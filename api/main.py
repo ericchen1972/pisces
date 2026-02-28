@@ -26,4 +26,4 @@ def chat():
     if not user_message:
         return jsonify({"error": "message is required"}), 400
 
-    return jsonify({"reply": "hello world", "echo": user_message})
+    return jsonify({"reply": "hello Eric", "echo": user_message})
