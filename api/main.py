@@ -34,7 +34,7 @@ def chat():
     if not gemini_api_key:
         return jsonify({"error": "GEMINI_API_KEY is not configured"}), 500
 
-    model = "gemini-2.0-flash-lite"
+    model = "gemini-2.5-flash"
     endpoint = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{model}:generateContent"
