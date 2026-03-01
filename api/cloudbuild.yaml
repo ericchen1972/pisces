@@ -6,6 +6,7 @@ steps:
       - gcr.io/$PROJECT_ID/github.com/$REPO_FULL_NAME:$COMMIT_SHA
       - --builder
       - gcr.io/buildpacks/builder
+      - --publish
 
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
