@@ -1,0 +1,25 @@
+steps:
+  - name: gcr.io/k8s-skaffold/pack
+    dir: api
+    args:
+      - build
+      - gcr.io/$PROJECT_ID/github.com/$REPO_FULL_NAME:$COMMIT_SHA
+      - --builder
+      - gcr.io/buildpacks/builder
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - pisces
+      - --image
+      - gcr.io/$PROJECT_ID/github.com/$REPO_FULL_NAME:$COMMIT_SHA
+      - --region
+      - asia-east1
+      - --platform
+      - managed
+      - --allow-unauthenticated
+
+images:
+  - gcr.io/$PROJECT_ID/github.com/$REPO_FULL_NAME:$COMMIT_SHA
