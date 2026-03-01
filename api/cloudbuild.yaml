@@ -22,8 +22,5 @@ steps:
       - managed
       - --allow-unauthenticated
 
-images:
-  - gcr.io/$PROJECT_ID/github.com/$REPO_FULL_NAME:$COMMIT_SHA
-
 options:
   logging: CLOUD_LOGGING_ONLY
