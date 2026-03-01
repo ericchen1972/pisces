@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { GoogleGenAI, Modality } from '@google/genai'
 
 const FALLBACK_API_BASE_URL = 'https://pisces-315346868518.asia-east1.run.app'
 const LOCAL_API_BASE_URL = 'http://127.0.0.1:8080'
 const GOOGLE_CLIENT_ID = '315346868518-os2tf8uc5282bggj40jbpkaltae1phi9.apps.googleusercontent.com'
 const MAX_RECORD_MS = 30000
+const GEMINI_LIVE_GREETING = '請你先開場打招呼，用自然簡短的電話語氣先問候我。'
+const LIVE_CONNECT_TIMEOUT_MS = 20000
 
 function getApiBaseUrl() {
   const envBase = (import.meta.env.VITE_API_BASE_URL || '').trim()
@@ -212,25 +215,63 @@ function formatTime(seconds) {
   return `${m}:${String(s).padStart(2, '0')}`
 }
 
-function AudioMessagePlayer({ audioUrl }) {
+function logPhoneLive(...args) {
+  // Keep a single namespace so debugging call flow is easy in DevTools.
+  console.log('[Pisces Live]', ...args)
+}
+
+function float32ToInt16(float32Array) {
+  const out = new Int16Array(float32Array.length)
+  for (let i = 0; i < float32Array.length; i += 1) {
+    const s = Math.max(-1, Math.min(1, float32Array[i]))
+    out[i] = s < 0 ? s * 32768 : s * 32767
+  }
+  return out
+}
+
+function downsampleBuffer(float32Array, inputRate, outputRate) {
+  if (outputRate >= inputRate) return float32Array
+  const sampleRateRatio = inputRate / outputRate
+  const newLength = Math.round(float32Array.length / sampleRateRatio)
+  const result = new Float32Array(newLength)
+  let offsetResult = 0
+  let offsetBuffer = 0
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio)
+    let accum = 0
+    let count = 0
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < float32Array.length; i += 1) {
+      accum += float32Array[i]
+      count += 1
+    }
+    result[offsetResult] = count > 0 ? accum / count : 0
+    offsetResult += 1
+    offsetBuffer = nextOffsetBuffer
+  }
+  return result
+}
+
+function AudioMessagePlayer({ audioUrl, variant = 'user' }) {
   const audioRef = useRef(null)
   const [isPlaying, setIsPlaying] = useState(false)
-  const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
+  const isAi = variant === 'ai'
+  const buttonGradient = isAi
+    ? 'linear-gradient(135deg, rgb(124 188 255) 0%, rgb(81 140 245) 55%, rgb(66 217 232) 100%)'
+    : 'linear-gradient(135deg, rgb(255, 124, 183) 0%, rgb(236, 75, 167) 55%, rgb(237 195 255) 100%)'
+  const waveColor = isAi ? '#9ed8ff' : '#ff84c2'
+  const buttonShadow = isAi ? '0 4px 10px rgba(37, 84, 161, 0.35)' : '0 4px 10px rgba(96, 24, 121, 0.35)'
 
   useEffect(() => {
     const audio = audioRef.current
     if (!audio) return
 
-    const onTimeUpdate = () => setCurrentTime(audio.currentTime || 0)
     const onLoaded = () => setDuration(audio.duration || 0)
     const onEnded = () => setIsPlaying(false)
 
-    audio.addEventListener('timeupdate', onTimeUpdate)
     audio.addEventListener('loadedmetadata', onLoaded)
     audio.addEventListener('ended', onEnded)
     return () => {
-      audio.removeEventListener('timeupdate', onTimeUpdate)
       audio.removeEventListener('loadedmetadata', onLoaded)
       audio.removeEventListener('ended', onEnded)
     }
@@ -264,12 +305,12 @@ function AudioMessagePlayer({ audioUrl }) {
             height: 46,
             borderRadius: '50%',
             border: '1px solid rgba(255,255,255,0.7)',
-            background: 'linear-gradient(135deg, #ff7cb7 0%, #ec4ba7 55%, #c442e8 100%)',
+            background: buttonGradient,
             color: '#fff',
             cursor: 'pointer',
             display: 'grid',
             placeItems: 'center',
-            boxShadow: '0 4px 10px rgba(96, 24, 121, 0.35)',
+            boxShadow: buttonShadow,
           }}
           aria-label={isPlaying ? 'Pause audio' : 'Play audio'}
         >
@@ -285,7 +326,7 @@ function AudioMessagePlayer({ audioUrl }) {
                   width: 3,
                   height: 8 + ((i * 7) % 14),
                   borderRadius: 999,
-                  background: '#ff84c2',
+                  background: waveColor,
                   opacity: 0.9,
                   transformOrigin: 'bottom',
                   animation: isPlaying ? `wavePulse 920ms ease-in-out ${i * 40}ms infinite` : 'none',
@@ -293,8 +334,7 @@ function AudioMessagePlayer({ audioUrl }) {
               />
             ))}
           </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'rgba(255,255,255,0.9)' }}>
-            <span>{formatTime(currentTime)}</span>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', fontSize: 11, color: 'rgba(255,255,255,0.9)' }}>
             <span>{formatTime(duration || 0)}</span>
           </div>
         </div>
@@ -319,6 +359,11 @@ function LoginHome() {
   const [messagesByContact, setMessagesByContact] = useState({})
   const [micAllowed, setMicAllowed] = useState(false)
   const [isRecording, setIsRecording] = useState(false)
+  const [isAwaitingReply, setIsAwaitingReply] = useState(false)
+  const [showPhoneOverlay, setShowPhoneOverlay] = useState(false)
+  const [phone2RotationDeg, setPhone2RotationDeg] = useState(0)
+  const [showPhonePeerAvatar, setShowPhonePeerAvatar] = useState(false)
+  const [phoneLiveStatus, setPhoneLiveStatus] = useState('idle')
   const [recordElapsedMs, setRecordElapsedMs] = useState(0)
   const chatScrollRef = useRef(null)
   const mediaRecorderRef = useRef(null)
@@ -326,6 +371,19 @@ function LoginHome() {
   const recordChunksRef = useRef([])
   const recordIntervalRef = useRef(null)
   const recordTimeoutRef = useRef(null)
+  const phoneRingAudioRef = useRef(null)
+  const phonePickupAudioRef = useRef(null)
+  const phoneAudioSeqRef = useRef(0)
+  const phoneAvatarTimerRef = useRef(null)
+  const phoneHangupTimersRef = useRef([])
+  const phoneLiveSessionRef = useRef(null)
+  const phoneLiveConnectPromiseRef = useRef(null)
+  const phoneAudioContextRef = useRef(null)
+  const phonePlaybackTimeRef = useRef(0)
+  const phoneMicStreamRef = useRef(null)
+  const phoneMicAudioContextRef = useRef(null)
+  const phoneMicSourceRef = useRef(null)
+  const phoneMicProcessorRef = useRef(null)
 
   const contacts = useMemo(() => {
     return [
@@ -337,6 +395,7 @@ function LoginHome() {
       },
     ]
   }, [])
+  const callPeerAvatarUrl = (selectedContact && selectedContact.avatar) || contacts[0]?.avatar || '/images/fish.png'
 
   useEffect(() => {
     let cancelled = false
@@ -438,6 +497,422 @@ function LoginHome() {
     }
   }
 
+  const playAudioOnce = async (audioEl) => {
+    if (!audioEl) return
+    audioEl.currentTime = 0
+    await audioEl.play()
+    await new Promise((resolve) => {
+      const done = () => {
+        audioEl.removeEventListener('ended', done)
+        audioEl.removeEventListener('error', done)
+        resolve()
+      }
+      audioEl.addEventListener('ended', done)
+      audioEl.addEventListener('error', done)
+    })
+  }
+
+  const getOrCreatePhoneAudioContext = () => {
+    let ctx = phoneAudioContextRef.current
+    if (!ctx || ctx.state === 'closed') {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext
+      if (!AudioCtx) return null
+      ctx = new AudioCtx()
+      phoneAudioContextRef.current = ctx
+      phonePlaybackTimeRef.current = ctx.currentTime
+    }
+    if (ctx.state === 'suspended') {
+      ctx.resume().catch(() => {})
+    }
+    return ctx
+  }
+
+  const stopPhoneMicStreaming = () => {
+    if (phoneMicProcessorRef.current) {
+      phoneMicProcessorRef.current.disconnect()
+      phoneMicProcessorRef.current.onaudioprocess = null
+      phoneMicProcessorRef.current = null
+    }
+    if (phoneMicSourceRef.current) {
+      phoneMicSourceRef.current.disconnect()
+      phoneMicSourceRef.current = null
+    }
+    if (phoneMicAudioContextRef.current) {
+      const ctx = phoneMicAudioContextRef.current
+      phoneMicAudioContextRef.current = null
+      if (ctx.state !== 'closed') {
+        ctx.close().catch(() => {})
+      }
+    }
+    if (phoneMicStreamRef.current) {
+      phoneMicStreamRef.current.getTracks().forEach((t) => t.stop())
+      phoneMicStreamRef.current = null
+    }
+  }
+
+  const startPhoneMicStreaming = async () => {
+    stopPhoneMicStreaming()
+    const session = phoneLiveSessionRef.current
+    if (!session) return
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    })
+    phoneMicStreamRef.current = stream
+
+    const AudioCtx = window.AudioContext || window.webkitAudioContext
+    if (!AudioCtx) {
+      throw new Error('AudioContext is not supported in this browser')
+    }
+
+    const ctx = new AudioCtx()
+    phoneMicAudioContextRef.current = ctx
+    const source = ctx.createMediaStreamSource(stream)
+    phoneMicSourceRef.current = source
+
+    const processor = ctx.createScriptProcessor(2048, 1, 1)
+    phoneMicProcessorRef.current = processor
+
+    processor.onaudioprocess = (event) => {
+      const activeSession = phoneLiveSessionRef.current
+      if (!activeSession) return
+      const input = event.inputBuffer.getChannelData(0)
+      const downsampled = downsampleBuffer(input, ctx.sampleRate, 16000)
+      const pcm16 = float32ToInt16(downsampled)
+      const bytes = new Uint8Array(pcm16.buffer)
+      let binary = ''
+      for (let i = 0; i < bytes.byteLength; i += 1) {
+        binary += String.fromCharCode(bytes[i])
+      }
+      const b64 = btoa(binary)
+      try {
+        activeSession.sendRealtimeInput({
+          audio: {
+            data: b64,
+            mimeType: 'audio/pcm;rate=16000',
+          },
+        })
+      } catch (err) {
+        logPhoneLive('sendRealtimeInput(audio) failed', err)
+      }
+    }
+
+    source.connect(processor)
+    processor.connect(ctx.destination)
+    await ctx.resume().catch(() => {})
+    logPhoneLive('mic streaming started', { sampleRate: ctx.sampleRate })
+  }
+
+  const playPcm16Chunk = (base64Data, mimeType = '') => {
+    const ctx = getOrCreatePhoneAudioContext()
+    if (!ctx || !base64Data) return
+
+    const rateMatch = /rate=(\d+)/i.exec(mimeType || '')
+    const sampleRate = rateMatch ? Number(rateMatch[1]) : 24000
+
+    const binary = atob(base64Data)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i)
+    }
+
+    const sampleCount = Math.floor(bytes.length / 2)
+    if (sampleCount <= 0) return
+    const samples = new Float32Array(sampleCount)
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    for (let i = 0; i < sampleCount; i += 1) {
+      const s = view.getInt16(i * 2, true)
+      samples[i] = Math.max(-1, Math.min(1, s / 32768))
+    }
+
+    const buffer = ctx.createBuffer(1, sampleCount, sampleRate)
+    buffer.getChannelData(0).set(samples)
+
+    const source = ctx.createBufferSource()
+    source.buffer = buffer
+    source.connect(ctx.destination)
+
+    const when = Math.max(ctx.currentTime + 0.01, phonePlaybackTimeRef.current)
+    source.start(when)
+    phonePlaybackTimeRef.current = when + buffer.duration
+  }
+
+  const closePhoneLiveSession = async () => {
+    const existingSession = phoneLiveSessionRef.current
+    if (existingSession) {
+      try {
+        existingSession.sendRealtimeInput({ audioStreamEnd: true })
+      } catch {
+        // ignore
+      }
+    }
+    stopPhoneMicStreaming()
+
+    try {
+      if (existingSession?.close) {
+        await existingSession.close()
+      }
+    } catch {
+      // ignore close errors
+    }
+    phoneLiveSessionRef.current = null
+    phoneLiveConnectPromiseRef.current = null
+    setPhoneLiveStatus('idle')
+
+    const ctx = phoneAudioContextRef.current
+    phoneAudioContextRef.current = null
+    phonePlaybackTimeRef.current = 0
+    if (ctx && ctx.state !== 'closed') {
+      ctx.close().catch(() => {})
+    }
+  }
+
+  const connectPhoneLive = async () => {
+    if (phoneLiveSessionRef.current) return true
+    if (phoneLiveConnectPromiseRef.current) return phoneLiveConnectPromiseRef.current
+
+    const connectPromise = (async () => {
+      setPhoneLiveStatus('connecting')
+      logPhoneLive('requesting /api/live/token')
+      const tokenRes = await fetch(`${apiBaseUrl}/api/live/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      })
+      const tokenData = await tokenRes.json()
+      logPhoneLive('live token response', { status: tokenRes.status, data: tokenData })
+      if (!tokenRes.ok || !tokenData.ok || !tokenData.token) {
+        throw new Error(tokenData.error || `Live token failed (${tokenRes.status})`)
+      }
+
+      const ai = new GoogleGenAI({
+        apiKey: tokenData.token,
+        httpOptions: { apiVersion: 'v1alpha' },
+      })
+      logPhoneLive('connecting live session', { model: tokenData.model, voice: tokenData.voice_name })
+      const session = await ai.live.connect({
+        model: tokenData.model || 'gemini-live-2.5-flash-preview',
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: {
+                voiceName: tokenData.voice_name || 'Leda',
+              },
+            },
+          },
+        },
+        callbacks: {
+          onopen: () => {
+            setPhoneLiveStatus('connected')
+            logPhoneLive('live session opened')
+          },
+          onmessage: (message) => {
+            logPhoneLive('live message', message)
+            const serverContent = message?.serverContent
+            const parts = serverContent?.modelTurn?.parts || []
+            parts.forEach((part) => {
+              const inlineData = part?.inlineData
+              if (!inlineData?.data) return
+              if ((inlineData.mimeType || '').toLowerCase().includes('audio/pcm')) {
+                playPcm16Chunk(inlineData.data, inlineData.mimeType || '')
+              }
+            })
+          },
+          onerror: (evt) => {
+            setPhoneLiveStatus('error')
+            logPhoneLive('live session error', evt)
+          },
+          onclose: (evt) => {
+            if (phoneLiveSessionRef.current) {
+              setPhoneLiveStatus('closed')
+            }
+            stopPhoneMicStreaming()
+            logPhoneLive('live session closed', {
+              code: evt?.code,
+              reason: evt?.reason,
+              wasClean: evt?.wasClean,
+              event: evt,
+            })
+          },
+        },
+      })
+
+      phoneLiveSessionRef.current = session
+      setPhoneLiveStatus('connected')
+      return true
+    })()
+
+    phoneLiveConnectPromiseRef.current = connectPromise
+    try {
+      const ok = await connectPromise
+      return ok
+    } catch (err) {
+      phoneLiveSessionRef.current = null
+      phoneLiveConnectPromiseRef.current = null
+      setPhoneLiveStatus('error')
+      throw err
+    } finally {
+      phoneLiveConnectPromiseRef.current = null
+    }
+  }
+
+  const startGeminiLiveGreeting = () => {
+    const session = phoneLiveSessionRef.current
+    if (!session) return
+    session.sendClientContent({
+      turns: [{ role: 'user', parts: [{ text: GEMINI_LIVE_GREETING }] }],
+      turnComplete: true,
+    })
+  }
+
+  const clearPhoneUiTimers = () => {
+    if (phoneAvatarTimerRef.current) {
+      clearTimeout(phoneAvatarTimerRef.current)
+      phoneAvatarTimerRef.current = null
+    }
+    if (phoneHangupTimersRef.current.length > 0) {
+      phoneHangupTimersRef.current.forEach((timerId) => clearTimeout(timerId))
+      phoneHangupTimersRef.current = []
+    }
+  }
+
+  const stopPhoneSounds = () => {
+    phoneAudioSeqRef.current += 1
+    clearPhoneUiTimers()
+    const ring = phoneRingAudioRef.current
+    const pickup = phonePickupAudioRef.current
+    if (ring) {
+      ring.pause()
+      ring.currentTime = 0
+    }
+    if (pickup) {
+      pickup.pause()
+      pickup.currentTime = 0
+    }
+  }
+
+  const openPhoneOverlay = async () => {
+    await closePhoneLiveSession()
+    setShowPhoneOverlay(true)
+    setPhone2RotationDeg(0)
+    setShowPhonePeerAvatar(false)
+    stopPhoneSounds()
+
+    const seq = phoneAudioSeqRef.current
+    let liveConnected = false
+    const connectPromise = connectPhoneLive()
+      .then(() => {
+        liveConnected = true
+        return true
+      })
+      .catch((err) => {
+        logPhoneLive('connectPhoneLive failed', err)
+        return false
+      })
+
+    try {
+      await playAudioOnce(phoneRingAudioRef.current)
+      if (seq !== phoneAudioSeqRef.current) return
+
+      let connected = liveConnected
+      if (!connected) {
+        logPhoneLive('ring finished before connected, entering ring loop')
+        const ring = phoneRingAudioRef.current
+        if (ring) {
+          ring.loop = true
+          ring.currentTime = 0
+          ring.play().catch(() => {})
+        }
+        connected = await Promise.race([
+          connectPromise,
+          new Promise((resolve) =>
+            window.setTimeout(() => {
+              logPhoneLive('live connect timeout', { timeoutMs: LIVE_CONNECT_TIMEOUT_MS })
+              resolve(false)
+            }, LIVE_CONNECT_TIMEOUT_MS),
+          ),
+        ])
+        if (ring) {
+          ring.pause()
+          ring.loop = false
+          ring.currentTime = 0
+        }
+      }
+
+      if (seq !== phoneAudioSeqRef.current) {
+        await closePhoneLiveSession()
+        return
+      }
+      if (!connected) {
+        setPhoneLiveStatus('error')
+        logPhoneLive('live not connected, aborting call flow')
+        return
+      }
+
+      logPhoneLive('connected, starting pickup flow')
+      setPhone2RotationDeg(-90)
+      phoneAvatarTimerRef.current = window.setTimeout(() => {
+        setShowPhonePeerAvatar(true)
+        phoneAvatarTimerRef.current = null
+      }, 1000)
+      await playAudioOnce(phonePickupAudioRef.current)
+      if (seq !== phoneAudioSeqRef.current) {
+        await closePhoneLiveSession()
+        return
+      }
+      try {
+        await startPhoneMicStreaming()
+      } catch (err) {
+        logPhoneLive('failed to start mic streaming', err)
+      }
+      logPhoneLive('pickup completed, sending greeting prompt')
+      startGeminiLiveGreeting()
+    } catch {
+      // Browser autoplay or audio decode failures are non-blocking for UI.
+      logPhoneLive('openPhoneOverlay flow failed unexpectedly')
+    }
+  }
+
+  const closePhoneOverlay = async () => {
+    stopPhoneSounds()
+    await closePhoneLiveSession()
+    setShowPhoneOverlay(false)
+    setPhone2RotationDeg(0)
+    setShowPhonePeerAvatar(false)
+  }
+
+  const onPhoneImageClick = () => {
+    const isOffhook = phone2RotationDeg === -90
+    stopPhoneSounds()
+    if (isOffhook) {
+      closePhoneLiveSession().catch(() => {})
+      const pickup = phonePickupAudioRef.current
+      if (pickup) {
+        pickup.currentTime = 0
+        pickup.play().catch(() => {})
+      }
+      const t1 = window.setTimeout(() => {
+        setShowPhonePeerAvatar(false)
+      }, 220)
+      const t2 = window.setTimeout(() => {
+        setPhone2RotationDeg(0)
+      }, 640)
+      const t3 = window.setTimeout(() => {
+        setShowPhoneOverlay(false)
+        setShowPhonePeerAvatar(false)
+      }, 1680)
+      phoneHangupTimersRef.current.push(t1, t2, t3)
+      return
+    }
+    closePhoneLiveSession().catch(() => {})
+    setShowPhoneOverlay(false)
+    setShowPhonePeerAvatar(false)
+  }
+
   const stopRecording = () => {
     const recorder = mediaRecorderRef.current
     if (!recorder) return
@@ -451,7 +926,7 @@ function LoginHome() {
   }
 
   const startRecording = async () => {
-    if (isRecording || !selectedContact || !micAllowed) return
+    if (isRecording || isAwaitingReply || !selectedContact || !micAllowed) return
     if (!window.MediaRecorder || !navigator.mediaDevices?.getUserMedia) return
 
     try {
@@ -468,21 +943,8 @@ function LoginHome() {
         }
       }
 
-      recorder.onstop = () => {
+      recorder.onstop = async () => {
         const chunks = recordChunksRef.current
-        if (chunks.length > 0) {
-          const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' })
-          const audioUrl = URL.createObjectURL(blob)
-          const audioMessageId = `ua-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
-          setMessagesByContact((prev) => {
-            const current = prev[contactId] || []
-            return {
-              ...prev,
-              [contactId]: [...current, { id: audioMessageId, role: 'user', audioUrl }],
-            }
-          })
-        }
-
         if (mediaStreamRef.current) {
           mediaStreamRef.current.getTracks().forEach((t) => t.stop())
         }
@@ -492,6 +954,77 @@ function LoginHome() {
         clearRecordingTimers()
         setIsRecording(false)
         setRecordElapsedMs(0)
+
+        if (chunks.length > 0) {
+          const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' })
+          const audioUrl = URL.createObjectURL(blob)
+          const audioMessageId = `ua-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+          const typingId = `vt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+          setMessagesByContact((prev) => {
+            const current = prev[contactId] || []
+            return {
+              ...prev,
+              [contactId]: [
+                ...current,
+                { id: audioMessageId, role: 'user', audioUrl },
+                { id: typingId, role: 'ai-typing', text: '...' },
+              ],
+            }
+          })
+          setIsAwaitingReply(true)
+
+          try {
+            const arrayBuffer = await blob.arrayBuffer()
+            const bytes = new Uint8Array(arrayBuffer)
+            let binary = ''
+            for (let i = 0; i < bytes.length; i += 1) {
+              binary += String.fromCharCode(bytes[i])
+            }
+            const audioBase64 = btoa(binary)
+
+            const res = await fetch(`${apiBaseUrl}/api/voice-chat`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                audio_base64: audioBase64,
+                mime_type: blob.type || recorder.mimeType || 'audio/webm',
+              }),
+            })
+            const data = await res.json()
+            const aiText = res.ok && data.reply ? data.reply : data.error || `Request failed (${res.status})`
+            const aiAudioUrl =
+              res.ok && data.audio_base64
+                ? `data:${data.audio_mime_type || 'audio/wav'};base64,${data.audio_base64}`
+                : ''
+
+            setMessagesByContact((prev) => {
+              const current = prev[contactId] || []
+              return {
+                ...prev,
+                [contactId]: current.map((m) =>
+                  m.id === typingId
+                    ? { id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role: 'ai', text: aiText, audioUrl: aiAudioUrl }
+                    : m,
+                ),
+              }
+            })
+          } catch (err) {
+            const errText = err?.message || 'Voice chat request failed.'
+            setMessagesByContact((prev) => {
+              const current = prev[contactId] || []
+              return {
+                ...prev,
+                [contactId]: current.map((m) =>
+                  m.id === typingId
+                    ? { id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role: 'ai', text: errText }
+                    : m,
+                ),
+              }
+            })
+          } finally {
+            setIsAwaitingReply(false)
+          }
+        }
       }
 
       recorder.start()
@@ -516,6 +1049,8 @@ function LoginHome() {
   useEffect(() => {
     return () => {
       clearRecordingTimers()
+      stopPhoneSounds()
+      closePhoneLiveSession().catch(() => {})
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
         mediaRecorderRef.current.stop()
       }
@@ -618,7 +1153,7 @@ function LoginHome() {
                     padding: isPadUp ? '8px 24px 4px' : '8px 8px 4px',
                     display: 'grid',
                     alignContent: 'start',
-                    gap: 10,
+                    gap: 16,
                   }}
                 >
                   {(messagesByContact[selectedContact.id] || []).map((msg) => {
@@ -642,7 +1177,7 @@ function LoginHome() {
                             }}
                           >
                             {msg.audioUrl ? (
-                              <AudioMessagePlayer audioUrl={msg.audioUrl} />
+                              <AudioMessagePlayer audioUrl={msg.audioUrl} variant="user" />
                             ) : (
                               msg.text
                             )}
@@ -678,16 +1213,16 @@ function LoginHome() {
                             justifySelf: 'start',
                             width: 'fit-content',
                             maxWidth: isPadUp ? '66%' : '80%',
-                            background: 'rgba(84, 84, 84, 0.88)',
+                            background: msg.audioUrl ? 'transparent' : 'rgba(84, 84, 84, 0.88)',
                             color: '#fff',
                             borderRadius: 18,
-                            padding: '10px 12px',
+                            padding: msg.audioUrl ? '0' : '10px 12px',
                             fontSize: '0.96rem',
                             lineHeight: 1.35,
                             whiteSpace: 'pre-wrap',
                             wordBreak: 'break-word',
                             overflowWrap: 'anywhere',
-                            boxShadow: '0 3px 8px rgba(0,0,0,0.2)',
+                            boxShadow: msg.audioUrl ? 'none' : '0 3px 8px rgba(0,0,0,0.2)',
                           }}
                         >
                           {msg.role === 'ai-typing' ? (
@@ -696,6 +1231,8 @@ function LoginHome() {
                               <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#fff', opacity: 0.4, animation: 'typingDot 1s infinite 0.2s' }} />
                               <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#fff', opacity: 0.4, animation: 'typingDot 1s infinite 0.4s' }} />
                             </span>
+                          ) : msg.audioUrl ? (
+                            <AudioMessagePlayer audioUrl={msg.audioUrl} variant="ai" />
                           ) : (
                             msg.text
                           )}
@@ -708,7 +1245,7 @@ function LoginHome() {
                 <form
                   onSubmit={async (e) => {
                     e.preventDefault()
-                    if (isRecording) return
+                    if (isRecording || isAwaitingReply) return
                     const input = chatInput.trim()
                     if (!input || !selectedContact) return
 
@@ -729,6 +1266,7 @@ function LoginHome() {
                     })
                     setChatInput('')
                     setShowEmojiPicker(false)
+                    setIsAwaitingReply(true)
 
                     try {
                       const res = await fetch(`${apiBaseUrl}/api/chat`, {
@@ -738,6 +1276,10 @@ function LoginHome() {
                       })
                       const data = await res.json()
                       const aiText = res.ok && data.reply ? data.reply : data.error || `Request failed (${res.status})`
+                      const aiAudioUrl =
+                        res.ok && data.audio_base64
+                          ? `data:${data.audio_mime_type || 'audio/wav'};base64,${data.audio_base64}`
+                          : ''
 
                       setMessagesByContact((prev) => {
                         const current = prev[contactId] || []
@@ -745,7 +1287,7 @@ function LoginHome() {
                           ...prev,
                           [contactId]: current.map((m) =>
                             m.id === typingId
-                              ? { id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role: 'ai', text: aiText }
+                              ? { id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role: 'ai', text: aiText, audioUrl: aiAudioUrl }
                               : m,
                           ),
                         }
@@ -763,6 +1305,8 @@ function LoginHome() {
                           ),
                         }
                       })
+                    } finally {
+                      setIsAwaitingReply(false)
                     }
                   }}
                   style={{ padding: isPadUp ? '8px 24px 12px' : '8px 8px 12px' }}
@@ -812,7 +1356,7 @@ function LoginHome() {
                         onChange={(e) => setChatInput(e.target.value)}
                         onFocus={() => setShowEmojiPicker(false)}
                         placeholder={isRecording ? '' : 'Type a message...'}
-                        disabled={isRecording}
+                        disabled={isRecording || isAwaitingReply}
                         style={{
                           height: 24,
                           width: '100%',
@@ -828,6 +1372,7 @@ function LoginHome() {
                     {micAllowed ? (
                       <button
                         type="button"
+                        disabled={isAwaitingReply}
                         onClick={() => {
                           if (isRecording) {
                             stopRecording()
@@ -839,9 +1384,10 @@ function LoginHome() {
                           border: 0,
                           background: 'transparent',
                           color: '#fff',
-                          cursor: 'pointer',
+                          cursor: isAwaitingReply ? 'default' : 'pointer',
                           display: 'grid',
                           placeItems: 'center',
+                          opacity: isAwaitingReply ? 0.5 : 1,
                         }}
                       >
                         {isRecording ? <IconStop /> : <IconMic />}
@@ -849,31 +1395,31 @@ function LoginHome() {
                     ) : null}
                     <button
                       type="button"
-                      disabled={isRecording}
+                      disabled={isRecording || isAwaitingReply}
                       onClick={() => setShowEmojiPicker((v) => !v)}
                       style={{
                         border: 0,
                         background: 'transparent',
                         color: '#fff',
-                        cursor: isRecording ? 'default' : 'pointer',
+                        cursor: isRecording || isAwaitingReply ? 'default' : 'pointer',
                         display: 'grid',
                         placeItems: 'center',
-                        opacity: isRecording ? 0.5 : 1,
+                        opacity: isRecording || isAwaitingReply ? 0.5 : 1,
                       }}
                     >
                       <IconEmoji />
                     </button>
                     <button
                       type="submit"
-                      disabled={isRecording}
+                      disabled={isRecording || isAwaitingReply}
                       style={{
                         border: 0,
                         background: 'transparent',
                         color: '#fff',
-                        cursor: isRecording ? 'default' : 'pointer',
+                        cursor: isRecording || isAwaitingReply ? 'default' : 'pointer',
                         display: 'grid',
                         placeItems: 'center',
-                        opacity: isRecording ? 0.5 : 1,
+                        opacity: isRecording || isAwaitingReply ? 0.5 : 1,
                       }}
                     >
                       <IconSend />
@@ -1081,10 +1627,110 @@ function LoginHome() {
         >
           <IconUser />
           <IconMessage />
-          <IconPhone />
+          <button
+            type="button"
+            onClick={openPhoneOverlay}
+            style={{
+              border: 0,
+              background: 'transparent',
+              color: 'inherit',
+              cursor: 'pointer',
+              display: 'grid',
+              placeItems: 'center',
+              width: '100%',
+              height: '100%',
+              padding: 0,
+            }}
+            aria-label="Open phone modal"
+          >
+            <IconPhone />
+          </button>
           <IconSettings />
         </nav>
       </section>
+      {showPhoneOverlay ? (
+        <div
+          onClick={closePhoneOverlay}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(6, 5, 12, 0.58)',
+            backdropFilter: 'blur(2px)',
+            WebkitBackdropFilter: 'blur(2px)',
+            zIndex: 50,
+            display: 'grid',
+            placeItems: 'center',
+            padding: 16,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              position: 'relative',
+              width: 'min(64vw, 380px)',
+              aspectRatio: '9 / 13',
+              maxWidth: 'calc(100vw - 32px)',
+              maxHeight: 'calc(100vh - 32px)',
+            }}
+          >
+            <img
+              src={callPeerAvatarUrl}
+              alt="Caller avatar"
+              style={{
+                position: 'absolute',
+                top: '14%',
+                left: '50%',
+                transform: 'translateX(-50%)',
+                width: 150,
+                height: 'auto',
+                cursor: 'pointer',
+                filter: 'drop-shadow(rgba(0, 0, 0, 0.36) 0px 10px 20px)',
+                borderRadius: '50%',
+                opacity: showPhonePeerAvatar ? 1 : 0,
+                transition: 'opacity 420ms ease',
+                zIndex: 4,
+              }}
+              onClick={onPhoneImageClick}
+            />
+            <img
+              src="/images/phone1.webp"
+              alt="Phone 1"
+              onClick={onPhoneImageClick}
+              style={{
+                position: 'absolute',
+                top: '40%',
+                left: '50%',
+                transform: 'translateX(-50%)',
+                width: '50%',
+                height: 'auto',
+                cursor: 'pointer',
+                filter: 'drop-shadow(0 10px 20px rgba(0,0,0,0.36))',
+                zIndex: 1,
+              }}
+            />
+            <img
+              src="/images/phone2.webp"
+              alt="Phone 2"
+              onClick={onPhoneImageClick}
+              style={{
+                position: 'absolute',
+                top: '40%',
+                left: '50%',
+                transform: `translateX(-50%) rotate(${phone2RotationDeg}deg)`,
+                transformOrigin: '0% 50%',
+                transition: 'transform 1s ease',
+                width: '50%',
+                height: 'auto',
+                cursor: 'pointer',
+                filter: 'drop-shadow(0 10px 20px rgba(0,0,0,0.36))',
+                zIndex: 3,
+              }}
+            />
+          </div>
+        </div>
+      ) : null}
+      <audio ref={phoneRingAudioRef} src="/images/phone_ring.wav" preload="auto" />
+      <audio ref={phonePickupAudioRef} src="/images/phone_pickup.wav" preload="auto" />
     </main>
   )
 }

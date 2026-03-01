@@ -1,2 +1,4 @@
 flask
 google-cloud-firestore
+google-cloud-speech
+google-genai

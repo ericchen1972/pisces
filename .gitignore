@@ -5,9 +5,16 @@ __pycache__/
 # Frontend
 web/node_modules/
 web/dist/
+web/.env.local
 
 # OS
 .DS_Store
 
 # Local notes
 AGENTS.md
+
+# Local secrets
+api/config.json
+
+# Service account keys
+api/keys/*.json
