@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { GoogleGenAI, Modality } from '@google/genai'
+import * as Ably from 'ably'
 
 const FALLBACK_API_BASE_URL = 'https://pisces-315346868518.asia-east1.run.app'
 const LOCAL_API_BASE_URL = 'http://127.0.0.1:8080'
@@ -7,6 +8,45 @@ const GOOGLE_CLIENT_ID = '315346868518-os2tf8uc5282bggj40jbpkaltae1phi9.apps.goo
 const MAX_RECORD_MS = 30000
 const GEMINI_LIVE_GREETING = '請你先開場打招呼，用自然簡短的電話語氣先問候我。'
 const LIVE_CONNECT_TIMEOUT_MS = 20000
+const AI_DEFAULT_GLOBAL_PROMPT = 'You are a polite, warm, and thoughtful AI communication partner.'
+const UI_STORAGE_KEY = 'pisces_ui_v1'
+const AVATAR_SIZE = 256
+const CHAT_INPUT_BASE_HEIGHT = 24
+const CHAT_INPUT_MAX_HEIGHT = 132
+const FEMALE_VOICE_OPTIONS = [
+  'Achernar',
+  'Aoede',
+  'Autonoe',
+  'Callirrhoe',
+  'Despina',
+  'Erinome',
+  'Gacrux',
+  'Kore',
+  'Laomedeia',
+  'Leda',
+  'Pulcherrima',
+  'Sulafat',
+  'Vindemiatrix',
+  'Zephyr',
+]
+const MALE_VOICE_OPTIONS = [
+  'Achird',
+  'Algenib',
+  'Algieba',
+  'Alnilam',
+  'Charon',
+  'Enceladus',
+  'Fenrir',
+  'Iapetus',
+  'Orus',
+  'Puck',
+  'Rasalgethi',
+  'Sadachbia',
+  'Sadaltager',
+  'Schedar',
+  'Umbriel',
+  'Zubenelgenubi',
+]
 
 function getApiBaseUrl() {
   const envBase = (import.meta.env.VITE_API_BASE_URL || '').trim()
@@ -136,6 +176,35 @@ function IconUser() {
   )
 }
 
+function IconUserPlus() {
+  return (
+    <span style={{ position: 'relative', display: 'inline-block', width: 24, height: 24 }}>
+      <span style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center' }}>
+        <IconUser />
+      </span>
+      <span
+        style={{
+          position: 'absolute',
+          right: -2,
+          bottom: -2,
+          width: 12,
+          height: 12,
+          borderRadius: '50%',
+          background: '#fff',
+          color: '#8f2bbf',
+          fontSize: 10,
+          fontWeight: 800,
+          lineHeight: '12px',
+          textAlign: 'center',
+          boxShadow: '0 1px 4px rgba(0,0,0,0.25)',
+        }}
+      >
+        +
+      </span>
+    </span>
+  )
+}
+
 function IconMessage() {
   return (
     <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -144,10 +213,64 @@ function IconMessage() {
   )
 }
 
+function IconList() {
+  return (
+    <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <line x1="8" y1="6" x2="21" y2="6" />
+      <line x1="8" y1="12" x2="21" y2="12" />
+      <line x1="8" y1="18" x2="21" y2="18" />
+      <circle cx="4" cy="6" r="1.5" fill="currentColor" stroke="none" />
+      <circle cx="4" cy="12" r="1.5" fill="currentColor" stroke="none" />
+      <circle cx="4" cy="18" r="1.5" fill="currentColor" stroke="none" />
+    </svg>
+  )
+}
+
 function IconPhone() {
   return (
     <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
       <path d="M22 16.9v3a2 2 0 0 1-2.2 2A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 2 .8 2.9a2 2 0 0 1-.4 2.1L8.2 10a16 16 0 0 0 5.8 5.8l1.3-1.3a2 2 0 0 1 2.1-.4c.9.4 1.9.7 2.9.8A2 2 0 0 1 22 16.9z" />
+    </svg>
+  )
+}
+
+function IconMoreVertical() {
+  return (
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden>
+      <circle cx="12" cy="5" r="2" />
+      <circle cx="12" cy="12" r="2" />
+      <circle cx="12" cy="19" r="2" />
+    </svg>
+  )
+}
+
+function IconEdit() {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4 11.5-11.5z" />
+    </svg>
+  )
+}
+
+function IconTrash() {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <polyline points="3 6 5 6 21 6" />
+      <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+      <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+      <line x1="10" y1="11" x2="10" y2="17" />
+      <line x1="14" y1="11" x2="14" y2="17" />
+    </svg>
+  )
+}
+
+function IconSave() {
+  return (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
+      <polyline points="17 21 17 13 7 13 7 21" />
+      <polyline points="7 3 7 8 15 8" />
     </svg>
   )
 }
@@ -218,6 +341,82 @@ function formatTime(seconds) {
 function logPhoneLive(...args) {
   // Keep a single namespace so debugging call flow is easy in DevTools.
   console.log('[Pisces Live]', ...args)
+}
+
+function loadImageFile(file) {
+  return new Promise((resolve, reject) => {
+    const image = new Image()
+    const objectUrl = URL.createObjectURL(file)
+    image.onload = () => {
+      URL.revokeObjectURL(objectUrl)
+      resolve(image)
+    }
+    image.onerror = () => {
+      URL.revokeObjectURL(objectUrl)
+      reject(new Error('Unable to read image file.'))
+    }
+    image.src = objectUrl
+  })
+}
+
+async function buildAvatarWebpBlob(file) {
+  const image = await loadImageFile(file)
+  const sourceWidth = image.naturalWidth || image.width
+  const sourceHeight = image.naturalHeight || image.height
+  const squareSide = Math.min(sourceWidth, sourceHeight)
+  const sourceX = Math.floor((sourceWidth - squareSide) / 2)
+  const sourceY = Math.floor((sourceHeight - squareSide) / 2)
+
+  const canvas = document.createElement('canvas')
+  canvas.width = AVATAR_SIZE
+  canvas.height = AVATAR_SIZE
+  const ctx = canvas.getContext('2d')
+  if (!ctx) {
+    throw new Error('Canvas context is not available.')
+  }
+
+  ctx.drawImage(
+    image,
+    sourceX,
+    sourceY,
+    squareSide,
+    squareSide,
+    0,
+    0,
+    AVATAR_SIZE,
+    AVATAR_SIZE,
+  )
+
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          reject(new Error('Failed to create avatar image.'))
+          return
+        }
+        resolve(blob)
+      },
+      'image/webp',
+      0.9,
+    )
+  })
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : ''
+      const base64 = result.includes(',') ? result.split(',')[1] : result
+      if (!base64) {
+        reject(new Error('Failed to encode image.'))
+        return
+      }
+      resolve(base64)
+    }
+    reader.onerror = () => reject(new Error('Failed to read image blob.'))
+    reader.readAsDataURL(blob)
+  })
 }
 
 function float32ToInt16(float32Array) {
@@ -353,10 +552,13 @@ function LoginHome() {
   const [isSignedIn, setIsSignedIn] = useState(false)
   const [currentUser, setCurrentUser] = useState(null)
   const [hoveredContactId, setHoveredContactId] = useState(null)
+  const [openContactMenuId, setOpenContactMenuId] = useState(null)
   const [selectedContact, setSelectedContact] = useState(null)
   const [chatInput, setChatInput] = useState('')
   const [showEmojiPicker, setShowEmojiPicker] = useState(false)
   const [messagesByContact, setMessagesByContact] = useState({})
+  const [unreadByContact, setUnreadByContact] = useState({})
+  const [isHistoryLoading, setIsHistoryLoading] = useState(false)
   const [micAllowed, setMicAllowed] = useState(false)
   const [isRecording, setIsRecording] = useState(false)
   const [isAwaitingReply, setIsAwaitingReply] = useState(false)
@@ -364,7 +566,44 @@ function LoginHome() {
   const [phone2RotationDeg, setPhone2RotationDeg] = useState(0)
   const [showPhonePeerAvatar, setShowPhonePeerAvatar] = useState(false)
   const [phoneLiveStatus, setPhoneLiveStatus] = useState('idle')
+  const [contacts, setContacts] = useState([
+    {
+      id: 'pisces-core',
+      name: '💜✨Pisces✨💜',
+      avatar: '/images/fish.png',
+      snippet: '',
+      isAi: true,
+      gender: 'female',
+      voice: 'Achernar',
+      globalPrompt: AI_DEFAULT_GLOBAL_PROMPT,
+    },
+  ])
+  const [editModalOpen, setEditModalOpen] = useState(false)
+  const [isAliasEditing, setIsAliasEditing] = useState(false)
+  const [editForm, setEditForm] = useState(null)
+  const [isUploadingAvatar, setIsUploadingAvatar] = useState(false)
+  const [avatarUploadError, setAvatarUploadError] = useState('')
+  const [settingsModalOpen, setSettingsModalOpen] = useState(false)
+  const [identifyCodeInput, setIdentifyCodeInput] = useState('')
+  const [settingsError, setSettingsError] = useState('')
+  const [settingsSaving, setSettingsSaving] = useState(false)
+  const [testerModalOpen, setTesterModalOpen] = useState(false)
+  const [testerEmail, setTesterEmail] = useState('')
+  const [testerAvatarUrl, setTesterAvatarUrl] = useState('')
+  const [testerError, setTesterError] = useState('')
+  const [testerSubmitting, setTesterSubmitting] = useState(false)
+  const [addFriendModalOpen, setAddFriendModalOpen] = useState(false)
+  const [friendEmailInput, setFriendEmailInput] = useState('')
+  const [friendAliasInput, setFriendAliasInput] = useState('')
+  const [friendCodeInput, setFriendCodeInput] = useState('')
+  const [addFriendError, setAddFriendError] = useState('')
+  const [addFriendSuccess, setAddFriendSuccess] = useState('')
+  const [addFriendSubmitting, setAddFriendSubmitting] = useState(false)
+  const [pendingAvatarBlob, setPendingAvatarBlob] = useState(null)
+  const [pendingAvatarPreviewUrl, setPendingAvatarPreviewUrl] = useState('')
   const [recordElapsedMs, setRecordElapsedMs] = useState(0)
+  const [isInputComposing, setIsInputComposing] = useState(false)
+  const restoredSelectedContactIdRef = useRef(null)
   const chatScrollRef = useRef(null)
   const mediaRecorderRef = useRef(null)
   const mediaStreamRef = useRef(null)
@@ -384,20 +623,607 @@ function LoginHome() {
   const phoneMicAudioContextRef = useRef(null)
   const phoneMicSourceRef = useRef(null)
   const phoneMicProcessorRef = useRef(null)
+  const avatarFileInputRef = useRef(null)
+  const chatInputRef = useRef(null)
+  const ablyRealtimeRef = useRef(null)
+  const ablyChannelRef = useRef(null)
+  const callPeerAvatarUrl = (selectedContact && selectedContact.avatar) || contacts[0]?.avatar || '/images/fish.png'
 
-  const contacts = useMemo(() => {
-    return [
+  const clearSessionAndLogout = async () => {
+    try {
+      await fetch(`${apiBaseUrl}/api/auth/logout`, {
+        method: 'POST',
+        credentials: 'include',
+      })
+    } catch {
+      // ignore logout network errors
+    }
+    if (ablyChannelRef.current) {
+      try {
+        ablyChannelRef.current.unsubscribe()
+      } catch {
+        // ignore
+      }
+      ablyChannelRef.current = null
+    }
+    if (ablyRealtimeRef.current) {
+      try {
+        ablyRealtimeRef.current.close()
+      } catch {
+        // ignore
+      }
+      ablyRealtimeRef.current = null
+    }
+    try {
+      localStorage.removeItem(UI_STORAGE_KEY)
+    } catch {
+      // ignore storage errors
+    }
+    setIsSignedIn(false)
+    setCurrentUser(null)
+    setUnreadByContact({})
+    setSelectedContact(null)
+    setOpenContactMenuId(null)
+    setEditModalOpen(false)
+    setSettingsModalOpen(false)
+    setAddFriendModalOpen(false)
+    setIsAliasEditing(false)
+    setEditForm(null)
+    setAvatarUploadError('')
+    setSettingsError('')
+    setIdentifyCodeInput('')
+    setAddFriendError('')
+    setAddFriendSuccess('')
+    setTesterModalOpen(false)
+    setTesterError('')
+    setPendingAvatarBlob(null)
+    if (pendingAvatarPreviewUrl) {
+      URL.revokeObjectURL(pendingAvatarPreviewUrl)
+      setPendingAvatarPreviewUrl('')
+    }
+  }
+
+  const upsertFriendContact = (friend) => {
+    if (!friend?.id) return
+    const nextContact = {
+      id: friend.id,
+      name: friend.name || friend.display_name || friend.email || 'Friend',
+      avatar: friend.avatar_url || '/images/fish.png',
+      snippet: '',
+      isAi: false,
+    }
+    setContacts((prev) => {
+      const existingIndex = prev.findIndex((contact) => contact.id === nextContact.id)
+      if (existingIndex >= 0) {
+        const cloned = [...prev]
+        cloned[existingIndex] = { ...cloned[existingIndex], ...nextContact }
+        return cloned
+      }
+      const next = [...prev]
+      next.splice(1, 0, nextContact)
+      return next
+    })
+  }
+
+  const applySignedInUser = (user) => {
+    setCurrentUser(user || null)
+    setIsSignedIn(true)
+    setSelectedContact(null)
+
+    const fetchedAiSettings = user?.ai_settings || {}
+    const nextGender = fetchedAiSettings.gender || 'female'
+    const nextVoice = fetchedAiSettings.voice || 'Achernar'
+    const nextGlobalPrompt = fetchedAiSettings.global_prompt || AI_DEFAULT_GLOBAL_PROMPT
+    const nextAvatar = user?.ai_avatar_url || '/images/fish.png'
+    setContacts([
       {
         id: 'pisces-core',
         name: '💜✨Pisces✨💜',
-        avatar: '/images/fish.png',
+        avatar: nextAvatar,
         snippet: '',
+        isAi: true,
+        gender: nextGender,
+        voice: nextVoice,
+        globalPrompt: nextGlobalPrompt,
       },
-    ]
-  }, [])
-  const callPeerAvatarUrl = (selectedContact && selectedContact.avatar) || contacts[0]?.avatar || '/images/fish.png'
+    ])
+  }
+
+  const loadFriendsList = async (signedInUser) => {
+    if (!signedInUser?.id) return
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/friends/list`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      const data = await res.json()
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || `Failed to load friends (HTTP ${res.status})`)
+      }
+      const friendContacts = (data.friends || []).map((friend) => ({
+        id: friend.id,
+        name: friend.name || friend.display_name || 'Friend',
+        avatar: friend.avatar_url || '/images/fish.png',
+        specialPrompt: friend.special_prompt || '',
+        relationship: friend.relationship || '',
+        unreadCount: Number(friend.unread_count || 0),
+        snippet: '',
+        isAi: false,
+      }))
+      setContacts((prev) => [prev[0], ...friendContacts])
+      const unreadMap = {}
+      friendContacts.forEach((c) => {
+        unreadMap[c.id] = Number.isFinite(c.unreadCount) ? Math.max(0, c.unreadCount) : 0
+      })
+      setUnreadByContact(unreadMap)
+    } catch {
+      // ignore friend list load errors in UI bootstrap
+    }
+  }
+
+  const markContactAsRead = async (contactId) => {
+    if (!isSignedIn || !contactId || contactId === 'pisces-core') return
+    setUnreadByContact((prev) => ({ ...prev, [contactId]: 0 }))
+    try {
+      await fetch(`${apiBaseUrl}/api/chat/mark-read`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contact_id: contactId }),
+      })
+    } catch {
+      // ignore mark-read errors in UI
+    }
+  }
+
+  const submitTesterLogin = async (e) => {
+    e.preventDefault()
+    const email = testerEmail.trim().toLowerCase()
+    const avatarUrl = testerAvatarUrl.trim()
+    if (!email) {
+      setTesterError('Email is required.')
+      return
+    }
+    try {
+      setTesterSubmitting(true)
+      setTesterError('')
+      const res = await fetch(`${apiBaseUrl}/api/auth/tester`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, avatar_url: avatarUrl }),
+      })
+      const data = await res.json()
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || `Tester login failed (HTTP ${res.status})`)
+      }
+      applySignedInUser(data.user || null)
+      loadFriendsList(data.user || null)
+      setTesterModalOpen(false)
+      setTesterEmail('')
+      setTesterAvatarUrl('')
+    } catch (err) {
+      setTesterError(err?.message || 'Tester login failed.')
+    } finally {
+      setTesterSubmitting(false)
+    }
+  }
+
+  const openSettingsModal = () => {
+    if (!isSignedIn || !currentUser?.id) return
+    setSettingsError('')
+    setIdentifyCodeInput((currentUser?.identify_code || '').trim())
+    setSettingsModalOpen(true)
+  }
+
+  const saveUserSettings = async (e) => {
+    e.preventDefault()
+    if (!isSignedIn || !currentUser?.id) return
+
+    try {
+      setSettingsSaving(true)
+      setSettingsError('')
+      const res = await fetch(`${apiBaseUrl}/api/user/settings`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          identify_code: identifyCodeInput,
+        }),
+      })
+      const data = await res.json()
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || `Save failed (HTTP ${res.status})`)
+      }
+      setCurrentUser((prev) =>
+        prev
+          ? {
+              ...prev,
+              identify_code: data?.user?.identify_code || '',
+            }
+          : prev,
+      )
+      setSettingsModalOpen(false)
+    } catch (err) {
+      setSettingsError(err?.message || 'Failed to save settings.')
+    } finally {
+      setSettingsSaving(false)
+    }
+  }
+
+  const openAddFriendModal = () => {
+    if (!isSignedIn || !currentUser?.id) return
+    setAddFriendError('')
+    setAddFriendSuccess('')
+    setFriendEmailInput('')
+    setFriendAliasInput('')
+    setFriendCodeInput('')
+    setAddFriendModalOpen(true)
+  }
+
+  const submitAddFriendValidation = async (e) => {
+    e.preventDefault()
+    if (!isSignedIn || !currentUser?.id) return
+
+    const email = friendEmailInput.trim().toLowerCase()
+    const alias = friendAliasInput.trim()
+    const code = friendCodeInput.trim()
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+    if (!emailPattern.test(email)) {
+      setAddFriendError('Please enter a valid Google account email.')
+      return
+    }
+    if (alias.length < 2) {
+      setAddFriendError('Name must be at least 2 characters.')
+      return
+    }
+    const aliasTaken = contacts.some((contact) => !contact.isAi && contact.name.trim().toLowerCase() === alias.toLowerCase())
+    if (aliasTaken) {
+      setAddFriendError('This name is already used by another contact.')
+      return
+    }
+
+    try {
+      setAddFriendSubmitting(true)
+      setAddFriendError('')
+      setAddFriendSuccess('')
+      const res = await fetch(`${apiBaseUrl}/api/friend/add`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          friend_email: email,
+          friend_alias: alias,
+          identify_code: code,
+        }),
+      })
+      const data = await res.json()
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || `Add friend failed (HTTP ${res.status})`)
+      }
+      const newFriend = data?.friend || {}
+      const newContact = {
+        id: newFriend.id,
+        name: alias || newFriend.display_name || newFriend.email || 'Friend',
+        avatar: newFriend.avatar_url || '/images/fish.png',
+        snippet: '',
+        isAi: false,
+      }
+      upsertFriendContact(newContact)
+      await loadFriendsList(currentUser)
+      setAddFriendSuccess('')
+      setAddFriendError('')
+      setFriendEmailInput('')
+      setFriendAliasInput('')
+      setFriendCodeInput('')
+      setAddFriendModalOpen(false)
+      setSelectedContact(null)
+    } catch (err) {
+      setAddFriendError(err?.message || 'Add friend failed.')
+    } finally {
+      setAddFriendSubmitting(false)
+    }
+  }
+
+  const onEditContact = (contact) => {
+    setOpenContactMenuId(null)
+    setIsAliasEditing(false)
+    setAvatarUploadError('')
+    setPendingAvatarBlob(null)
+    if (pendingAvatarPreviewUrl) {
+      URL.revokeObjectURL(pendingAvatarPreviewUrl)
+      setPendingAvatarPreviewUrl('')
+    }
+    setEditForm({
+      id: contact.id,
+      isAi: Boolean(contact.isAi),
+      avatar: contact.avatar,
+      alias: contact.name,
+      aliasOriginal: contact.name,
+      specialPrompt: contact.specialPrompt || '',
+      relationship: contact.relationship || '',
+      gender: contact.gender || 'female',
+      voice: contact.voice || 'Achernar',
+      globalPrompt: contact.globalPrompt || AI_DEFAULT_GLOBAL_PROMPT,
+    })
+    setEditModalOpen(true)
+  }
+
+  const onDeleteContact = (contact) => {
+    setOpenContactMenuId(null)
+    if (contact.isAi) return
+    setContacts((prev) => prev.filter((item) => item.id !== contact.id))
+    if (selectedContact?.id === contact.id) {
+      setSelectedContact(null)
+    }
+  }
+
+  const loadContactHistory = async (contactId) => {
+    if (!isSignedIn || !currentUser?.id || !contactId) return
+    try {
+      setIsHistoryLoading(true)
+      const res = await fetch(`${apiBaseUrl}/api/chat/history`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contact_id: contactId,
+        }),
+      })
+      const data = await res.json()
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || `History load failed (HTTP ${res.status})`)
+      }
+      const nextMessages = (data.messages || []).map((message) => ({
+        id: message.id || `${message.role}-${Math.random().toString(36).slice(2, 8)}`,
+        role: message.role === 'user' ? 'user' : message.role === 'peer' ? 'peer' : 'ai',
+        text: message.text || '',
+      }))
+      setMessagesByContact((prev) => ({
+        ...prev,
+        [contactId]: nextMessages,
+      }))
+    } catch (err) {
+      setMessagesByContact((prev) => {
+        const current = prev[contactId] || []
+        return {
+          ...prev,
+          [contactId]: [
+            ...current,
+            {
+              id: `history-err-${Date.now()}`,
+              role: 'ai',
+              text: err?.message || 'Failed to load history.',
+            },
+          ],
+        }
+      })
+    } finally {
+      setIsHistoryLoading(false)
+    }
+  }
+
+  const onAliasBlur = () => {
+    if (!editForm) return
+    const trimmed = (editForm.alias || '').trim()
+    if (trimmed.length < 2) {
+      setEditForm((prev) => (prev ? { ...prev, alias: prev.aliasOriginal } : prev))
+    } else {
+      setEditForm((prev) => (prev ? { ...prev, alias: trimmed } : prev))
+    }
+    setIsAliasEditing(false)
+  }
+
+  const onSaveContactEdit = async () => {
+    if (!editForm) return
+    const aliasTrimmed = (editForm.alias || '').trim()
+    const nextAlias = aliasTrimmed.length >= 2 ? aliasTrimmed : editForm.aliasOriginal
+    const aliasCollision = contacts.some(
+      (contact) => contact.id !== editForm.id && contact.name.trim().toLowerCase() === nextAlias.toLowerCase(),
+    )
+    if (aliasCollision) {
+      setAvatarUploadError('This name is already used by another contact.')
+      return
+    }
+    let nextAvatarUrl = editForm.avatar
+
+    if (editForm.isAi) {
+      if (!currentUser?.id) {
+        setAvatarUploadError('Please sign in again before saving AI settings.')
+        return
+      }
+
+      try {
+        setIsUploadingAvatar(true)
+        setAvatarUploadError('')
+        let avatarImageBase64 = ''
+        let avatarMimeType = 'image/webp'
+
+        if (pendingAvatarBlob) {
+          avatarImageBase64 = await blobToBase64(pendingAvatarBlob)
+          avatarMimeType = pendingAvatarBlob.type || 'image/webp'
+        }
+
+        const saveRes = await fetch(`${apiBaseUrl}/api/user/ai-settings`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...(nextAvatarUrl && nextAvatarUrl.startsWith('https://')
+              ? { avatar_url: nextAvatarUrl }
+              : {}),
+            ...(avatarImageBase64
+              ? {
+                  avatar_image_base64: avatarImageBase64,
+                  avatar_mime_type: avatarMimeType,
+                }
+              : {}),
+            gender: editForm.gender,
+            voice: editForm.voice,
+            global_prompt: editForm.globalPrompt,
+          }),
+        })
+        const saveData = await saveRes.json()
+        if (!saveRes.ok || !saveData.ok) {
+          throw new Error(saveData.error || `Save failed (HTTP ${saveRes.status})`)
+        }
+        nextAvatarUrl = saveData?.user?.ai_avatar_url || nextAvatarUrl
+      } catch (err) {
+        setAvatarUploadError(err?.message || 'Save failed.')
+        setIsUploadingAvatar(false)
+        return
+      } finally {
+        setIsUploadingAvatar(false)
+      }
+    } else {
+      if (!currentUser?.id) {
+        setAvatarUploadError('Please sign in again before saving contact settings.')
+        return
+      }
+
+      try {
+        setAvatarUploadError('')
+        const saveRes = await fetch(`${apiBaseUrl}/api/friend/settings`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            friend_user_id: editForm.id,
+            alias: nextAlias,
+            special_prompt: (editForm.specialPrompt || '').trim(),
+            relationship: (editForm.relationship || '').trim(),
+          }),
+        })
+        const saveData = await saveRes.json()
+        if (!saveRes.ok || !saveData.ok) {
+          throw new Error(saveData.error || `Save failed (HTTP ${saveRes.status})`)
+        }
+      } catch (err) {
+        setAvatarUploadError(err?.message || 'Save failed.')
+        return
+      }
+    }
+
+    setContacts((prev) =>
+      prev.map((contact) => {
+        if (contact.id !== editForm.id) return contact
+        const nextContact = {
+          ...contact,
+          name: nextAlias,
+          avatar: nextAvatarUrl,
+          specialPrompt: (editForm.specialPrompt || '').trim(),
+          relationship: (editForm.relationship || '').trim(),
+        }
+        if (contact.isAi) {
+          nextContact.gender = editForm.gender
+          nextContact.voice = editForm.voice
+          nextContact.globalPrompt = editForm.globalPrompt
+        }
+        return nextContact
+      }),
+    )
+
+    if (selectedContact?.id === editForm.id) {
+      setSelectedContact((prev) =>
+        prev
+          ? {
+              ...prev,
+              name: nextAlias,
+              avatar: nextAvatarUrl,
+              specialPrompt: (editForm.specialPrompt || '').trim(),
+              relationship: (editForm.relationship || '').trim(),
+              gender: editForm.gender,
+              voice: editForm.voice,
+              globalPrompt: editForm.globalPrompt,
+            }
+          : prev,
+      )
+    }
+
+    if (editForm.isAi) {
+      setCurrentUser((prev) =>
+        prev
+          ? {
+              ...prev,
+              ai_avatar_url: nextAvatarUrl,
+              ai_settings: {
+                gender: editForm.gender,
+                voice: editForm.voice,
+                global_prompt: editForm.globalPrompt,
+              },
+            }
+          : prev,
+      )
+    }
+    if (pendingAvatarPreviewUrl) {
+      URL.revokeObjectURL(pendingAvatarPreviewUrl)
+    }
+    setPendingAvatarPreviewUrl('')
+    setPendingAvatarBlob(null)
+    setEditModalOpen(false)
+    setEditForm(null)
+    setIsAliasEditing(false)
+  }
+
+  const onPickAvatarFile = async (event) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file || !editForm?.isAi) return
+
+    if (!['image/jpeg', 'image/png'].includes(file.type)) {
+      setAvatarUploadError('Only jpg/png files are supported.')
+      return
+    }
+
+    try {
+      setAvatarUploadError('')
+      const avatarBlob = await buildAvatarWebpBlob(file)
+      const previewUrl = URL.createObjectURL(avatarBlob)
+      if (pendingAvatarPreviewUrl) {
+        URL.revokeObjectURL(pendingAvatarPreviewUrl)
+      }
+      setPendingAvatarBlob(avatarBlob)
+      setPendingAvatarPreviewUrl(previewUrl)
+      setEditForm((prev) => (prev ? { ...prev, avatar: previewUrl } : prev))
+    } catch (err) {
+      setAvatarUploadError(err?.message || 'Avatar upload failed.')
+    }
+  }
 
   useEffect(() => {
+    const restore = async () => {
+      try {
+        const res = await fetch(`${apiBaseUrl}/api/session/me`, {
+          method: 'GET',
+          credentials: 'include',
+        })
+        const data = await res.json()
+        if (res.ok && data?.ok && data?.authenticated && data?.user?.id) {
+          applySignedInUser(data.user)
+          loadFriendsList(data.user)
+        }
+      } catch {
+        // ignore restore errors and continue with defaults
+      }
+      try {
+        const rawUi = localStorage.getItem(UI_STORAGE_KEY)
+        if (rawUi) {
+          const uiState = JSON.parse(rawUi)
+          if (uiState?.selectedContactId) {
+            restoredSelectedContactIdRef.current = uiState.selectedContactId
+          }
+        }
+      } catch {
+        // ignore restore errors and continue with defaults
+      }
+    }
+    restore()
+  }, [apiBaseUrl])
+
+  useEffect(() => {
+    if (isSignedIn) return
     let cancelled = false
     let attempts = 0
 
@@ -415,6 +1241,7 @@ function LoginHome() {
 
               const res = await fetch(`${apiBaseUrl}/api/auth/google`, {
                 method: 'POST',
+                credentials: 'include',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ credential: response.credential }),
               })
@@ -422,9 +1249,8 @@ function LoginHome() {
               if (!res.ok || !data.ok) {
                 throw new Error(data.error || `Google login failed (HTTP ${res.status})`)
               }
-              setCurrentUser(data.user || null)
-              setIsSignedIn(true)
-              setSelectedContact(null)
+              applySignedInUser(data.user || null)
+              loadFriendsList(data.user || null)
             } catch (err) {
               setGoogleError(err?.message || 'Google login failed.')
             } finally {
@@ -458,7 +1284,149 @@ function LoginHome() {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [isSignedIn, apiBaseUrl])
+
+  useEffect(() => {
+    if (!isSignedIn) return
+    try {
+      localStorage.setItem(
+        UI_STORAGE_KEY,
+        JSON.stringify({
+          selectedContactId: selectedContact?.id || '',
+        }),
+      )
+    } catch {
+      // ignore storage errors
+    }
+  }, [isSignedIn, selectedContact])
+
+  useEffect(() => {
+    if (!isSignedIn || selectedContact || !restoredSelectedContactIdRef.current) return
+    const target = contacts.find((contact) => contact.id === restoredSelectedContactIdRef.current)
+    if (target) {
+      setSelectedContact(target)
+      markContactAsRead(target.id)
+      loadContactHistory(target.id)
+    }
+    restoredSelectedContactIdRef.current = null
+  }, [isSignedIn, selectedContact, contacts])
+
+  useEffect(() => {
+    if (!isSignedIn || !currentUser?.id) return
+
+    let isCancelled = false
+
+    const setupAbly = async () => {
+      try {
+        if (ablyChannelRef.current) {
+          try {
+            ablyChannelRef.current.unsubscribe()
+          } catch {
+            // ignore
+          }
+          ablyChannelRef.current = null
+        }
+        if (ablyRealtimeRef.current) {
+          try {
+            ablyRealtimeRef.current.close()
+          } catch {
+            // ignore
+          }
+          ablyRealtimeRef.current = null
+        }
+
+        const realtime = new Ably.Realtime({
+          authCallback: async (_tokenParams, callback) => {
+            try {
+              const res = await fetch(`${apiBaseUrl}/api/ably/token`, {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+              })
+              const data = await res.json()
+              if (!res.ok || !data.ok || !data.token_request) {
+                throw new Error(data.error || `Ably auth failed (${res.status})`)
+              }
+              callback(null, data.token_request)
+            } catch (err) {
+              callback(err, null)
+            }
+          },
+        })
+
+        const channel = realtime.channels.get(`user_${currentUser.id}`)
+        channel.subscribe('message.new', (message) => {
+          if (isCancelled) return
+          const payload = message?.data || {}
+          const senderId = payload.sender_user_id || ''
+          const text = payload.text || ''
+          if (!senderId || !text) return
+
+          upsertFriendContact({
+            id: senderId,
+            name: payload.sender_display_name || 'Friend',
+            avatar_url: payload.sender_avatar_url || '/images/fish.png',
+          })
+
+          setMessagesByContact((prev) => {
+            const current = prev[senderId] || []
+            return {
+              ...prev,
+              [senderId]: [
+                ...current,
+                {
+                  id: payload.message_id || `m-${Date.now()}`,
+                  role: 'peer',
+                  text,
+                },
+              ],
+            }
+          })
+
+          if (selectedContact?.id === senderId) {
+            markContactAsRead(senderId)
+          } else {
+            setUnreadByContact((prev) => ({ ...prev, [senderId]: (prev[senderId] || 0) + 1 }))
+          }
+        })
+
+        ablyRealtimeRef.current = realtime
+        ablyChannelRef.current = channel
+      } catch {
+        // ignore ably setup errors in UI
+      }
+    }
+
+    setupAbly()
+    return () => {
+      isCancelled = true
+      if (ablyChannelRef.current) {
+        try {
+          ablyChannelRef.current.unsubscribe()
+        } catch {
+          // ignore
+        }
+        ablyChannelRef.current = null
+      }
+      if (ablyRealtimeRef.current) {
+        try {
+          ablyRealtimeRef.current.close()
+        } catch {
+          // ignore
+        }
+        ablyRealtimeRef.current = null
+      }
+    }
+  }, [isSignedIn, currentUser?.id, currentUser?.provider, apiBaseUrl, selectedContact?.id])
+
+  useEffect(() => {
+    return () => {
+      if (pendingAvatarPreviewUrl) {
+        URL.revokeObjectURL(pendingAvatarPreviewUrl)
+      }
+    }
+  }, [pendingAvatarPreviewUrl])
 
   useEffect(() => {
     if (!selectedContact || !chatScrollRef.current) return
@@ -495,6 +1463,22 @@ function LoginHome() {
       clearTimeout(recordTimeoutRef.current)
       recordTimeoutRef.current = null
     }
+  }
+
+  const resetChatInputHeight = () => {
+    const el = chatInputRef.current
+    if (!el) return
+    el.style.height = `${CHAT_INPUT_BASE_HEIGHT}px`
+    el.style.overflowY = 'hidden'
+  }
+
+  const adjustChatInputHeight = () => {
+    const el = chatInputRef.current
+    if (!el) return
+    el.style.height = `${CHAT_INPUT_BASE_HEIGHT}px`
+    const nextHeight = Math.max(CHAT_INPUT_BASE_HEIGHT, Math.min(el.scrollHeight, CHAT_INPUT_MAX_HEIGHT))
+    el.style.height = `${nextHeight}px`
+    el.style.overflowY = el.scrollHeight > CHAT_INPUT_MAX_HEIGHT ? 'auto' : 'hidden'
   }
 
   const playAudioOnce = async (audioEl) => {
@@ -680,6 +1664,7 @@ function LoginHome() {
       logPhoneLive('requesting /api/live/token')
       const tokenRes = await fetch(`${apiBaseUrl}/api/live/token`, {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
       })
       const tokenData = await tokenRes.json()
@@ -984,10 +1969,12 @@ function LoginHome() {
 
             const res = await fetch(`${apiBaseUrl}/api/voice-chat`, {
               method: 'POST',
+              credentials: 'include',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 audio_base64: audioBase64,
                 mime_type: blob.type || recorder.mimeType || 'audio/webm',
+                contact_id: contactId,
               }),
             })
             const data = await res.json()
@@ -1028,6 +2015,8 @@ function LoginHome() {
       }
 
       recorder.start()
+      setChatInput('')
+      resetChatInputHeight()
       setIsRecording(true)
       setRecordElapsedMs(0)
       setShowEmojiPicker(false)
@@ -1045,6 +2034,16 @@ function LoginHome() {
       setRecordElapsedMs(0)
     }
   }
+
+  useEffect(() => {
+    adjustChatInputHeight()
+  }, [chatInput])
+
+  useEffect(() => {
+    if (!isRecording && !chatInput.trim()) {
+      resetChatInputHeight()
+    }
+  }, [isRecording, chatInput])
 
   useEffect(() => {
     return () => {
@@ -1099,9 +2098,46 @@ function LoginHome() {
         >
           <span style={{ fontSize: 13, fontWeight: 700, letterSpacing: 0.5 }}>9:41</span>
           <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
-            <IconPower />
+            <button
+              type="button"
+              onClick={clearSessionAndLogout}
+              disabled={!isSignedIn}
+              style={{
+                border: 0,
+                background: 'transparent',
+                color: 'inherit',
+                padding: 0,
+                display: 'grid',
+                placeItems: 'center',
+                cursor: isSignedIn ? 'pointer' : 'default',
+                opacity: isSignedIn ? 1 : 0.5,
+              }}
+              aria-label="Log out"
+              title="Log out"
+            >
+              <IconPower />
+            </button>
             <IconBluetooth />
-            <IconBattery />
+            <button
+              type="button"
+              onClick={() => {
+                setTesterError('')
+                setTesterModalOpen(true)
+              }}
+              style={{
+                border: 0,
+                background: 'transparent',
+                color: 'inherit',
+                padding: 0,
+                display: 'grid',
+                placeItems: 'center',
+                cursor: 'pointer',
+              }}
+              aria-label="Open tester login"
+              title="Tester login"
+            >
+              <IconBattery />
+            </button>
           </div>
         </div>
 
@@ -1156,6 +2192,9 @@ function LoginHome() {
                     gap: 16,
                   }}
                 >
+                  {isHistoryLoading ? (
+                    <div style={{ color: 'rgba(255,255,255,0.85)', fontSize: 13 }}>Loading history...</div>
+                  ) : null}
                   {(messagesByContact[selectedContact.id] || []).map((msg) => {
                     if (msg.role === 'user') {
                       return (
@@ -1198,7 +2237,7 @@ function LoginHome() {
                         }}
                       >
                         <img
-                          src="/images/fish.png"
+                          src={selectedContact?.avatar || '/images/fish.png'}
                           alt="Pisces"
                           style={{
                             width: isPadUp ? 64 : 48,
@@ -1253,56 +2292,99 @@ function LoginHome() {
                     const userMessageId = `u-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
                     const typingId = `t-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
 
-                    setMessagesByContact((prev) => {
-                      const current = prev[contactId] || []
-                      return {
-                        ...prev,
-                        [contactId]: [
-                          ...current,
-                          { id: userMessageId, role: 'user', text: input },
-                          { id: typingId, role: 'ai-typing', text: '...' },
-                        ],
-                      }
-                    })
-                    setChatInput('')
-                    setShowEmojiPicker(false)
-                    setIsAwaitingReply(true)
-
-                    try {
-                      const res = await fetch(`${apiBaseUrl}/api/chat`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ message: input }),
-                      })
-                      const data = await res.json()
-                      const aiText = res.ok && data.reply ? data.reply : data.error || `Request failed (${res.status})`
-                      const aiAudioUrl =
-                        res.ok && data.audio_base64
-                          ? `data:${data.audio_mime_type || 'audio/wav'};base64,${data.audio_base64}`
-                          : ''
-
+                    if (selectedContact.isAi) {
                       setMessagesByContact((prev) => {
                         const current = prev[contactId] || []
                         return {
                           ...prev,
-                          [contactId]: current.map((m) =>
-                            m.id === typingId
-                              ? { id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role: 'ai', text: aiText, audioUrl: aiAudioUrl }
-                              : m,
-                          ),
+                          [contactId]: [
+                            ...current,
+                            { id: userMessageId, role: 'user', text: input },
+                            { id: typingId, role: 'ai-typing', text: '...' },
+                          ],
                         }
                       })
-                    } catch (err) {
-                      const errText = err?.message || 'Unable to reach API.'
+                      setChatInput('')
+                      setShowEmojiPicker(false)
+                      setIsAwaitingReply(true)
+
+                      try {
+                        const res = await fetch(`${apiBaseUrl}/api/chat`, {
+                          method: 'POST',
+                          credentials: 'include',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            message: input,
+                            contact_id: contactId,
+                          }),
+                        })
+                        const data = await res.json()
+                        const aiText = res.ok && data.reply ? data.reply : data.error || `Request failed (${res.status})`
+                        const aiAudioUrl =
+                          res.ok && data.audio_base64
+                            ? `data:${data.audio_mime_type || 'audio/wav'};base64,${data.audio_base64}`
+                            : ''
+
+                        setMessagesByContact((prev) => {
+                          const current = prev[contactId] || []
+                          return {
+                            ...prev,
+                            [contactId]: current.map((m) =>
+                              m.id === typingId
+                                ? { id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role: 'ai', text: aiText, audioUrl: aiAudioUrl }
+                                : m,
+                            ),
+                          }
+                        })
+                      } catch (err) {
+                        const errText = err?.message || 'Unable to reach API.'
+                        setMessagesByContact((prev) => {
+                          const current = prev[contactId] || []
+                          return {
+                            ...prev,
+                            [contactId]: current.map((m) =>
+                              m.id === typingId
+                                ? { id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role: 'ai', text: errText }
+                                : m,
+                            ),
+                          }
+                        })
+                      } finally {
+                        setIsAwaitingReply(false)
+                      }
+                      return
+                    }
+
+                    setIsAwaitingReply(true)
+                    try {
+                      const res = await fetch(`${apiBaseUrl}/api/messages/send`, {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          recipient_user_id: contactId,
+                          text: input,
+                        }),
+                      })
+                      const data = await res.json()
+                      if (!res.ok || !data.ok) {
+                        throw new Error(data.error || `Send failed (${res.status})`)
+                      }
                       setMessagesByContact((prev) => {
                         const current = prev[contactId] || []
                         return {
                           ...prev,
-                          [contactId]: current.map((m) =>
-                            m.id === typingId
-                              ? { id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role: 'ai', text: errText }
-                              : m,
-                          ),
+                          [contactId]: [...current, { id: data?.message?.message_id || userMessageId, role: 'user', text: input }],
+                        }
+                      })
+                      setChatInput('')
+                      setShowEmojiPicker(false)
+                    } catch (err) {
+                      setMessagesByContact((prev) => {
+                        const current = prev[contactId] || []
+                        return {
+                          ...prev,
+                          [contactId]: [...current, { id: `e-${Date.now()}`, role: 'peer', text: err?.message || 'Unable to send message.' }],
                         }
                       })
                     } finally {
@@ -1316,7 +2398,7 @@ function LoginHome() {
                       position: 'relative',
                       display: 'grid',
                       gridTemplateColumns: micAllowed ? '1fr auto auto auto' : '1fr auto auto',
-                      alignItems: 'center',
+                      alignItems: 'end',
                       gap: 10,
                       borderRadius: 16,
                       border: '1px solid rgba(255,255,255,0.5)',
@@ -1326,7 +2408,7 @@ function LoginHome() {
                       padding: '8px 10px',
                     }}
                   >
-                    <div style={{ position: 'relative', height: 24, display: 'flex', alignItems: 'center' }}>
+                    <div style={{ position: 'relative', minHeight: CHAT_INPUT_BASE_HEIGHT, display: 'flex', alignItems: 'center' }}>
                       {isRecording ? (
                         <div
                           style={{
@@ -1346,26 +2428,44 @@ function LoginHome() {
                               height: '100%',
                               width: `${Math.min((recordElapsedMs / MAX_RECORD_MS) * 100, 100)}%`,
                               background: '#79cc63',
-                              transition: 'width 100ms linear',
-                            }}
-                          />
-                        </div>
+                            transition: 'width 100ms linear',
+                          }}
+                        />
+                      </div>
                       ) : null}
-                      <input
+                      <textarea
+                        ref={chatInputRef}
+                        rows={1}
                         value={chatInput}
                         onChange={(e) => setChatInput(e.target.value)}
                         onFocus={() => setShowEmojiPicker(false)}
+                        onCompositionStart={() => setIsInputComposing(true)}
+                        onCompositionEnd={() => setIsInputComposing(false)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && !e.shiftKey) {
+                            if (isInputComposing || e.isComposing) return
+                            e.preventDefault()
+                            if (!isRecording && !isAwaitingReply && chatInput.trim()) {
+                              e.currentTarget.form?.requestSubmit()
+                            }
+                          }
+                        }}
                         placeholder={isRecording ? '' : 'Type a message...'}
                         disabled={isRecording || isAwaitingReply}
                         style={{
-                          height: 24,
+                          height: CHAT_INPUT_BASE_HEIGHT,
                           width: '100%',
                           border: 0,
                           outline: 'none',
                           background: 'transparent',
                           color: '#fff',
                           fontSize: '1rem',
+                          lineHeight: 1.35,
                           opacity: isRecording ? 0 : 1,
+                          resize: 'none',
+                          boxSizing: 'border-box',
+                          fontFamily: 'inherit',
+                          padding: 0,
                         }}
                       />
                     </div>
@@ -1388,6 +2488,7 @@ function LoginHome() {
                           display: 'grid',
                           placeItems: 'center',
                           opacity: isAwaitingReply ? 0.5 : 1,
+                          alignSelf: 'end',
                         }}
                       >
                         {isRecording ? <IconStop /> : <IconMic />}
@@ -1405,6 +2506,7 @@ function LoginHome() {
                         display: 'grid',
                         placeItems: 'center',
                         opacity: isRecording || isAwaitingReply ? 0.5 : 1,
+                        alignSelf: 'end',
                       }}
                     >
                       <IconEmoji />
@@ -1420,6 +2522,7 @@ function LoginHome() {
                         display: 'grid',
                         placeItems: 'center',
                         opacity: isRecording || isAwaitingReply ? 0.5 : 1,
+                        alignSelf: 'end',
                       }}
                     >
                       <IconSend />
@@ -1469,6 +2572,7 @@ function LoginHome() {
             ) : (
               <div
                 className="no-scrollbar"
+                onClick={() => setOpenContactMenuId(null)}
                 style={{
                   height: '100%',
                   overflowY: 'auto',
@@ -1482,10 +2586,15 @@ function LoginHome() {
                     key={contact.id}
                     onMouseEnter={() => setHoveredContactId(contact.id)}
                     onMouseLeave={() => setHoveredContactId(null)}
-                    onClick={() => setSelectedContact(contact)}
+                    onClick={() => {
+                      setOpenContactMenuId(null)
+                      setSelectedContact(contact)
+                      markContactAsRead(contact.id)
+                      loadContactHistory(contact.id)
+                    }}
                     style={{
                       display: 'grid',
-                      gridTemplateColumns: isPadUp ? '72px 1fr' : '56px 1fr',
+                      gridTemplateColumns: isPadUp ? '72px 1fr 36px' : '56px 1fr 34px',
                       alignItems: 'center',
                       columnGap: isPadUp ? 12 : 0,
                       padding: '14px 10px 16px',
@@ -1533,6 +2642,112 @@ function LoginHome() {
                           }}
                         >
                           {contact.snippet}
+                        </div>
+                      ) : null}
+                    </div>
+                    <div style={{ justifySelf: 'end', position: 'relative' }}>
+                      {(unreadByContact[contact.id] || 0) > 0 ? (
+                        <span
+                          style={{
+                            position: 'absolute',
+                            top: -6,
+                            right: 24,
+                            minWidth: 18,
+                            height: 18,
+                            padding: '0 6px',
+                            borderRadius: 999,
+                            background: '#ff4f9a',
+                            color: '#fff',
+                            fontSize: 11,
+                            fontWeight: 700,
+                            display: 'grid',
+                            placeItems: 'center',
+                            boxShadow: '0 2px 8px rgba(0,0,0,0.28)',
+                          }}
+                        >
+                          {unreadByContact[contact.id] > 99 ? '99+' : unreadByContact[contact.id]}
+                        </span>
+                      ) : null}
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setOpenContactMenuId((prev) => (prev === contact.id ? null : contact.id))
+                        }}
+                        style={{
+                          border: 0,
+                          background: 'transparent',
+                          color: 'rgba(255,255,255,0.92)',
+                          display: 'grid',
+                          placeItems: 'center',
+                          cursor: 'pointer',
+                          padding: 2,
+                          borderRadius: 8,
+                        }}
+                        aria-label={`Open menu for ${contact.name}`}
+                      >
+                        <IconMoreVertical />
+                      </button>
+                      {openContactMenuId === contact.id ? (
+                        <div
+                          onClick={(e) => e.stopPropagation()}
+                          style={{
+                            position: 'absolute',
+                            top: 28,
+                            right: 0,
+                            minWidth: 126,
+                            background: 'rgba(46, 26, 70, 0.94)',
+                            border: '1px solid rgba(255,255,255,0.25)',
+                            borderRadius: 10,
+                            boxShadow: '0 8px 20px rgba(0,0,0,0.25)',
+                            backdropFilter: 'blur(8px)',
+                            WebkitBackdropFilter: 'blur(8px)',
+                            zIndex: 15,
+                            padding: '6px 0',
+                          }}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => onEditContact(contact)}
+                            style={{
+                              width: '100%',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 8,
+                              border: 0,
+                              background: 'transparent',
+                              color: '#fff',
+                              cursor: 'pointer',
+                              padding: '8px 12px',
+                              fontSize: 14,
+                              textAlign: 'left',
+                            }}
+                          >
+                            <IconEdit />
+                            <span>Edit</span>
+                          </button>
+                          {contact.isAi ? null : (
+                            <button
+                              type="button"
+                              onClick={() => onDeleteContact(contact)}
+                              style={{
+                                width: '100%',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: 8,
+                                border: 0,
+                                background: 'transparent',
+                                color: '#ffd7e3',
+                                cursor: 'pointer',
+                                padding: '8px 12px',
+                                fontSize: 14,
+                                textAlign: 'left',
+                              }}
+                            >
+                              <IconTrash />
+                              <span>Delete</span>
+                            </button>
+                          )}
                         </div>
                       ) : null}
                     </div>
@@ -1622,32 +2837,764 @@ function LoginHome() {
             display: 'grid',
             gridTemplateColumns: 'repeat(4, 1fr)',
             placeItems: 'center',
-            color: '#2f2454',
-          }}
-        >
-          <IconUser />
-          <IconMessage />
+          color: '#2f2454',
+        }}
+      >
           <button
             type="button"
-            onClick={openPhoneOverlay}
+            onClick={openAddFriendModal}
+            disabled={!isSignedIn}
             style={{
               border: 0,
               background: 'transparent',
               color: 'inherit',
-              cursor: 'pointer',
+              cursor: isSignedIn ? 'pointer' : 'default',
               display: 'grid',
               placeItems: 'center',
               width: '100%',
               height: '100%',
               padding: 0,
+              opacity: isSignedIn ? 1 : 0.45,
+            }}
+            aria-label="Add friend"
+          >
+            <IconUserPlus />
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (!isSignedIn) return
+              setSelectedContact(null)
+            }}
+            disabled={!isSignedIn}
+            style={{
+              border: 0,
+              background: 'transparent',
+              color: 'inherit',
+              cursor: isSignedIn ? 'pointer' : 'default',
+              display: 'grid',
+              placeItems: 'center',
+              width: '100%',
+              height: '100%',
+              padding: 0,
+              opacity: isSignedIn ? 1 : 0.45,
+            }}
+            aria-label="Contact list"
+          >
+            <IconList />
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (!isSignedIn || !selectedContact) return
+              openPhoneOverlay()
+            }}
+            disabled={!isSignedIn || !selectedContact}
+            style={{
+              border: 0,
+              background: 'transparent',
+              color: 'inherit',
+              cursor: isSignedIn && selectedContact ? 'pointer' : 'default',
+              display: 'grid',
+              placeItems: 'center',
+              width: '100%',
+              height: '100%',
+              padding: 0,
+              opacity: isSignedIn && selectedContact ? 1 : 0.45,
             }}
             aria-label="Open phone modal"
           >
             <IconPhone />
           </button>
-          <IconSettings />
+          <button
+            type="button"
+            onClick={openSettingsModal}
+            disabled={!isSignedIn}
+            style={{
+              border: 0,
+              background: 'transparent',
+              color: 'inherit',
+              cursor: isSignedIn ? 'pointer' : 'default',
+              display: 'grid',
+              placeItems: 'center',
+              width: '100%',
+              height: '100%',
+              padding: 0,
+              opacity: isSignedIn ? 1 : 0.45,
+            }}
+            aria-label="Open settings"
+          >
+            <IconSettings />
+          </button>
         </nav>
       </section>
+      {settingsModalOpen ? (
+        <div
+          onClick={() => {
+            if (settingsSaving) return
+            setSettingsModalOpen(false)
+            setSettingsError('')
+          }}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(7, 6, 14, 0.52)',
+            backdropFilter: 'blur(3px)',
+            WebkitBackdropFilter: 'blur(3px)',
+            zIndex: 54,
+            display: 'grid',
+            placeItems: 'center',
+            padding: 16,
+          }}
+        >
+          <form
+            onSubmit={saveUserSettings}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 'min(92vw, 520px)',
+              borderRadius: 18,
+              border: '1px solid rgba(255,255,255,0.35)',
+              background: 'rgba(55, 30, 78, 0.9)',
+              color: '#fff',
+              boxShadow: '0 20px 46px rgba(0,0,0,0.35)',
+              padding: 18,
+              display: 'grid',
+              gap: 12,
+            }}
+          >
+            <div style={{ fontSize: 16, fontWeight: 700 }}>Friend Verification Code</div>
+            <label style={{ display: 'grid', gap: 6 }}>
+              <input
+                type="text"
+                value={identifyCodeInput}
+                onChange={(e) => setIdentifyCodeInput(e.target.value)}
+                placeholder="Enter code (optional)"
+                style={{
+                  height: 38,
+                  borderRadius: 10,
+                  border: '1px solid rgba(255,255,255,0.35)',
+                  background: 'rgba(255,255,255,0.12)',
+                  color: '#fff',
+                  padding: '0 10px',
+                  outline: 'none',
+                }}
+              />
+            </label>
+            <p style={{ margin: 0, fontSize: 13, lineHeight: 1.45, color: 'rgba(255,255,255,0.92)' }}>
+              If you set a verification code here, anyone who adds you as a friend must enter this code.
+              If left empty, anyone can add you as a friend using your Google account.
+            </p>
+            {settingsError ? <p style={{ margin: 0, color: '#ffd7e3', fontSize: 12 }}>{settingsError}</p> : null}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button
+                type="button"
+                onClick={() => {
+                  if (settingsSaving) return
+                  setSettingsModalOpen(false)
+                  setSettingsError('')
+                }}
+                style={{
+                  border: '1px solid rgba(255,255,255,0.35)',
+                  borderRadius: 999,
+                  background: 'transparent',
+                  color: '#fff',
+                  cursor: settingsSaving ? 'default' : 'pointer',
+                  padding: '8px 14px',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={settingsSaving}
+                style={{
+                  border: '1px solid rgba(255,255,255,0.45)',
+                  borderRadius: 999,
+                  background: 'linear-gradient(135deg, rgb(255, 124, 183) 0%, rgb(236, 75, 167) 55%, rgb(237 195 255) 100%)',
+                  color: '#fff',
+                  cursor: settingsSaving ? 'default' : 'pointer',
+                  padding: '8px 16px',
+                  fontWeight: 700,
+                  opacity: settingsSaving ? 0.7 : 1,
+                }}
+              >
+                {settingsSaving ? 'Saving...' : 'Save'}
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : null}
+      {addFriendModalOpen ? (
+        <div
+          onClick={() => {
+            if (addFriendSubmitting) return
+            setAddFriendModalOpen(false)
+            setAddFriendError('')
+            setAddFriendSuccess('')
+          }}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(7, 6, 14, 0.52)',
+            backdropFilter: 'blur(3px)',
+            WebkitBackdropFilter: 'blur(3px)',
+            zIndex: 54,
+            display: 'grid',
+            placeItems: 'center',
+            padding: 16,
+          }}
+        >
+          <form
+            onSubmit={submitAddFriendValidation}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 'min(92vw, 520px)',
+              borderRadius: 18,
+              border: '1px solid rgba(255,255,255,0.35)',
+              background: 'rgba(55, 30, 78, 0.9)',
+              color: '#fff',
+              boxShadow: '0 20px 46px rgba(0,0,0,0.35)',
+              padding: 18,
+              display: 'grid',
+              gap: 12,
+            }}
+          >
+            <div style={{ fontSize: 16, fontWeight: 700 }}>Add Friend</div>
+            <label style={{ display: 'grid', gap: 6 }}>
+              <span style={{ fontSize: 13, opacity: 0.9 }}>Google Account</span>
+              <input
+                type="email"
+                required
+                value={friendEmailInput}
+                onChange={(e) => setFriendEmailInput(e.target.value)}
+                placeholder="friend@gmail.com"
+                style={{
+                  height: 38,
+                  borderRadius: 10,
+                  border: '1px solid rgba(255,255,255,0.35)',
+                  background: 'rgba(255,255,255,0.12)',
+                  color: '#fff',
+                  padding: '0 10px',
+                  outline: 'none',
+                }}
+              />
+            </label>
+            <label style={{ display: 'grid', gap: 6 }}>
+              <span style={{ fontSize: 13, opacity: 0.9 }}>Name</span>
+              <input
+                type="text"
+                required
+                minLength={2}
+                value={friendAliasInput}
+                onChange={(e) => setFriendAliasInput(e.target.value)}
+                placeholder="Contact name"
+                style={{
+                  height: 38,
+                  borderRadius: 10,
+                  border: '1px solid rgba(255,255,255,0.35)',
+                  background: 'rgba(255,255,255,0.12)',
+                  color: '#fff',
+                  padding: '0 10px',
+                  outline: 'none',
+                }}
+              />
+            </label>
+            <label style={{ display: 'grid', gap: 6 }}>
+              <span style={{ fontSize: 13, opacity: 0.9 }}>Friend Verification Code</span>
+              <input
+                type="text"
+                value={friendCodeInput}
+                onChange={(e) => setFriendCodeInput(e.target.value)}
+                placeholder="Optional"
+                style={{
+                  height: 38,
+                  borderRadius: 10,
+                  border: '1px solid rgba(255,255,255,0.35)',
+                  background: 'rgba(255,255,255,0.12)',
+                  color: '#fff',
+                  padding: '0 10px',
+                  outline: 'none',
+                }}
+              />
+            </label>
+            <p style={{ margin: 0, fontSize: 13, lineHeight: 1.45, color: 'rgba(255,255,255,0.92)' }}>
+              If the other user has set a verification code, please enter it here.
+            </p>
+            {addFriendError ? <p style={{ margin: 0, color: '#ffe56b', fontSize: 12 }}>{addFriendError}</p> : null}
+            {addFriendSuccess ? <p style={{ margin: 0, color: '#ccffe0', fontSize: 12 }}>{addFriendSuccess}</p> : null}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button
+                type="button"
+                onClick={() => {
+                  if (addFriendSubmitting) return
+                  setAddFriendModalOpen(false)
+                  setAddFriendError('')
+                  setAddFriendSuccess('')
+                }}
+                style={{
+                  border: '1px solid rgba(255,255,255,0.35)',
+                  borderRadius: 999,
+                  background: 'transparent',
+                  color: '#fff',
+                  cursor: addFriendSubmitting ? 'default' : 'pointer',
+                  padding: '8px 14px',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={addFriendSubmitting}
+                style={{
+                  border: '1px solid rgba(255,255,255,0.45)',
+                  borderRadius: 999,
+                  background: 'linear-gradient(135deg, rgb(255, 124, 183) 0%, rgb(236, 75, 167) 55%, rgb(237 195 255) 100%)',
+                  color: '#fff',
+                  cursor: addFriendSubmitting ? 'default' : 'pointer',
+                  padding: '8px 16px',
+                  fontWeight: 700,
+                  opacity: addFriendSubmitting ? 0.7 : 1,
+                }}
+              >
+                {addFriendSubmitting ? 'Checking...' : 'Submit'}
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : null}
+      {testerModalOpen ? (
+        <div
+          onClick={() => {
+            if (testerSubmitting) return
+            setTesterModalOpen(false)
+            setTesterError('')
+          }}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(7, 6, 14, 0.52)',
+            backdropFilter: 'blur(3px)',
+            WebkitBackdropFilter: 'blur(3px)',
+            zIndex: 54,
+            display: 'grid',
+            placeItems: 'center',
+            padding: 16,
+          }}
+        >
+          <form
+            onSubmit={submitTesterLogin}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 'min(92vw, 480px)',
+              borderRadius: 18,
+              border: '1px solid rgba(255,255,255,0.35)',
+              background: 'rgba(55, 30, 78, 0.9)',
+              color: '#fff',
+              boxShadow: '0 20px 46px rgba(0,0,0,0.35)',
+              padding: 18,
+              display: 'grid',
+              gap: 12,
+            }}
+          >
+            <div style={{ fontSize: 16, fontWeight: 700 }}>Tester Login</div>
+            <label style={{ display: 'grid', gap: 6 }}>
+              <span style={{ fontSize: 13, opacity: 0.9 }}>Email</span>
+              <input
+                type="email"
+                required
+                value={testerEmail}
+                onChange={(e) => setTesterEmail(e.target.value)}
+                placeholder="tester@example.com"
+                style={{
+                  height: 38,
+                  borderRadius: 10,
+                  border: '1px solid rgba(255,255,255,0.35)',
+                  background: 'rgba(255,255,255,0.12)',
+                  color: '#fff',
+                  padding: '0 10px',
+                  outline: 'none',
+                }}
+              />
+            </label>
+            <label style={{ display: 'grid', gap: 6 }}>
+              <span style={{ fontSize: 13, opacity: 0.9 }}>Avatar URL</span>
+              <input
+                type="url"
+                value={testerAvatarUrl}
+                onChange={(e) => setTesterAvatarUrl(e.target.value)}
+                placeholder="https://..."
+                style={{
+                  height: 38,
+                  borderRadius: 10,
+                  border: '1px solid rgba(255,255,255,0.35)',
+                  background: 'rgba(255,255,255,0.12)',
+                  color: '#fff',
+                  padding: '0 10px',
+                  outline: 'none',
+                }}
+              />
+            </label>
+            {testerError ? <p style={{ margin: 0, color: '#ffd7e3', fontSize: 12 }}>{testerError}</p> : null}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button
+                type="button"
+                onClick={() => {
+                  if (testerSubmitting) return
+                  setTesterModalOpen(false)
+                  setTesterError('')
+                }}
+                style={{
+                  border: '1px solid rgba(255,255,255,0.35)',
+                  borderRadius: 999,
+                  background: 'transparent',
+                  color: '#fff',
+                  cursor: testerSubmitting ? 'default' : 'pointer',
+                  padding: '8px 14px',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={testerSubmitting}
+                style={{
+                  border: '1px solid rgba(255,255,255,0.45)',
+                  borderRadius: 999,
+                  background: 'linear-gradient(135deg, rgb(255, 124, 183) 0%, rgb(236, 75, 167) 55%, rgb(237 195 255) 100%)',
+                  color: '#fff',
+                  cursor: testerSubmitting ? 'default' : 'pointer',
+                  padding: '8px 16px',
+                  fontWeight: 700,
+                  opacity: testerSubmitting ? 0.7 : 1,
+                }}
+              >
+                {testerSubmitting ? 'Signing in...' : 'Sign in'}
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : null}
+      {editModalOpen && editForm ? (
+        <div
+          onClick={() => {
+            if (pendingAvatarPreviewUrl) {
+              URL.revokeObjectURL(pendingAvatarPreviewUrl)
+            }
+            setEditModalOpen(false)
+            setEditForm(null)
+            setIsAliasEditing(false)
+            setPendingAvatarBlob(null)
+            setPendingAvatarPreviewUrl('')
+            setAvatarUploadError('')
+          }}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(7, 6, 14, 0.52)',
+            backdropFilter: 'blur(3px)',
+            WebkitBackdropFilter: 'blur(3px)',
+            zIndex: 55,
+            display: 'grid',
+            placeItems: 'center',
+            padding: 16,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 'min(92vw, 560px)',
+              maxHeight: 'min(88vh, 760px)',
+              overflowY: 'auto',
+              borderRadius: 18,
+              border: '1px solid rgba(255,255,255,0.35)',
+              background: 'rgba(55, 30, 78, 0.88)',
+              color: '#fff',
+              boxShadow: '0 20px 46px rgba(0,0,0,0.35)',
+              padding: 18,
+              display: 'grid',
+              gap: 16,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+              <button
+                type="button"
+                disabled={!editForm.isAi || isUploadingAvatar}
+                onClick={() => {
+                  if (!editForm.isAi || isUploadingAvatar) return
+                  avatarFileInputRef.current?.click()
+                }}
+                style={{
+                  border: '1px solid rgba(255,255,255,0.4)',
+                  background: 'transparent',
+                  padding: 0,
+                  borderRadius: '50%',
+                  width: 128,
+                  height: 128,
+                  cursor: editForm.isAi && !isUploadingAvatar ? 'pointer' : 'default',
+                  position: 'relative',
+                  overflow: 'hidden',
+                  flex: '0 0 auto',
+                }}
+                title={editForm.isAi ? 'Click to replace avatar (jpg/png)' : 'Avatar edit for AI only'}
+              >
+                <img
+                  src={editForm.avatar}
+                  alt="Contact avatar"
+                  style={{
+                    width: 128,
+                    height: 128,
+                    borderRadius: '50%',
+                    objectFit: 'cover',
+                    filter: 'drop-shadow(rgba(0, 0, 0, 0.25) 0px 8px 16px)',
+                    opacity: isUploadingAvatar ? 0.5 : 1,
+                  }}
+                />
+                {isUploadingAvatar ? (
+                  <span
+                    style={{
+                      position: 'absolute',
+                      inset: 0,
+                      display: 'grid',
+                      placeItems: 'center',
+                      color: '#fff',
+                      fontSize: 12,
+                      fontWeight: 700,
+                      background: 'rgba(23,13,34,0.35)',
+                    }}
+                  >
+                    Uploading...
+                  </span>
+                ) : null}
+              </button>
+              <div style={{ minHeight: 128, display: 'grid', alignContent: 'center', flex: 1 }}>
+                {isAliasEditing ? (
+                  <input
+                    autoFocus
+                    value={editForm.alias}
+                    onChange={(e) => setEditForm((prev) => (prev ? { ...prev, alias: e.target.value } : prev))}
+                    onBlur={onAliasBlur}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault()
+                        e.currentTarget.blur()
+                      }
+                    }}
+                    style={{
+                      width: '100%',
+                      maxWidth: 320,
+                      border: '1px solid rgba(255,255,255,0.45)',
+                      borderRadius: 10,
+                      background: 'rgba(255,255,255,0.12)',
+                      color: '#fff',
+                      fontSize: isPadUp ? '1.55rem' : '1.35rem',
+                      padding: '8px 12px',
+                      outline: 'none',
+                    }}
+                  />
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setIsAliasEditing(true)}
+                    style={{
+                      border: 0,
+                      background: 'transparent',
+                      color: '#fff',
+                      cursor: 'pointer',
+                      fontSize: isPadUp ? '1.55rem' : '1.35rem',
+                      textAlign: 'left',
+                      padding: 0,
+                      textShadow: '0 2px 8px rgba(41,10,57,0.35)',
+                    }}
+                  >
+                    {editForm.alias}
+                  </button>
+                )}
+              </div>
+            </div>
+            <input
+              ref={avatarFileInputRef}
+              type="file"
+              accept="image/jpeg,image/png"
+              onChange={onPickAvatarFile}
+              style={{ display: 'none' }}
+            />
+            {avatarUploadError ? (
+              <p style={{ margin: 0, fontSize: 12, color: '#ffd7e3' }}>{avatarUploadError}</p>
+            ) : null}
+
+            {editForm.isAi ? (
+              <>
+                <div style={{ display: 'grid', gap: 8 }}>
+                  <div style={{ fontSize: 13, opacity: 0.88 }}>Gender</div>
+                  <div style={{ display: 'flex', gap: 16 }}>
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                      <input
+                        type="radio"
+                        name="ai-gender"
+                        checked={editForm.gender === 'female'}
+                        onChange={() =>
+                          setEditForm((prev) => (prev ? { ...prev, gender: 'female', voice: 'Achernar' } : prev))
+                        }
+                      />
+                      <span>Female</span>
+                    </label>
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                      <input
+                        type="radio"
+                        name="ai-gender"
+                        checked={editForm.gender === 'male'}
+                        onChange={() =>
+                          setEditForm((prev) => (prev ? { ...prev, gender: 'male', voice: 'Achird' } : prev))
+                        }
+                      />
+                      <span>Male</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 12 }}>
+                  <div style={{ display: 'grid', gap: 8 }}>
+                    <div style={{ fontSize: 13, opacity: 0.88 }}>Voice</div>
+                    <select
+                      value={editForm.voice}
+                      onChange={(e) => setEditForm((prev) => (prev ? { ...prev, voice: e.target.value } : prev))}
+                      style={{
+                        height: 38,
+                        borderRadius: 10,
+                        border: '1px solid rgba(255,255,255,0.35)',
+                        background: 'rgba(255,255,255,0.12)',
+                        color: '#fff',
+                        padding: '0 10px',
+                      }}
+                    >
+                      {(editForm.gender === 'female' ? FEMALE_VOICE_OPTIONS : MALE_VOICE_OPTIONS).map((voice) => (
+                        <option key={voice} style={{ color: '#111' }} value={voice}>{voice}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div style={{ display: 'grid', gap: 8 }}>
+                  <div style={{ fontSize: 13, opacity: 0.88 }}>Glogal Prompt</div>
+                  <textarea
+                    value={editForm.globalPrompt}
+                    onChange={(e) => setEditForm((prev) => (prev ? { ...prev, globalPrompt: e.target.value } : prev))}
+                    rows={4}
+                    style={{
+                      width: '100%',
+                      borderRadius: 10,
+                      border: '1px solid rgba(255,255,255,0.35)',
+                      background: 'rgba(255,255,255,0.12)',
+                      color: '#fff',
+                      padding: 10,
+                      fontSize: 14,
+                      lineHeight: 1.4,
+                      resize: 'vertical',
+                      boxSizing: 'border-box',
+                    }}
+                  />
+                </div>
+              </>
+            ) : (
+              <div style={{ display: 'grid', gap: 12 }}>
+                <div style={{ display: 'grid', gap: 8 }}>
+                  <div style={{ fontSize: 13, opacity: 0.88 }}>Special Prompt</div>
+                  <textarea
+                    value={editForm.specialPrompt || ''}
+                    onChange={(e) => setEditForm((prev) => (prev ? { ...prev, specialPrompt: e.target.value } : prev))}
+                    rows={4}
+                    placeholder={
+                      'You can set a special prompt for this contact.\nWhen AI sends messages for you to this person, it will use this setting and ignore the Global Prompt.'
+                    }
+                    style={{
+                      width: '100%',
+                      borderRadius: 10,
+                      border: '1px solid rgba(255,255,255,0.35)',
+                      background: 'rgba(255,255,255,0.12)',
+                      color: '#fff',
+                      padding: 10,
+                      fontSize: 14,
+                      lineHeight: 1.4,
+                      resize: 'vertical',
+                      boxSizing: 'border-box',
+                    }}
+                  />
+                </div>
+                <div style={{ display: 'grid', gap: 8 }}>
+                  <div style={{ fontSize: 13, opacity: 0.88 }}>Relationship</div>
+                  <input
+                    type="text"
+                    value={editForm.relationship || ''}
+                    onChange={(e) => setEditForm((prev) => (prev ? { ...prev, relationship: e.target.value } : prev))}
+                    placeholder="Label your relationship with this contact"
+                    style={{
+                      height: 38,
+                      borderRadius: 10,
+                      border: '1px solid rgba(255,255,255,0.35)',
+                      background: 'rgba(255,255,255,0.12)',
+                      color: '#fff',
+                      padding: '0 10px',
+                      outline: 'none',
+                    }}
+                  />
+                  <p style={{ margin: 0, fontSize: 12, color: 'rgba(255,255,255,0.85)', lineHeight: 1.5 }}>
+                    You can describe your relationship with this person, for example: friend, boss, or crush.
+                    AI will use this label to adjust wording when sending messages, and the other person will not see this label.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button
+                type="button"
+                onClick={() => {
+                  if (pendingAvatarPreviewUrl) {
+                    URL.revokeObjectURL(pendingAvatarPreviewUrl)
+                  }
+                  setEditModalOpen(false)
+                  setEditForm(null)
+                  setIsAliasEditing(false)
+                  setPendingAvatarBlob(null)
+                  setPendingAvatarPreviewUrl('')
+                  setAvatarUploadError('')
+                }}
+                style={{
+                  border: '1px solid rgba(255,255,255,0.35)',
+                  borderRadius: 999,
+                  background: 'transparent',
+                  color: '#fff',
+                  cursor: 'pointer',
+                  padding: '8px 14px',
+                  fontWeight: 600,
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={onSaveContactEdit}
+                style={{
+                  border: '1px solid rgba(255,255,255,0.45)',
+                  borderRadius: 999,
+                  background: 'linear-gradient(135deg, rgb(255, 124, 183) 0%, rgb(236, 75, 167) 55%, rgb(237 195 255) 100%)',
+                  color: '#fff',
+                  cursor: 'pointer',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  padding: '8px 16px',
+                  fontSize: 14,
+                  fontWeight: 700,
+                }}
+              >
+                <IconSave />
+                <span>Save</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {showPhoneOverlay ? (
         <div
           onClick={closePhoneOverlay}
