@@ -226,6 +226,15 @@ function IconList() {
   )
 }
 
+function IconAiSpark() {
+  return (
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M12 3l1.8 4.2L18 9l-4.2 1.8L12 15l-1.8-4.2L6 9l4.2-1.8L12 3z" />
+      <path d="M19 15l.9 2.1L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.9L19 15z" />
+    </svg>
+  )
+}
+
 function IconPhone() {
   return (
     <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -332,6 +341,7 @@ function IconPlay() {
 }
 
 function formatTime(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '0:00'
   const sec = Math.max(0, Math.floor(seconds))
   const m = Math.floor(sec / 60)
   const s = sec % 60
@@ -450,10 +460,12 @@ function downsampleBuffer(float32Array, inputRate, outputRate) {
   return result
 }
 
-function AudioMessagePlayer({ audioUrl, variant = 'user' }) {
+function AudioMessagePlayer({ audioUrl, variant = 'user', durationHint = 0 }) {
   const audioRef = useRef(null)
   const [isPlaying, setIsPlaying] = useState(false)
-  const [duration, setDuration] = useState(0)
+  const [duration, setDuration] = useState(
+    Number.isFinite(durationHint) && durationHint > 0 ? durationHint : 0,
+  )
   const isAi = variant === 'ai'
   const buttonGradient = isAi
     ? 'linear-gradient(135deg, rgb(124 188 255) 0%, rgb(81 140 245) 55%, rgb(66 217 232) 100%)'
@@ -465,16 +477,33 @@ function AudioMessagePlayer({ audioUrl, variant = 'user' }) {
     const audio = audioRef.current
     if (!audio) return
 
-    const onLoaded = () => setDuration(audio.duration || 0)
+    const onLoaded = () => {
+      const d = Number(audio.duration)
+      if (Number.isFinite(d) && d > 0) {
+        setDuration(d)
+      } else if (Number.isFinite(durationHint) && durationHint > 0) {
+        setDuration(durationHint)
+      } else {
+        setDuration(0)
+      }
+    }
+    const onDurationChange = () => {
+      const d = Number(audio.duration)
+      if (Number.isFinite(d) && d > 0) {
+        setDuration(d)
+      }
+    }
     const onEnded = () => setIsPlaying(false)
 
     audio.addEventListener('loadedmetadata', onLoaded)
+    audio.addEventListener('durationchange', onDurationChange)
     audio.addEventListener('ended', onEnded)
     return () => {
       audio.removeEventListener('loadedmetadata', onLoaded)
+      audio.removeEventListener('durationchange', onDurationChange)
       audio.removeEventListener('ended', onEnded)
     }
-  }, [])
+  }, [durationHint])
 
   const togglePlay = async () => {
     const audio = audioRef.current
@@ -542,6 +571,51 @@ function AudioMessagePlayer({ audioUrl, variant = 'user' }) {
   )
 }
 
+function MessageRichContent({ msg, variant = 'user', onImageClick }) {
+  const hasAudio = !!msg.audioUrl
+  const hasImage = !!msg.imageUrl
+  const hasMusic = !!msg.musicUrl
+  const hasText = !!(msg.text || '').trim()
+  if (!hasAudio && !hasImage && !hasMusic) {
+    return hasText ? msg.text : null
+  }
+  return (
+    <div style={{ display: 'grid', gap: 8 }}>
+      {hasAudio ? (
+        <AudioMessagePlayer
+          audioUrl={msg.audioUrl}
+          variant={variant === 'ai' ? 'ai' : 'user'}
+          durationHint={Number(msg.audioDuration || 0)}
+        />
+      ) : null}
+      {hasImage ? (
+        <img
+          src={msg.imageUrl}
+          alt="Generated"
+          onClick={() => onImageClick?.(msg.imageUrl)}
+          style={{
+            width: 'min(280px, 72vw)',
+            maxWidth: '100%',
+            borderRadius: 12,
+            border: '1px solid rgba(255,255,255,0.35)',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.24)',
+            objectFit: 'cover',
+            cursor: 'zoom-in',
+          }}
+        />
+      ) : null}
+      {hasMusic ? (
+        <AudioMessagePlayer
+          audioUrl={msg.musicUrl}
+          variant={variant === 'ai' ? 'ai' : 'user'}
+          durationHint={0}
+        />
+      ) : null}
+      {hasText ? <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', overflowWrap: 'anywhere' }}>{msg.text}</div> : null}
+    </div>
+  )
+}
+
 function LoginHome() {
   useBackgroundImage('/images/background.webp')
   const apiBaseUrl = useMemo(() => getApiBaseUrl(), [])
@@ -562,6 +636,8 @@ function LoginHome() {
   const [micAllowed, setMicAllowed] = useState(false)
   const [isRecording, setIsRecording] = useState(false)
   const [isAwaitingReply, setIsAwaitingReply] = useState(false)
+  const [isAiAssistMode, setIsAiAssistMode] = useState(false)
+  const [showAiAssistTooltip, setShowAiAssistTooltip] = useState(false)
   const [showPhoneOverlay, setShowPhoneOverlay] = useState(false)
   const [phone2RotationDeg, setPhone2RotationDeg] = useState(0)
   const [showPhonePeerAvatar, setShowPhonePeerAvatar] = useState(false)
@@ -585,6 +661,7 @@ function LoginHome() {
   const [avatarUploadError, setAvatarUploadError] = useState('')
   const [settingsModalOpen, setSettingsModalOpen] = useState(false)
   const [identifyCodeInput, setIdentifyCodeInput] = useState('')
+  const [historyRangeInput, setHistoryRangeInput] = useState('30')
   const [settingsError, setSettingsError] = useState('')
   const [settingsSaving, setSettingsSaving] = useState(false)
   const [testerModalOpen, setTesterModalOpen] = useState(false)
@@ -602,6 +679,7 @@ function LoginHome() {
   const [pendingAvatarBlob, setPendingAvatarBlob] = useState(null)
   const [pendingAvatarPreviewUrl, setPendingAvatarPreviewUrl] = useState('')
   const [recordElapsedMs, setRecordElapsedMs] = useState(0)
+  const [imageViewerUrl, setImageViewerUrl] = useState('')
   const [isInputComposing, setIsInputComposing] = useState(false)
   const restoredSelectedContactIdRef = useRef(null)
   const chatScrollRef = useRef(null)
@@ -623,11 +701,67 @@ function LoginHome() {
   const phoneMicAudioContextRef = useRef(null)
   const phoneMicSourceRef = useRef(null)
   const phoneMicProcessorRef = useRef(null)
+  const phoneLiveContextRef = useRef('')
+  const lastCompositionEndAtRef = useRef(0)
   const avatarFileInputRef = useRef(null)
   const chatInputRef = useRef(null)
   const ablyRealtimeRef = useRef(null)
   const ablyChannelRef = useRef(null)
-  const callPeerAvatarUrl = (selectedContact && selectedContact.avatar) || contacts[0]?.avatar || '/images/fish.png'
+  const aiContactAvatar = contacts.find((c) => c.isAi)?.avatar || '/images/fish.png'
+  const aiAvatarForCall = currentUser?.ai_avatar_url || aiContactAvatar || '/images/fish.png'
+  const callPeerAvatarUrl = selectedContact
+    ? (selectedContact.isAi || isAiAssistMode ? aiAvatarForCall : selectedContact.avatar)
+    : aiAvatarForCall
+
+  const buildViewMessages = (rawMessages = []) => {
+    const view = []
+    const groupIndexById = {}
+    rawMessages.forEach((message) => {
+      const role = message.role
+      if (role === 'assist_user' || role === 'assist_ai') {
+        const gid = message.assist_group_id || `assist-${message.id}`
+        let idx = groupIndexById[gid]
+        if (idx == null) {
+          idx = view.length
+          groupIndexById[gid] = idx
+          view.push({
+            id: gid,
+            role: 'assist_group',
+            groupId: gid,
+            collapsed: true,
+            userText: '',
+            aiText: '',
+            aiAudioUrl: '',
+          })
+        }
+        if (role === 'assist_user') view[idx].userText = message.text || ''
+        if (role === 'assist_ai') {
+          view[idx].aiText = message.text || ''
+          view[idx].aiAudioUrl = message.audio_url || ''
+        }
+        return
+      }
+      view.push({
+        id: message.id || `${message.role}-${Math.random().toString(36).slice(2, 8)}`,
+        role:
+          message.role === 'user'
+            ? 'user'
+            : message.role === 'peer'
+              ? 'peer'
+              : message.role === 'ai_proxy'
+                ? 'ai_proxy'
+                : 'ai',
+        text: message.text || '',
+        audioUrl: message.audio_url || '',
+        audioDuration: Number(message.audio_duration_seconds || 0),
+        imageUrl: message.image_url || '',
+        musicUrl: message.music_url || '',
+        senderMode: message.sender_mode || '',
+        avatarUrl: message.avatar_url || '',
+      })
+    })
+    return view
+  }
 
   const clearSessionAndLogout = async () => {
     try {
@@ -815,12 +949,18 @@ function LoginHome() {
     if (!isSignedIn || !currentUser?.id) return
     setSettingsError('')
     setIdentifyCodeInput((currentUser?.identify_code || '').trim())
+    setHistoryRangeInput(String(currentUser?.history_range || 30))
     setSettingsModalOpen(true)
   }
 
   const saveUserSettings = async (e) => {
     e.preventDefault()
     if (!isSignedIn || !currentUser?.id) return
+
+    let historyRange = Number.parseInt(historyRangeInput, 10)
+    if (!Number.isFinite(historyRange)) historyRange = 30
+    if (historyRange < 10) historyRange = 10
+    if (historyRange > 60) historyRange = 60
 
     try {
       setSettingsSaving(true)
@@ -831,6 +971,7 @@ function LoginHome() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           identify_code: identifyCodeInput,
+          history_range: historyRange,
         }),
       })
       const data = await res.json()
@@ -842,6 +983,7 @@ function LoginHome() {
           ? {
               ...prev,
               identify_code: data?.user?.identify_code || '',
+              history_range: Number(data?.user?.history_range || historyRange),
             }
           : prev,
       )
@@ -976,11 +1118,7 @@ function LoginHome() {
       if (!res.ok || !data.ok) {
         throw new Error(data.error || `History load failed (HTTP ${res.status})`)
       }
-      const nextMessages = (data.messages || []).map((message) => ({
-        id: message.id || `${message.role}-${Math.random().toString(36).slice(2, 8)}`,
-        role: message.role === 'user' ? 'user' : message.role === 'peer' ? 'peer' : 'ai',
-        text: message.text || '',
-      }))
+      const nextMessages = buildViewMessages(data.messages || [])
       setMessagesByContact((prev) => ({
         ...prev,
         [contactId]: nextMessages,
@@ -1361,7 +1499,11 @@ function LoginHome() {
           const payload = message?.data || {}
           const senderId = payload.sender_user_id || ''
           const text = payload.text || ''
-          if (!senderId || !text) return
+          const audioUrl = payload.audio_url || ''
+          const imageUrl = payload.image_url || ''
+          const musicUrl = payload.music_url || ''
+          const audioDuration = Number(payload.audio_duration_seconds || 0)
+          if (!senderId || (!text && !audioUrl && !imageUrl && !musicUrl)) return
 
           upsertFriendContact({
             id: senderId,
@@ -1379,6 +1521,12 @@ function LoginHome() {
                   id: payload.message_id || `m-${Date.now()}`,
                   role: 'peer',
                   text,
+                  audioUrl,
+                  audioDuration,
+                  imageUrl,
+                  musicUrl,
+                  senderMode: payload.sender_mode || 'user',
+                  avatarUrl: payload.sender_avatar_url || '',
                 },
               ],
             }
@@ -1432,6 +1580,12 @@ function LoginHome() {
     if (!selectedContact || !chatScrollRef.current) return
     chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight
   }, [selectedContact, messagesByContact])
+
+  useEffect(() => {
+    if (!selectedContact || selectedContact.isAi) {
+      setIsAiAssistMode(false)
+    }
+  }, [selectedContact?.id, selectedContact?.isAi])
 
   useEffect(() => {
     let cancelled = false
@@ -1666,6 +1820,9 @@ function LoginHome() {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contact_id: selectedContact?.id || 'pisces-core',
+        }),
       })
       const tokenData = await tokenRes.json()
       logPhoneLive('live token response', { status: tokenRes.status, data: tokenData })
@@ -1682,6 +1839,13 @@ function LoginHome() {
         model: tokenData.model || 'gemini-live-2.5-flash-preview',
         config: {
           responseModalities: [Modality.AUDIO],
+          ...(tokenData.system_prompt
+            ? {
+                systemInstruction: {
+                  parts: [{ text: tokenData.system_prompt }],
+                },
+              }
+            : {}),
           speechConfig: {
             voiceConfig: {
               prebuiltVoiceConfig: {
@@ -1726,6 +1890,8 @@ function LoginHome() {
         },
       })
 
+      phoneLiveContextRef.current = String(tokenData.live_context || '')
+
       phoneLiveSessionRef.current = session
       setPhoneLiveStatus('connected')
       return true
@@ -1748,6 +1914,31 @@ function LoginHome() {
   const startGeminiLiveGreeting = () => {
     const session = phoneLiveSessionRef.current
     if (!session) return
+    const contextText = (phoneLiveContextRef.current || '').trim()
+    if (contextText) {
+      try {
+        session.sendClientContent({
+          turns: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text:
+                    'Background context only. Do not repeat this verbatim. ' +
+                    'Use it to understand speakers, tone, and relationship.\n\n' +
+                    contextText,
+                },
+              ],
+            },
+          ],
+          // Seed context first, then complete the real greeting turn.
+          turnComplete: false,
+        })
+        logPhoneLive('live context seeded', { length: contextText.length })
+      } catch (err) {
+        logPhoneLive('failed to seed live context', err)
+      }
+    }
     session.sendClientContent({
       turns: [{ role: 'user', parts: [{ text: GEMINI_LIVE_GREETING }] }],
       turnComplete: true,
@@ -1916,8 +2107,15 @@ function LoginHome() {
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const recorder = new MediaRecorder(stream)
+      const preferredMimeTypes = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+      ]
+      const pickedMimeType = preferredMimeTypes.find((type) => window.MediaRecorder.isTypeSupported?.(type))
+      const recorder = pickedMimeType ? new MediaRecorder(stream, { mimeType: pickedMimeType }) : new MediaRecorder(stream)
       const contactId = selectedContact.id
+      const startedAt = Date.now()
       recordChunksRef.current = []
       mediaStreamRef.current = stream
       mediaRecorderRef.current = recorder
@@ -1929,6 +2127,7 @@ function LoginHome() {
       }
 
       recorder.onstop = async () => {
+        const recordedDurationSeconds = Math.max(0, (Date.now() - startedAt) / 1000)
         const chunks = recordChunksRef.current
         if (mediaStreamRef.current) {
           mediaStreamRef.current.getTracks().forEach((t) => t.stop())
@@ -1944,15 +2143,32 @@ function LoginHome() {
           const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' })
           const audioUrl = URL.createObjectURL(blob)
           const audioMessageId = `ua-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+          const shouldUseAiVoiceFlow = contactId === 'pisces-core' || isAiAssistMode
+          const isAssistVoiceFlow = isAiAssistMode && contactId !== 'pisces-core'
           const typingId = `vt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+          const assistTempId = `assist-v-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
           setMessagesByContact((prev) => {
             const current = prev[contactId] || []
             return {
               ...prev,
               [contactId]: [
                 ...current,
-                { id: audioMessageId, role: 'user', audioUrl },
-                { id: typingId, role: 'ai-typing', text: '...' },
+                { id: audioMessageId, role: 'user', audioUrl, audioDuration: recordedDurationSeconds },
+                ...(isAssistVoiceFlow
+                  ? [
+                      {
+                        id: assistTempId,
+                        role: 'assist_group',
+                        groupId: assistTempId,
+                        collapsed: false,
+                        userText: '',
+                        aiText: '...',
+                        aiAudioUrl: '',
+                      },
+                    ]
+                  : shouldUseAiVoiceFlow
+                    ? [{ id: typingId, role: 'ai-typing', text: '...' }]
+                    : []),
               ],
             }
           })
@@ -1967,45 +2183,160 @@ function LoginHome() {
             }
             const audioBase64 = btoa(binary)
 
-            const res = await fetch(`${apiBaseUrl}/api/voice-chat`, {
-              method: 'POST',
-              credentials: 'include',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                audio_base64: audioBase64,
-                mime_type: blob.type || recorder.mimeType || 'audio/webm',
-                contact_id: contactId,
-              }),
-            })
-            const data = await res.json()
-            const aiText = res.ok && data.reply ? data.reply : data.error || `Request failed (${res.status})`
-            const aiAudioUrl =
-              res.ok && data.audio_base64
-                ? `data:${data.audio_mime_type || 'audio/wav'};base64,${data.audio_base64}`
-                : ''
-
-            setMessagesByContact((prev) => {
-              const current = prev[contactId] || []
-              return {
-                ...prev,
-                [contactId]: current.map((m) =>
-                  m.id === typingId
-                    ? { id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role: 'ai', text: aiText, audioUrl: aiAudioUrl }
-                    : m,
-                ),
+            if (!shouldUseAiVoiceFlow && contactId !== 'pisces-core') {
+              const res = await fetch(`${apiBaseUrl}/api/messages/send-voice`, {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  recipient_user_id: contactId,
+                  audio_base64: audioBase64,
+                  mime_type: blob.type || recorder.mimeType || 'audio/webm',
+                  duration_seconds: recordedDurationSeconds,
+                }),
+              })
+              const data = await res.json()
+              if (!res.ok || !data.ok) {
+                throw new Error(data.error || `Send failed (${res.status})`)
               }
-            })
+              setMessagesByContact((prev) => {
+                const current = prev[contactId] || []
+                return {
+                  ...prev,
+                  [contactId]: current.map((m) =>
+                    m.id === audioMessageId
+                      ? {
+                          ...m,
+                          id: data?.message?.message_id || audioMessageId,
+                          audioUrl: data?.message?.audio_url || m.audioUrl,
+                          audioDuration: Number(data?.message?.audio_duration_seconds || m.audioDuration || 0),
+                        }
+                      : m,
+                  ),
+                }
+              })
+            } else if (isAssistVoiceFlow) {
+              const sttRes = await fetch(`${apiBaseUrl}/api/speech/transcribe`, {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  audio_base64: audioBase64,
+                  mime_type: blob.type || recorder.mimeType || 'audio/webm',
+                }),
+              })
+              const sttData = await sttRes.json()
+              if (!sttRes.ok || !sttData.ok || !sttData.transcript) {
+                throw new Error(sttData.error || `Speech-to-text failed (${sttRes.status})`)
+              }
+
+              const res = await fetch(`${apiBaseUrl}/api/assist/message`, {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  contact_id: contactId,
+                  message: sttData.transcript,
+                }),
+              })
+              const data = await res.json()
+              if (!res.ok || !data.ok) {
+                throw new Error(data.error || `Assist failed (${res.status})`)
+              }
+              const assist = data.assist_group || {}
+              const assistAudioUrl = assist.audio_url
+                ? assist.audio_url
+                : assist.audio_base64 && assist.audio_mime_type
+                  ? `data:${assist.audio_mime_type};base64,${assist.audio_base64}`
+                  : ''
+              setMessagesByContact((prev) => {
+                const current = prev[contactId] || []
+                return {
+                  ...prev,
+                  [contactId]: current.map((m) =>
+                    m.id === assistTempId
+                      ? {
+                          id: assist.id || assistTempId,
+                          role: 'assist_group',
+                          groupId: assist.id || assistTempId,
+                          collapsed: false,
+                          userText: '',
+                          aiText: assist.ai_text || '',
+                          aiAudioUrl: assistAudioUrl,
+                        }
+                      : m,
+                  ),
+                }
+              })
+            } else {
+              const res = await fetch(`${apiBaseUrl}/api/voice-chat`, {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  audio_base64: audioBase64,
+                  mime_type: blob.type || recorder.mimeType || 'audio/webm',
+                  contact_id: contactId,
+                }),
+              })
+              const data = await res.json()
+              const aiText = res.ok && data.reply ? data.reply : data.error || `Request failed (${res.status})`
+              const aiAudioUrl =
+                res.ok && data.audio_base64
+                  ? `data:${data.audio_mime_type || 'audio/wav'};base64,${data.audio_base64}`
+                  : ''
+              const aiImageUrl = res.ok ? (data.image_url || '') : ''
+              const aiMusicUrl = res.ok ? (data.music_url || '') : ''
+
+              setMessagesByContact((prev) => {
+                const current = prev[contactId] || []
+                return {
+                  ...prev,
+                  [contactId]: current.map((m) =>
+                    m.id === typingId
+                      ? {
+                          id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                          role: 'ai',
+                          text: aiText,
+                          audioUrl: aiAudioUrl,
+                          imageUrl: aiImageUrl,
+                          musicUrl: aiMusicUrl,
+                        }
+                      : m,
+                  ),
+                }
+              })
+            }
           } catch (err) {
             const errText = err?.message || 'Voice chat request failed.'
             setMessagesByContact((prev) => {
               const current = prev[contactId] || []
+              if (isAssistVoiceFlow) {
+                return {
+                  ...prev,
+                  [contactId]: current.map((m) =>
+                    m.id === assistTempId
+                      ? { ...m, aiText: errText, collapsed: false }
+                      : m,
+                  ),
+                }
+              }
+              if (shouldUseAiVoiceFlow) {
+                return {
+                  ...prev,
+                  [contactId]: current.map((m) =>
+                    m.id === typingId
+                      ? { id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role: 'ai', text: errText }
+                      : m,
+                  ),
+                }
+              }
               return {
                 ...prev,
-                [contactId]: current.map((m) =>
-                  m.id === typingId
-                    ? { id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role: 'ai', text: errText }
-                    : m,
-                ),
+                [contactId]: [
+                  ...current,
+                  { id: `e-${Date.now()}`, role: 'peer', text: errText },
+                ],
               }
             })
           } finally {
@@ -2021,7 +2352,6 @@ function LoginHome() {
       setRecordElapsedMs(0)
       setShowEmojiPicker(false)
 
-      const startedAt = Date.now()
       recordIntervalRef.current = setInterval(() => {
         setRecordElapsedMs(Math.min(Date.now() - startedAt, MAX_RECORD_MS))
       }, 100)
@@ -2196,36 +2526,178 @@ function LoginHome() {
                     <div style={{ color: 'rgba(255,255,255,0.85)', fontSize: 13 }}>Loading history...</div>
                   ) : null}
                   {(messagesByContact[selectedContact.id] || []).map((msg) => {
+                    if (msg.role === 'assist_group') {
+                      return (
+                        <div
+                          key={msg.id}
+                          style={{
+                            width: '100%',
+                            borderRadius: 14,
+                            border: '1px solid rgba(255,255,255,0.34)',
+                            background: 'rgba(62, 36, 84, 0.7)',
+                            boxShadow: '0 6px 14px rgba(0,0,0,0.22)',
+                            padding: 10,
+                            display: 'grid',
+                            gap: 8,
+                          }}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setMessagesByContact((prev) => {
+                                const current = prev[selectedContact.id] || []
+                                return {
+                                  ...prev,
+                                  [selectedContact.id]: current.map((m) =>
+                                    m.id === msg.id ? { ...m, collapsed: !m.collapsed } : m,
+                                  ),
+                                }
+                              })
+                            }}
+                            style={{
+                              border: 0,
+                              background: 'transparent',
+                              color: '#ffe6ff',
+                              cursor: 'pointer',
+                              textAlign: 'left',
+                              fontSize: 12,
+                              fontWeight: 700,
+                              padding: 0,
+                            }}
+                          >
+                            {msg.collapsed ? '▶ AI Assist' : '▼ AI Assist'}
+                          </button>
+                          {msg.collapsed ? (
+                            <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.85)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                              {msg.userText || msg.aiText || 'AI assist message'}
+                            </div>
+                          ) : (
+                            <div style={{ display: 'grid', gap: 8 }}>
+                              <div
+                                style={{
+                                  justifySelf: 'end',
+                                  maxWidth: isPadUp ? '64%' : '82%',
+                                  background: 'rgba(255, 186, 231, 0.24)',
+                                  color: '#fff',
+                                  borderRadius: 14,
+                                  padding: '8px 10px',
+                                  fontSize: '0.94rem',
+                                  lineHeight: 1.35,
+                                  whiteSpace: 'pre-wrap',
+                                  wordBreak: 'break-word',
+                                  overflowWrap: 'anywhere',
+                                }}
+                              >
+                                {msg.userText}
+                              </div>
+                              <div
+                                style={{
+                                  justifySelf: 'start',
+                                  maxWidth: isPadUp ? '68%' : '86%',
+                                  background: 'rgba(127, 95, 156, 0.55)',
+                                  color: '#fff',
+                                  borderRadius: 14,
+                                  padding: '8px 10px',
+                                  fontSize: '0.94rem',
+                                  lineHeight: 1.35,
+                                  whiteSpace: 'pre-wrap',
+                                  wordBreak: 'break-word',
+                                  overflowWrap: 'anywhere',
+                                }}
+                              >
+                            {msg.aiAudioUrl ? <AudioMessagePlayer audioUrl={msg.aiAudioUrl} variant="ai" durationHint={0} /> : msg.aiText}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )
+                    }
+
                     if (msg.role === 'user') {
+                      const hasRich = !!(msg.audioUrl || msg.imageUrl || msg.musicUrl)
                       return (
                         <div key={msg.id} style={{ display: 'flex', justifyContent: 'flex-end', width: '100%' }}>
                           <div
                             style={{
-                              width: msg.audioUrl ? 'fit-content' : undefined,
+                              width: hasRich ? 'fit-content' : undefined,
                               maxWidth: isPadUp ? '62%' : '78%',
-                              background: msg.audioUrl ? 'transparent' : '#79cc63',
-                              color: msg.audioUrl ? '#fff' : '#1b2817',
+                              background: hasRich ? 'transparent' : '#79cc63',
+                              color: hasRich ? '#fff' : '#1b2817',
                               borderRadius: 18,
-                              padding: msg.audioUrl ? '0' : '10px 12px',
+                              padding: hasRich ? '0' : '10px 12px',
                               fontSize: '0.98rem',
                               lineHeight: 1.35,
                               whiteSpace: 'pre-wrap',
                               wordBreak: 'break-word',
                               overflowWrap: 'anywhere',
-                              boxShadow: msg.audioUrl ? 'none' : '0 3px 8px rgba(0,0,0,0.18)',
+                              boxShadow: hasRich ? 'none' : '0 3px 8px rgba(0,0,0,0.18)',
                             }}
                           >
-                            {msg.audioUrl ? (
-                              <AudioMessagePlayer audioUrl={msg.audioUrl} variant="user" />
-                            ) : (
-                              msg.text
-                            )}
+                            <MessageRichContent
+                              msg={msg}
+                              variant="user"
+                              onImageClick={(url) => setImageViewerUrl(url)}
+                            />
                           </div>
                         </div>
                       )
                     }
 
+                    if (msg.role === 'ai_proxy') {
+                      const hasRich = !!(msg.audioUrl || msg.imageUrl || msg.musicUrl)
+                      return (
+                        <div
+                          key={msg.id}
+                          style={{
+                            display: 'grid',
+                            gridTemplateColumns: '1fr auto',
+                            alignItems: 'end',
+                            columnGap: 8,
+                            width: '100%',
+                          }}
+                        >
+                          <div
+                            style={{
+                              justifySelf: 'end',
+                              width: 'fit-content',
+                              maxWidth: isPadUp ? '62%' : '78%',
+                              background: hasRich ? 'transparent' : 'rgba(55, 30, 78, 0.9)',
+                              color: '#fff',
+                              borderRadius: 18,
+                              padding: hasRich ? '0' : '10px 12px',
+                              fontSize: '0.98rem',
+                              lineHeight: 1.35,
+                              whiteSpace: 'pre-wrap',
+                              wordBreak: 'break-word',
+                              overflowWrap: 'anywhere',
+                              boxShadow: hasRich ? 'none' : '0 3px 8px rgba(0,0,0,0.18)',
+                            }}
+                          >
+                            <MessageRichContent
+                              msg={msg}
+                              variant="ai"
+                              onImageClick={(url) => setImageViewerUrl(url)}
+                            />
+                          </div>
+                          <img
+                            src={msg.avatarUrl || contacts[0]?.avatar || '/images/fish.png'}
+                            alt="AI proxy"
+                            style={{
+                              width: isPadUp ? 40 : 32,
+                              height: isPadUp ? 40 : 32,
+                              borderRadius: '50%',
+                              objectFit: 'cover',
+                              marginBottom: 4,
+                            }}
+                          />
+                        </div>
+                      )
+                    }
+
                     return (
+                      (() => {
+                        const hasRich = !!(msg.audioUrl || msg.imageUrl || msg.musicUrl)
+                        return (
                       <div
                         key={msg.id}
                         style={{
@@ -2237,7 +2709,7 @@ function LoginHome() {
                         }}
                       >
                         <img
-                          src={selectedContact?.avatar || '/images/fish.png'}
+                          src={msg.avatarUrl || selectedContact?.avatar || '/images/fish.png'}
                           alt="Pisces"
                           style={{
                             width: isPadUp ? 64 : 48,
@@ -2252,16 +2724,16 @@ function LoginHome() {
                             justifySelf: 'start',
                             width: 'fit-content',
                             maxWidth: isPadUp ? '66%' : '80%',
-                            background: msg.audioUrl ? 'transparent' : 'rgba(84, 84, 84, 0.88)',
+                            background: hasRich ? 'transparent' : 'rgba(84, 84, 84, 0.88)',
                             color: '#fff',
                             borderRadius: 18,
-                            padding: msg.audioUrl ? '0' : '10px 12px',
+                            padding: hasRich ? '0' : '10px 12px',
                             fontSize: '0.96rem',
                             lineHeight: 1.35,
                             whiteSpace: 'pre-wrap',
                             wordBreak: 'break-word',
                             overflowWrap: 'anywhere',
-                            boxShadow: msg.audioUrl ? 'none' : '0 3px 8px rgba(0,0,0,0.2)',
+                            boxShadow: hasRich ? 'none' : '0 3px 8px rgba(0,0,0,0.2)',
                           }}
                         >
                           {msg.role === 'ai-typing' ? (
@@ -2270,13 +2742,17 @@ function LoginHome() {
                               <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#fff', opacity: 0.4, animation: 'typingDot 1s infinite 0.2s' }} />
                               <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#fff', opacity: 0.4, animation: 'typingDot 1s infinite 0.4s' }} />
                             </span>
-                          ) : msg.audioUrl ? (
-                            <AudioMessagePlayer audioUrl={msg.audioUrl} variant="ai" />
                           ) : (
-                            msg.text
+                            <MessageRichContent
+                              msg={msg}
+                              variant="ai"
+                              onImageClick={(url) => setImageViewerUrl(url)}
+                            />
                           )}
                         </div>
                       </div>
+                        )
+                      })()
                     )
                   })}
                 </div>
@@ -2324,6 +2800,8 @@ function LoginHome() {
                           res.ok && data.audio_base64
                             ? `data:${data.audio_mime_type || 'audio/wav'};base64,${data.audio_base64}`
                             : ''
+                        const aiImageUrl = res.ok ? (data.image_url || '') : ''
+                        const aiMusicUrl = res.ok ? (data.music_url || '') : ''
 
                         setMessagesByContact((prev) => {
                           const current = prev[contactId] || []
@@ -2331,7 +2809,14 @@ function LoginHome() {
                             ...prev,
                             [contactId]: current.map((m) =>
                               m.id === typingId
-                                ? { id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role: 'ai', text: aiText, audioUrl: aiAudioUrl }
+                                ? {
+                                    id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                                    role: 'ai',
+                                    text: aiText,
+                                    audioUrl: aiAudioUrl,
+                                    imageUrl: aiImageUrl,
+                                    musicUrl: aiMusicUrl,
+                                  }
                                 : m,
                             ),
                           }
@@ -2345,6 +2830,87 @@ function LoginHome() {
                             [contactId]: current.map((m) =>
                               m.id === typingId
                                 ? { id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role: 'ai', text: errText }
+                                : m,
+                            ),
+                          }
+                        })
+                      } finally {
+                        setIsAwaitingReply(false)
+                      }
+                      return
+                    }
+
+                    if (isAiAssistMode) {
+                      const assistTempId = `assist-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+                      setMessagesByContact((prev) => {
+                        const current = prev[contactId] || []
+                        return {
+                          ...prev,
+                          [contactId]: [
+                            ...current,
+                            {
+                              id: assistTempId,
+                              role: 'assist_group',
+                              groupId: assistTempId,
+                              collapsed: false,
+                              userText: input,
+                              aiText: '...',
+                              aiAudioUrl: '',
+                            },
+                          ],
+                        }
+                      })
+                      setChatInput('')
+                      setShowEmojiPicker(false)
+                      setIsAwaitingReply(true)
+                      try {
+                        const res = await fetch(`${apiBaseUrl}/api/assist/message`, {
+                          method: 'POST',
+                          credentials: 'include',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            contact_id: contactId,
+                            message: input,
+                          }),
+                        })
+                        const data = await res.json()
+                        if (!res.ok || !data.ok) {
+                          throw new Error(data.error || `Assist failed (${res.status})`)
+                        }
+                        const assist = data.assist_group || {}
+                        const assistAudioUrl = assist.audio_url
+                          ? assist.audio_url
+                          : assist.audio_base64 && assist.audio_mime_type
+                            ? `data:${assist.audio_mime_type};base64,${assist.audio_base64}`
+                            : ''
+                        setMessagesByContact((prev) => {
+                          const current = prev[contactId] || []
+                          return {
+                            ...prev,
+                            [contactId]: current.map((m) =>
+                              m.id === assistTempId
+                                ? {
+                                    id: assist.id || assistTempId,
+                                    role: 'assist_group',
+                                    groupId: assist.id || assistTempId,
+                                    collapsed: false,
+                                    userText: assist.user_text || input,
+                                    aiText: assist.ai_text || '',
+                                    aiAudioUrl: assistAudioUrl,
+                                  }
+                                : m,
+                            ),
+                          }
+                        })
+                      } catch (err) {
+                        const errText = err?.message || 'Assist mode failed.'
+                        setMessagesByContact((prev) => {
+                          const current = prev[contactId] || []
+                          return {
+                            ...prev,
+                            [contactId]: current.map((m) =>
+                              m.id === assistTempId
+                                ? { ...m, aiText: errText, collapsed: false }
                                 : m,
                             ),
                           }
@@ -2397,12 +2963,18 @@ function LoginHome() {
                     style={{
                       position: 'relative',
                       display: 'grid',
-                      gridTemplateColumns: micAllowed ? '1fr auto auto auto' : '1fr auto auto',
+                      gridTemplateColumns: !selectedContact?.isAi
+                        ? (micAllowed ? '1fr auto auto auto auto' : '1fr auto auto auto')
+                        : (micAllowed ? '1fr auto auto auto' : '1fr auto auto'),
                       alignItems: 'end',
                       gap: 10,
                       borderRadius: 16,
-                      border: '1px solid rgba(255,255,255,0.5)',
-                      background: 'rgba(255,255,255,0.18)',
+                      border: isAiAssistMode && !selectedContact?.isAi
+                        ? '1px solid rgba(255, 196, 241, 0.9)'
+                        : '1px solid rgba(255,255,255,0.5)',
+                      background: isAiAssistMode && !selectedContact?.isAi
+                        ? 'rgba(116, 54, 125, 0.45)'
+                        : 'rgba(255,255,255,0.18)',
                       backdropFilter: 'blur(8px)',
                       WebkitBackdropFilter: 'blur(8px)',
                       padding: '8px 10px',
@@ -2440,10 +3012,22 @@ function LoginHome() {
                         onChange={(e) => setChatInput(e.target.value)}
                         onFocus={() => setShowEmojiPicker(false)}
                         onCompositionStart={() => setIsInputComposing(true)}
-                        onCompositionEnd={() => setIsInputComposing(false)}
+                        onCompositionEnd={() => {
+                          setIsInputComposing(false)
+                          lastCompositionEndAtRef.current = Date.now()
+                        }}
                         onKeyDown={(e) => {
                           if (e.key === 'Enter' && !e.shiftKey) {
-                            if (isInputComposing || e.isComposing) return
+                            const nativeEvent = e.nativeEvent || {}
+                            const keyCode = Number(e.keyCode || nativeEvent.keyCode || nativeEvent.which || 0)
+                            const isImeComposing =
+                              isInputComposing ||
+                              e.isComposing ||
+                              nativeEvent.isComposing ||
+                              keyCode === 229 ||
+                              e.key === 'Process' ||
+                              Date.now() - lastCompositionEndAtRef.current < 40
+                            if (isImeComposing) return
                             e.preventDefault()
                             if (!isRecording && !isAwaitingReply && chatInput.trim()) {
                               e.currentTarget.form?.requestSubmit()
@@ -2458,7 +3042,7 @@ function LoginHome() {
                           border: 0,
                           outline: 'none',
                           background: 'transparent',
-                          color: '#fff',
+                          color: isAiAssistMode && !selectedContact?.isAi ? '#ffe9ff' : '#fff',
                           fontSize: '1rem',
                           lineHeight: 1.35,
                           opacity: isRecording ? 0 : 1,
@@ -2469,6 +3053,68 @@ function LoginHome() {
                         }}
                       />
                     </div>
+                    {!selectedContact?.isAi ? (
+                      <div
+                        style={{ position: 'relative', alignSelf: 'end', display: 'grid' }}
+                        onMouseEnter={() => setShowAiAssistTooltip(true)}
+                        onMouseLeave={() => setShowAiAssistTooltip(false)}
+                      >
+                        <button
+                          type="button"
+                          disabled={isRecording || isAwaitingReply}
+                          onClick={() => {
+                            setShowAiAssistTooltip(false)
+                            setIsAiAssistMode((v) => !v)
+                          }}
+                          onFocus={() => setShowAiAssistTooltip(true)}
+                          onBlur={() => setShowAiAssistTooltip(false)}
+                          style={{
+                            border: isAiAssistMode ? '1px solid rgba(255, 202, 247, 0.85)' : '1px solid rgba(255,255,255,0.35)',
+                            background: isAiAssistMode ? 'rgba(255, 184, 237, 0.26)' : 'transparent',
+                            color: isAiAssistMode ? '#ffd6f4' : '#fff',
+                            borderRadius: 999,
+                            cursor: isRecording || isAwaitingReply ? 'default' : 'pointer',
+                            display: 'grid',
+                            placeItems: 'center',
+                            width: 28,
+                            height: 28,
+                            opacity: isRecording || isAwaitingReply ? 0.5 : 1,
+                            alignSelf: 'end',
+                          }}
+                          aria-label="Toggle AI mode for this chat"
+                        >
+                          <IconAiSpark />
+                        </button>
+                        {showAiAssistTooltip ? (
+                          <div
+                            style={{
+                              position: 'absolute',
+                              right: 0,
+                              bottom: 40,
+                              width: 'min(360px, 78vw)',
+                              background: 'rgba(59, 35, 88, 0.96)',
+                              border: '1px solid rgba(255,255,255,0.35)',
+                              borderRadius: 12,
+                              padding: '10px 12px',
+                              color: '#ffeaff',
+                              fontSize: 13,
+                              lineHeight: 1.45,
+                              boxShadow: '0 10px 24px rgba(0,0,0,0.28)',
+                              backdropFilter: 'blur(8px)',
+                              WebkitBackdropFilter: 'blur(8px)',
+                              zIndex: 30,
+                              pointerEvents: 'none',
+                            }}
+                          >
+                            <div>
+                              Click here to enter AI mode. Your text, voice, and calls will be directed to your AI.
+                            </div>
+                            <div style={{ marginTop: 6 }}>• AI will automatically understand your conversation with this contact.</div>
+                            <div>• The other person will not see your conversation with AI.</div>
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
                     {micAllowed ? (
                       <button
                         type="button"
@@ -2483,7 +3129,7 @@ function LoginHome() {
                         style={{
                           border: 0,
                           background: 'transparent',
-                          color: '#fff',
+                          color: isAiAssistMode && !selectedContact?.isAi ? '#ffd6f4' : '#fff',
                           cursor: isAwaitingReply ? 'default' : 'pointer',
                           display: 'grid',
                           placeItems: 'center',
@@ -2581,7 +3227,7 @@ function LoginHome() {
                   padding: isPadUp ? '0px 24px 0px' : '0px 4px 0px',
                 }}
               >
-                {contacts.map((contact, index) => (
+                {contacts.map((contact) => (
                   <article
                     key={contact.id}
                     onMouseEnter={() => setHoveredContactId(contact.id)}
@@ -2598,8 +3244,8 @@ function LoginHome() {
                       alignItems: 'center',
                       columnGap: isPadUp ? 12 : 0,
                       padding: '14px 10px 16px',
-                      borderRadius: isPadUp ? 0 : 14,
-                      borderBottom: hoveredContactId === contact.id ? 'none' : '1px solid #d8d8d8',
+                      borderRadius: 0,
+                      borderBottom: '1px solid rgb(216, 216, 216)',
                       boxShadow: hoveredContactId === contact.id ? 'rgba(0, 0, 0, 0.45) 0px 17px 20px -20px' : 'none',
                       transition: 'box-shadow 160ms ease, border-color 160ms ease',
                       position: 'relative',
@@ -2752,18 +3398,6 @@ function LoginHome() {
                       ) : null}
                     </div>
 
-                    {index === contacts.length - 1 ? null : (
-                      <div
-                        style={{
-                          position: 'absolute',
-                          left: 10,
-                          right: 10,
-                          bottom: 0,
-                          height: 1,
-                          boxShadow: '0 12px 14px 1px rgba(75, 22, 96, 0.55)',
-                        }}
-                      />
-                    )}
                   </article>
                 ))}
               </div>
@@ -2983,6 +3617,30 @@ function LoginHome() {
             <p style={{ margin: 0, fontSize: 13, lineHeight: 1.45, color: 'rgba(255,255,255,0.92)' }}>
               If you set a verification code here, anyone who adds you as a friend must enter this code.
               If left empty, anyone can add you as a friend using your Google account.
+            </p>
+            <label style={{ display: 'grid', gap: 6 }}>
+              <span style={{ fontSize: 13, opacity: 0.9 }}>History Range</span>
+              <input
+                type="number"
+                min={10}
+                max={60}
+                step={1}
+                value={historyRangeInput}
+                onChange={(e) => setHistoryRangeInput(e.target.value)}
+                style={{
+                  height: 38,
+                  borderRadius: 10,
+                  border: '1px solid rgba(255,255,255,0.35)',
+                  background: 'rgba(255,255,255,0.12)',
+                  color: '#fff',
+                  padding: '0 10px',
+                  outline: 'none',
+                }}
+              />
+            </label>
+            <p style={{ margin: 0, fontSize: 13, lineHeight: 1.45, color: 'rgba(255,255,255,0.92)' }}>
+              When AI needs to send messages for you or provide advice, this controls how many recent messages
+              from your conversation with that contact AI is allowed to read.
             </p>
             {settingsError ? <p style={{ margin: 0, color: '#ffd7e3', fontSize: 12 }}>{settingsError}</p> : null}
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
@@ -3678,6 +4336,38 @@ function LoginHome() {
       ) : null}
       <audio ref={phoneRingAudioRef} src="/images/phone_ring.wav" preload="auto" />
       <audio ref={phonePickupAudioRef} src="/images/phone_pickup.wav" preload="auto" />
+      {imageViewerUrl ? (
+        <div
+          onClick={() => setImageViewerUrl('')}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(9, 3, 18, 0.82)',
+            backdropFilter: 'blur(4px)',
+            WebkitBackdropFilter: 'blur(4px)',
+            display: 'grid',
+            placeItems: 'center',
+            zIndex: 3000,
+            cursor: 'zoom-out',
+            padding: 20,
+          }}
+        >
+          <img
+            src={imageViewerUrl}
+            alt="Preview"
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 'min(92vw, 1200px)',
+              maxHeight: '88vh',
+              borderRadius: 14,
+              border: '1px solid rgba(255,255,255,0.35)',
+              boxShadow: '0 24px 60px rgba(0,0,0,0.45)',
+              objectFit: 'contain',
+              background: 'rgba(0,0,0,0.15)',
+            }}
+          />
+        </div>
+      ) : null}
     </main>
   )
 }

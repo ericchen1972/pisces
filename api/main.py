@@ -6,6 +6,8 @@ import struct
 import hashlib
 import asyncio
 import uuid
+import math
+import random
 from datetime import datetime, timedelta, timezone
 from urllib import error, request
 from urllib.parse import urlencode
@@ -15,6 +17,7 @@ from google.auth.transport import requests as google_requests
 from google.cloud import firestore
 from google.cloud import speech_v1 as speech
 from google import genai
+from google.genai import types as genai_types
 from google.oauth2 import id_token
 from google.oauth2 import service_account
 from ably import AblyRest
@@ -31,6 +34,14 @@ GOOGLE_CLIENT_ID = os.getenv(
 CHAT_MODEL = "gemini-2.5-flash"
 TTS_MODEL = "gemini-2.5-pro-preview-tts"
 LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+IMAGE_MODEL_CANDIDATES = [
+    "gemini-3.1-flash-image-preview",
+    "gemini-3-pro-image-preview",
+    "gemini-2.5-flash-image",
+    "gemini-2.0-flash-exp-image-generation",
+]
+MUSIC_MODEL = "models/lyria-realtime-exp"
+MUSIC_DURATION_SECONDS = 30
 AI_DEFAULT_GLOBAL_PROMPT = (
     "You are a polite, warm, and thoughtful AI communication partner."
 )
@@ -168,6 +179,225 @@ def count_en_words(text):
     return len(words)
 
 
+def has_explicit_voice_request(text):
+    value = (text or "").strip().lower()
+    if not value:
+        return False
+    zh_patterns = [
+        r"唸給我聽",
+        r"念給我聽",
+        r"讀給我聽",
+        r"朗讀",
+        r"語音",
+        r"講出來",
+        r"說出來",
+    ]
+    en_patterns = [
+        r"\bread\b",
+        r"\bread aloud\b",
+        r"\bsay aloud\b",
+        r"\bspeak\b",
+        r"\bnarrate\b",
+        r"\bpronounce\b",
+    ]
+    for pattern in zh_patterns + en_patterns:
+        if re.search(pattern, value):
+            return True
+    return False
+
+
+def has_forward_intent_in_ai_room(text):
+    value = (text or "").strip().lower()
+    if not value:
+        return False
+    zh_patterns = [
+        r"幫我.*(說|問|告訴|傳|傳送|轉傳|發送|送)",
+        r"跟.+說",
+        r"告訴.+",
+        r"幫我傳",
+        r"代我",
+        r"(傳|傳送|轉傳|發送|送).+給",
+        r"給.+(傳|傳送|轉傳|發送|送)",
+        r"把.+給.+",
+    ]
+    en_patterns = [
+        r"\btell\b.+\b",
+        r"\bask\b.+\b",
+        r"\bsend\b.+\bto\b",
+        r"\bforward\b.+\bto\b",
+        r"\bdeliver\b.+\bto\b",
+        r"\bmessage\b.+\b",
+        r"\bfor me\b",
+    ]
+    for pattern in zh_patterns + en_patterns:
+        if re.search(pattern, value):
+            return True
+    return False
+
+
+def has_send_to_friend_intent(text):
+    value = (text or "").strip().lower()
+    if not value:
+        return False
+    zh_patterns = [
+        r"幫我.*(說|問|告訴|轉達|傳|傳送|傳話|發送|送|問候)",
+        r"(跟|向).+(說|問|告訴|問候)",
+        r"告訴.+",
+        r"問候.+",
+        r"代我",
+        r"(傳|傳送|轉傳|發送|送).+給",
+        r"給.+(傳|傳送|轉傳|發送|送)",
+        r"把.+給.+",
+    ]
+    en_patterns = [
+        r"\bhelp me\b.*\b(tell|ask|message|send|greet)\b",
+        r"\b(tell|ask|message|send|greet)\b.+\b(for me|to)\b",
+        r"\b(forward|deliver)\b.+\bto\b",
+    ]
+    for pattern in zh_patterns + en_patterns:
+        if re.search(pattern, value):
+            return True
+    return False
+
+
+def has_draw_image_intent(text):
+    value = (text or "").strip().lower()
+    if not value:
+        return False
+    zh_patterns = [r"畫", r"繪", r"圖片", r"插畫", r"生成圖", r"做一張圖"]
+    en_patterns = [r"\bdraw\b", r"\bimage\b", r"\billustration\b", r"\bpicture\b", r"\bgenerate an image\b"]
+    for pattern in zh_patterns + en_patterns:
+        if re.search(pattern, value):
+            return True
+    return False
+
+
+def has_create_music_intent(text):
+    value = (text or "").strip().lower()
+    if not value:
+        return False
+    zh_patterns = [
+        r"音樂",
+        r"配樂",
+        r"歌曲",
+        r"作曲",
+        r"旋律",
+        r"背景音樂",
+        r"爵士樂",
+        r"古典樂",
+        r"搖滾樂",
+        r"電音",
+        r"創作.*樂",
+        r"做一段.*樂",
+        r"生成.*樂",
+        r"編一段.*樂",
+    ]
+    en_patterns = [r"\bmusic\b", r"\bsong\b", r"\bcompose\b", r"\btrack\b", r"\binstrumental\b"]
+    for pattern in zh_patterns + en_patterns:
+        if re.search(pattern, value):
+            return True
+    return False
+
+
+def has_lyrics_request(text):
+    value = (text or "").strip().lower()
+    if not value:
+        return False
+    zh_patterns = [r"歌詞", r"詞", r"寫歌", r"作詞", r"唱", r"人聲"]
+    en_patterns = [r"\blyrics\b", r"\bvocals?\b", r"\bsing\b", r"\bwrite.*song\b", r"\bwrite.*lyrics\b"]
+    for pattern in zh_patterns + en_patterns:
+        if re.search(pattern, value):
+            return True
+    return False
+
+
+def has_explicit_send_as_user_intent(text):
+    value = (text or "").strip().lower()
+    if not value:
+        return False
+    zh_patterns = [
+        r"用我的名義",
+        r"以我的名義",
+        r"代表我",
+        r"替我本人",
+    ]
+    en_patterns = [
+        r"\bin my name\b",
+        r"\bas me\b",
+        r"\bfrom me\b",
+        r"\buse my name\b",
+        r"\bon my behalf\b",
+    ]
+    for pattern in zh_patterns + en_patterns:
+        if re.search(pattern, value):
+            return True
+    return False
+
+
+def normalize_friend_outbound_text(user_message, friend_name):
+    text = (user_message or "").strip()
+    if not text:
+        return ""
+
+    patterns = [
+        rf"^\s*幫我(?:用語音)?(?:跟|向)?\s*{re.escape(friend_name)}\s*(?:說|問|告訴|問候)?\s*(?:一下)?[，,\s]*",
+        rf"^\s*(?:跟|向)\s*{re.escape(friend_name)}\s*(?:說|問|告訴|問候)\s*[，,\s]*",
+        rf"^\s*請(?:你)?(?:幫我)?(?:跟|向)?\s*{re.escape(friend_name)}\s*(?:說|問|告訴|問候)?\s*(?:一下)?[，,\s]*",
+    ]
+    cleaned = text
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip("，, 。.!?？")
+    return cleaned or text
+
+
+def list_user_friends(user_id):
+    client = get_firestore_client()
+    docs = list(
+        client.collection("friendships")
+        .where("status", "==", "accepted")
+        .stream()
+    )
+    friends = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        user_a_id = (data.get("user_a_id") or "").strip()
+        user_b_id = (data.get("user_b_id") or "").strip()
+        if user_id not in (user_a_id, user_b_id):
+            continue
+        is_a = user_id == user_a_id
+        friend_id = user_b_id if is_a else user_a_id
+        alias = (data.get("alias_for_a") or "").strip() if is_a else (data.get("alias_for_b") or "").strip()
+        display_name = (data.get("user_b_display_name") or "").strip() if is_a else (data.get("user_a_display_name") or "").strip()
+        email = (data.get("user_b_email") or "").strip().lower() if is_a else (data.get("user_a_email") or "").strip().lower()
+        friends.append(
+            {
+                "id": friend_id,
+                "alias": alias,
+                "display_name": display_name,
+                "email": email,
+            }
+        )
+    return friends
+
+
+def find_friend_from_message(user_id, text):
+    value = (text or "").strip().lower()
+    if not value:
+        return None
+    for friend in list_user_friends(user_id):
+        candidates = [friend.get("alias") or "", friend.get("display_name") or ""]
+        email = friend.get("email") or ""
+        if email:
+            candidates.append(email.split("@", 1)[0])
+            candidates.append(email)
+        for candidate in candidates:
+            token = candidate.strip().lower()
+            if token and token in value:
+                return friend
+    return None
+
+
 def build_chat_tool_decision(user_message, global_prompt, history_messages):
     instruction = (
         "You are Pisces AI. Follow the persona/global prompt below first, then decide whether "
@@ -211,6 +441,11 @@ def build_chat_tool_decision(user_message, global_prompt, history_messages):
 
     if language not in ("zh-TW", "en-US"):
         language = "zh-TW"
+
+    if should_read_aloud and not has_explicit_voice_request(user_message):
+        should_read_aloud = False
+        tone_prompt = ""
+        reason = "voice_not_explicitly_requested"
 
     if not reply:
         # Fallback to regular text generation if JSON output is malformed.
@@ -268,18 +503,10 @@ def generate_plain_text_reply(user_message, global_prompt, history_messages):
 
 
 def synthesize_tts_audio(text, language, voice_name, tone_prompt=""):
-    if language == "en-US":
-        style_prompt = tone_prompt or "gentle tone"
-        locale_hint = "English (United States)"
-    else:
-        style_prompt = tone_prompt or "溫柔的語氣"
-        locale_hint = "Chinese, Mandarin (Taiwan)"
-
-    prompt = (
-        f"Read the following text in {locale_hint}. "
-        f"Use this speaking style: {style_prompt}. "
-        f"Text: {text}"
-    )
+    # Keep TTS input as plain message text to avoid speaking prompt metadata.
+    prompt = (text or "").strip()
+    if not prompt:
+        raise RuntimeError("TTS text is empty")
     payload = {
         "contents": [
             {
@@ -474,6 +701,272 @@ def upload_avatar_to_vercel_blob(user_id, image_bytes, mime_type="image/webp"):
     return blob_url
 
 
+def _audio_ext_from_mime(mime_type):
+    mime = (mime_type or "").lower()
+    if "mpeg" in mime or "mp3" in mime:
+        return "mp3"
+    if "ogg" in mime:
+        return "ogg"
+    if "webm" in mime:
+        return "webm"
+    if "wav" in mime or "l16" in mime or "pcm" in mime:
+        return "wav"
+    return "wav"
+
+
+def upload_audio_to_vercel_blob(user_id, audio_bytes, mime_type="audio/wav"):
+    token = get_blob_rw_token()
+    if not token:
+        raise RuntimeError("BLOB_READ_WRITE_TOKEN is not configured")
+    if not audio_bytes:
+        raise RuntimeError("audio payload is empty")
+
+    ext = _audio_ext_from_mime(mime_type)
+    content_type = mime_type or "audio/wav"
+    pathname = f"audios/{user_id}/voice_{int(datetime.now(timezone.utc).timestamp() * 1000)}.{ext}"
+    endpoint = f"https://vercel.com/api/blob/?{urlencode({'pathname': pathname})}"
+    req = request.Request(
+        endpoint,
+        data=audio_bytes,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "x-vercel-blob-access": "public",
+            "x-content-type": content_type,
+            "x-add-random-suffix": "0",
+            "x-api-version": "12",
+            "Content-Type": content_type,
+        },
+        method="PUT",
+    )
+    try:
+        with request.urlopen(req, timeout=45) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"blob upload failed: {detail}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"blob upload failed: {exc}") from exc
+
+    blob_url = (payload.get("url") or "").strip()
+    if not blob_url.startswith("https://"):
+        raise RuntimeError("blob upload succeeded but no valid url returned")
+    return blob_url
+
+
+def upload_image_to_vercel_blob(user_id, image_bytes, mime_type="image/png"):
+    token = get_blob_rw_token()
+    if not token:
+        raise RuntimeError("BLOB_READ_WRITE_TOKEN is not configured")
+    if not image_bytes:
+        raise RuntimeError("image payload is empty")
+
+    ext = "png" if "png" in (mime_type or "").lower() else "jpg"
+    content_type = mime_type or "image/png"
+    pathname = f"images/{user_id}/image_{int(datetime.now(timezone.utc).timestamp() * 1000)}.{ext}"
+    endpoint = f"https://vercel.com/api/blob/?{urlencode({'pathname': pathname})}"
+    req = request.Request(
+        endpoint,
+        data=image_bytes,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "x-vercel-blob-access": "public",
+            "x-content-type": content_type,
+            "x-add-random-suffix": "0",
+            "x-api-version": "12",
+            "Content-Type": content_type,
+        },
+        method="PUT",
+    )
+    try:
+        with request.urlopen(req, timeout=45) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"blob upload failed: {detail}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"blob upload failed: {exc}") from exc
+
+    blob_url = (payload.get("url") or "").strip()
+    if not blob_url.startswith("https://"):
+        raise RuntimeError("blob upload succeeded but no valid url returned")
+    return blob_url
+
+
+def generate_image_with_gemini(prompt):
+    text_prompt = (prompt or "").strip() or "Create a beautiful illustration."
+    last_err = ""
+    for model_name in IMAGE_MODEL_CANDIDATES:
+        payload = {
+            "contents": [{"parts": [{"text": text_prompt}]}],
+            "generationConfig": {
+                "responseModalities": ["TEXT", "IMAGE"],
+            },
+        }
+        try:
+            data = call_gemini_generate_content(payload, model=model_name, timeout=90)
+            candidates = data.get("candidates") or []
+            if not candidates:
+                raise RuntimeError("no candidates")
+            content = candidates[0].get("content") or {}
+            parts = content.get("parts") or []
+            for part in parts:
+                inline_data = part.get("inlineData") or {}
+                image_b64 = (inline_data.get("data") or "").strip()
+                mime_type = (inline_data.get("mimeType") or "image/png").strip()
+                if image_b64:
+                    return base64.b64decode(image_b64), mime_type
+            raise RuntimeError("no inline image in response")
+        except Exception as exc:
+            last_err = f"{model_name}: {exc}"
+            continue
+    raise RuntimeError(last_err or "all image models failed")
+
+
+def build_tool_status_reply(want_image, want_music, image_url, music_url, image_error="", music_error=""):
+    parts = []
+    if want_image:
+        if image_url:
+            parts.append("Image created successfully.")
+        else:
+            reason = (image_error or "image tool unavailable").split("\n", 1)[0][:180]
+            parts.append(f"Image generation failed: {reason}")
+    if want_music:
+        if music_url:
+            parts.append("Music created successfully.")
+        else:
+            reason = (music_error or "music tool unavailable").split("\n", 1)[0][:180]
+            parts.append(f"Music generation failed: {reason}")
+    return " ".join(parts).strip()
+
+
+def synthesize_music_wav_bytes_fallback(seed_text, duration_seconds=MUSIC_DURATION_SECONDS):
+    sample_rate = 24000
+    duration_seconds = max(4, min(int(duration_seconds), 30))
+    total_samples = sample_rate * duration_seconds
+    pcm = bytearray()
+
+    seed_int = int(hashlib.sha1((seed_text or "pisces music").encode("utf-8")).hexdigest()[:8], 16)
+    rng = random.Random(seed_int)
+    scale_hz = [220.00, 246.94, 261.63, 293.66, 329.63, 369.99, 392.00, 440.00]
+    beat_samples = sample_rate // 2
+    t = 0
+    while t < total_samples:
+        freq = rng.choice(scale_hz) * (2 if rng.random() > 0.75 else 1)
+        note_len = beat_samples * (1 if rng.random() > 0.35 else 2)
+        note_end = min(total_samples, t + note_len)
+        for i in range(t, note_end):
+            dt = i / sample_rate
+            env = min(1.0, (i - t) / (sample_rate * 0.03))
+            tail = max(0.0, (note_end - i) / (sample_rate * 0.05))
+            amp = min(env, tail if tail > 0 else env) * 0.26
+            sample = amp * (math.sin(2 * math.pi * freq * dt) + 0.35 * math.sin(2 * math.pi * (freq * 2.0) * dt))
+            s16 = int(max(-1.0, min(1.0, sample)) * 32767)
+            pcm.extend(struct.pack("<h", s16))
+        t = note_end
+
+    return pcm16_to_wav_bytes(bytes(pcm), sample_rate=sample_rate, channels=1)
+
+
+def plan_music_request(seed_text):
+    default = {
+        "prompt": (seed_text or "instrumental electronic music").strip(),
+        "bpm": 110,
+        "temperature": 1.0,
+    }
+    if not (seed_text or "").strip():
+        return default
+    payload = {
+        "system_instruction": {
+            "parts": [{
+                "text": (
+                    "You convert a user's natural-language music request into a concise prompt for Lyria music generation. "
+                    "Return strict JSON only with keys: prompt (string), bpm (integer 60-180), temperature (number 0.4-1.4). "
+                    "Preserve requested genre/mood/instruments exactly when possible. "
+                    "Build a STYLE-LOCK prompt with concrete instrumentation + rhythm so output doesn't drift. "
+                    "If user asks electronic music, include synth bass, drum machine, arpeggiator, sidechain-like pumping feel. "
+                    "If user asks jazz, include jazz harmony/swing/brush drums or upright bass where appropriate. "
+                    "If user asks baroque/classical, include strings/harpsichord/counterpoint language."
+                )
+            }]
+        },
+        "contents": [{"parts": [{"text": seed_text}]}],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }
+    try:
+        resp = call_gemini_generate_content(payload, model=CHAT_MODEL, timeout=20)
+        obj = json.loads(extract_text_from_response(resp) or "{}")
+        prompt = str(obj.get("prompt") or "").strip() or default["prompt"]
+        bpm = int(obj.get("bpm") or default["bpm"])
+        temperature = float(obj.get("temperature") or default["temperature"])
+        bpm = max(60, min(180, bpm))
+        temperature = max(0.4, min(1.4, temperature))
+        return {"prompt": prompt, "bpm": bpm, "temperature": temperature}
+    except Exception:
+        return default
+
+
+def generate_music_with_lyria(seed_text, duration_seconds=MUSIC_DURATION_SECONDS):
+    gemini_api_key = get_gemini_api_key()
+    if not gemini_api_key:
+        raise RuntimeError("GOOGLE_API_KEY/GEMINI_API_KEY is not configured")
+
+    async def _run():
+        client = genai.Client(api_key=gemini_api_key, http_options={"api_version": "v1alpha"})
+        pcm_chunks = []
+        duration_seconds_clamped = max(4, min(int(duration_seconds), 30))
+        plan = plan_music_request(seed_text)
+        sample_rate = 48000
+        channels = 2
+        target_bytes = None
+        async with client.aio.live.music.connect(model=MUSIC_MODEL) as session:
+            await session.set_weighted_prompts(
+                prompts=[
+                    genai_types.WeightedPrompt(text=(plan["prompt"] or "instrumental electronic music"), weight=1.25),
+                    genai_types.WeightedPrompt(
+                        text="STYLE LOCK: follow requested genre/mood/instrumentation strictly; avoid unrelated style drift.",
+                        weight=1.0,
+                    ),
+                    genai_types.WeightedPrompt(text="instrumental only, no spoken words, no vocal syllables", weight=0.45),
+                ]
+            )
+            await session.set_music_generation_config(
+                config=genai_types.LiveMusicGenerationConfig(
+                    bpm=int(plan["bpm"]),
+                    temperature=float(plan["temperature"]),
+                )
+            )
+            await session.play()
+            stream = session.receive()
+            while True:
+                message = await asyncio.wait_for(anext(stream), timeout=8.0)
+                server_content = getattr(message, "server_content", None)
+                audio_chunks = getattr(server_content, "audio_chunks", None) if server_content else None
+                if not audio_chunks:
+                    continue
+                for chunk in audio_chunks:
+                    data = getattr(chunk, "data", b"")
+                    mime_type = (getattr(chunk, "mime_type", "") or "").lower()
+                    match = re.search(r"rate=(\d+)", mime_type)
+                    if match:
+                        sample_rate = int(match.group(1))
+                    match = re.search(r"channels=(\d+)", mime_type)
+                    if match:
+                        channels = int(match.group(1))
+                    if target_bytes is None:
+                        # Lyria currently returns PCM16 (L16), bytes_per_sample = 2.
+                        target_bytes = sample_rate * channels * 2 * duration_seconds_clamped
+                    if data:
+                        pcm_chunks.append(data)
+                if target_bytes and sum(len(c) for c in pcm_chunks) >= target_bytes:
+                    break
+        return b"".join(pcm_chunks), sample_rate, channels
+
+    pcm_bytes, sample_rate, channels = asyncio.run(_run())
+    if not pcm_bytes:
+        raise RuntimeError("Lyria returned no audio chunks")
+    return pcm16_to_wav_bytes(pcm_bytes, sample_rate=sample_rate, channels=channels)
+
+
 def get_firestore_client():
     if os.path.exists(FIRESTORE_SA_PATH):
         creds = service_account.Credentials.from_service_account_file(FIRESTORE_SA_PATH)
@@ -582,6 +1075,18 @@ def get_user_history_range(user_id):
         return None
 
 
+def sanitize_history_range(raw_value, default_value=30):
+    try:
+        value = int(raw_value)
+    except Exception:
+        value = int(default_value)
+    if value < 10:
+        value = 10
+    if value > 60:
+        value = 60
+    return value
+
+
 def get_chat_messages(user_id, contact_id, history_range=None):
     if not user_id or not contact_id:
         return []
@@ -599,11 +1104,15 @@ def get_chat_messages(user_id, contact_id, history_range=None):
     docs = list(query.stream())
     docs.reverse()
     messages = []
+    allowed_roles = {"user", "ai", "peer", "ai_proxy", "assist_user", "assist_ai"}
     for doc in docs:
         data = doc.to_dict() or {}
         text = (data.get("text") or "").strip()
+        audio_url = (data.get("audio_url") or "").strip()
+        image_url = (data.get("image_url") or "").strip()
+        music_url = (data.get("music_url") or "").strip()
         role = (data.get("role") or "").strip()
-        if not text or role not in ("user", "ai", "peer"):
+        if (not text and not audio_url and not image_url and not music_url) or role not in allowed_roles:
             continue
         created_at = data.get("created_at")
         created_at_iso = ""
@@ -615,14 +1124,27 @@ def get_chat_messages(user_id, contact_id, history_range=None):
                 "role": role,
                 "text": text,
                 "created_at": created_at_iso,
+                "assist_group_id": (data.get("assist_group_id") or "").strip(),
+                "visibility": (data.get("visibility") or "").strip() or "shared",
+                "sender_mode": (data.get("sender_mode") or "").strip() or ("ai_proxy" if role == "ai_proxy" else "user"),
+                "avatar_url": (data.get("avatar_url") or "").strip(),
+                "audio_url": audio_url,
+                "audio_duration_seconds": float(data.get("audio_duration_seconds") or 0),
+                "image_url": image_url,
+                "music_url": music_url,
             }
         )
     return messages
 
 
-def save_chat_message(user_id, contact_id, role, text):
+def save_chat_message(user_id, contact_id, role, text, extras=None):
     clean_text = (text or "").strip()
-    if not user_id or not contact_id or role not in ("user", "ai", "peer") or not clean_text:
+    allowed_roles = {"user", "ai", "peer", "ai_proxy", "assist_user", "assist_ai"}
+    extras = extras if isinstance(extras, dict) else {}
+    audio_url = (extras.get("audio_url") or "").strip()
+    image_url = (extras.get("image_url") or "").strip()
+    music_url = (extras.get("music_url") or "").strip()
+    if not user_id or not contact_id or role not in allowed_roles or (not clean_text and not audio_url and not image_url and not music_url):
         return
     client = get_firestore_client()
     coll = (
@@ -632,13 +1154,14 @@ def save_chat_message(user_id, contact_id, role, text):
         .document(contact_id)
         .collection("messages")
     )
-    coll.add(
-        {
-            "role": role,
-            "text": clean_text,
-            "created_at": firestore.SERVER_TIMESTAMP,
-        }
-    )
+    payload = {
+        "role": role,
+        "text": clean_text,
+        "created_at": firestore.SERVER_TIMESTAMP,
+    }
+    if extras:
+        payload.update(extras)
+    coll.add(payload)
 
 
 def upsert_chat_meta(user_id, contact_id, unread_increment=0, force_unread_zero=False, preview_text=""):
@@ -659,6 +1182,47 @@ def upsert_chat_meta(user_id, contact_id, unread_increment=0, force_unread_zero=
     ref.set(payload, merge=True)
 
 
+def log_tool_error(user_id, contact_id, tool_name, stage, error_message, request_id="", input_snapshot=None):
+    try:
+        client = get_firestore_client()
+        payload = {
+            "user_id": user_id,
+            "contact_id": contact_id,
+            "tool": tool_name,
+            "stage": stage,
+            "status": "failed",
+            "error_message": (error_message or "").strip()[:2000],
+            "request_id": (request_id or "").strip(),
+            "created_at": firestore.SERVER_TIMESTAMP,
+        }
+        if input_snapshot is not None:
+            payload["input_snapshot"] = input_snapshot
+        client.collection("err_log").add(payload)
+    except Exception:
+        # Never let log failures break user flow.
+        return
+
+
+def log_info_event(user_id, contact_id, tool_name, stage, message, request_id="", input_snapshot=None):
+    try:
+        client = get_firestore_client()
+        payload = {
+            "user_id": user_id,
+            "contact_id": contact_id,
+            "tool": tool_name,
+            "stage": stage,
+            "status": "info",
+            "error_message": (message or "").strip()[:2000],
+            "request_id": (request_id or "").strip(),
+            "created_at": firestore.SERVER_TIMESTAMP,
+        }
+        if input_snapshot is not None:
+            payload["input_snapshot"] = input_snapshot
+        client.collection("err_log").add(payload)
+    except Exception:
+        return
+
+
 def build_history_prompt(history_messages):
     if not history_messages:
         return "No previous conversation."
@@ -670,6 +1234,95 @@ def build_history_prompt(history_messages):
             continue
         lines.append(f"{role}: {text}")
     return "\n".join(lines) if lines else "No previous conversation."
+
+
+def build_live_system_prompt(user_id, contact_id):
+    client = get_firestore_client()
+    user_doc = client.collection("users").document(user_id).get()
+    user_data = user_doc.to_dict() if user_doc.exists else {}
+    user_name = (user_data.get("display_name") or user_data.get("email") or "User").strip()
+    ai_name = (user_data.get("ai_name") or "Pisces").strip()
+    ai_settings = get_user_ai_settings(user_id)
+    global_prompt = (ai_settings.get("global_prompt") or AI_DEFAULT_GLOBAL_PROMPT).strip()
+    ai_room = (contact_id or "pisces-core") == "pisces-core"
+
+    if ai_room:
+        return (
+            f'Your name is "{ai_name}".\n'
+            f'You are the AI assistant of "{user_name}".\n'
+            f"Your speaking style is: {global_prompt}"
+        )
+
+    friend_ctx = get_friend_context(user_id, contact_id)
+    receiver_name = (friend_ctx or {}).get("friend_name") or "Contact"
+    return (
+        f'Your name is "{ai_name}".\n'
+        f'You are the AI assistant of "{user_name}".\n'
+        f"Your speaking style is: {global_prompt}\n\n"
+        f'You are currently helping "{user_name}" communicate with "{receiver_name}".'
+    )
+
+
+def build_live_contents_context(user_id, contact_id):
+    client = get_firestore_client()
+    user_doc = client.collection("users").document(user_id).get()
+    user_data = user_doc.to_dict() if user_doc.exists else {}
+    user_name = (user_data.get("display_name") or user_data.get("email") or "User").strip()
+    ai_name = (user_data.get("ai_name") or "Pisces").strip()
+    history_range = get_user_history_range(user_id)
+    ai_room = (contact_id or "pisces-core") == "pisces-core"
+
+    if ai_room:
+        history_messages = get_chat_messages(user_id, "pisces-core", history_range=history_range)
+        lines = [
+            f'The following conversation history is between "{user_name}" and "{ai_name}".',
+            "Each line starts with the speaker name.",
+        ]
+        for msg in history_messages:
+            role = (msg.get("role") or "").strip()
+            text = (msg.get("text") or "").strip()
+            if not text:
+                continue
+            if role == "user":
+                speaker = user_name
+            elif role == "ai":
+                speaker = ai_name
+            else:
+                continue
+            lines.append(f'{speaker}: {text}')
+        return "\n".join(lines)
+
+    friend_ctx = get_friend_context(user_id, contact_id)
+    receiver_name = (friend_ctx or {}).get("friend_name") or "Contact"
+    relationship = (friend_ctx or {}).get("relationship") or ""
+    history_messages = get_chat_messages(user_id, contact_id, history_range=history_range)
+    lines = [
+        f'The following conversation history is between "{user_name}" and "{receiver_name}".',
+        "Each line starts with the speaker name.",
+    ]
+    if relationship:
+        lines.append(f'"{receiver_name}" is "{relationship}" to "{user_name}".')
+    lines.append(
+        f'Please understand tone, relationship, and context. Help "{user_name}" communicate with "{receiver_name}". '
+        f'Do not treat this history as direct conversation between you and "{user_name}".'
+    )
+    for msg in history_messages:
+        role = (msg.get("role") or "").strip()
+        text = (msg.get("text") or "").strip()
+        if not text:
+            continue
+        if role == "user":
+            speaker = user_name
+        elif role == "peer":
+            speaker = receiver_name
+        elif role == "ai_proxy":
+            speaker = ai_name
+        elif role == "ai":
+            speaker = ai_name
+        else:
+            continue
+        lines.append(f'{speaker}: {text}')
+    return "\n".join(lines)
 
 
 def get_allowed_origin():
@@ -733,24 +1386,200 @@ def generate_gemini_reply(user_message, ai_settings, history_messages):
     }
 
 
+def get_friend_context(user_id, contact_id):
+    client = get_firestore_client()
+    user_a_id, user_b_id = sorted([user_id, contact_id])
+    pair_key = f"{user_a_id}_{user_b_id}"
+    doc = client.collection("friendships").document(pair_key).get()
+    if not doc.exists:
+        return None
+    data = doc.to_dict() or {}
+    if (data.get("status") or "").strip() != "accepted":
+        return None
+    is_a = user_id == user_a_id
+    special_prompt = (data.get("special_prompt_for_a") or "").strip() if is_a else (data.get("special_prompt_for_b") or "").strip()
+    relationship = (data.get("relationship_for_a") or "").strip() if is_a else (data.get("relationship_for_b") or "").strip()
+    # Use requester's own alias field for this friend:
+    # requester=user_a -> alias_for_a, requester=user_b -> alias_for_b
+    friend_alias = (data.get("alias_for_a") or "").strip() if is_a else (data.get("alias_for_b") or "").strip()
+    friend_display = (data.get("user_b_display_name") or "").strip() if is_a else (data.get("user_a_display_name") or "").strip()
+    return {
+        "pair_key": pair_key,
+        "special_prompt": special_prompt,
+        "relationship": relationship,
+        "friend_name": friend_alias or friend_display or "friend",
+    }
+
+
+def decide_assist_action(user_message, history_messages, friend_name):
+    instruction = (
+        "You are Pisces AI function_arrange planner inside a friend chat window. "
+        "Return strict JSON only with keys: "
+        "send_to_friend (boolean), voice (boolean), reply_to_user (string). "
+        "Rules: "
+        "1) If user asks you to help tell/ask/send something to the current friend, set send_to_friend=true. "
+        "2) Otherwise set send_to_friend=false and provide direct advice in reply_to_user. "
+        "3) voice=true only when user asks read aloud/say/speak. "
+        "4) In this friend-chat window, pronouns like he/she/him/her/they or 他/她/他們 refer to the current friend by default. "
+        "5) Do not include markdown code fences."
+    )
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": instruction},
+                    {"text": f"Current friend: {friend_name}"},
+                    {"text": f"Conversation history:\n{build_history_prompt(history_messages)}"},
+                    {"text": f"User message:\n{user_message}"},
+                ]
+            }
+        ]
+    }
+    data = call_gemini_generate_content(payload, model=CHAT_MODEL)
+    raw = extract_text_from_response(data)
+    obj = extract_json_obj(raw)
+    send_to_friend = bool(obj.get("send_to_friend"))
+    voice = bool(obj.get("voice"))
+    reply_to_user = str(obj.get("reply_to_user") or "").strip()
+    if not reply_to_user:
+        reply_to_user = "Done."
+    return {
+        "send_to_friend": send_to_friend,
+        "voice": voice,
+        "reply_to_user": reply_to_user,
+    }
+
+
+def decide_media_tools(user_message, history_messages):
+    instruction = (
+        "You are a tool planner. Return strict JSON only with keys: "
+        "draw_image (boolean), create_music (boolean). "
+        "Infer intent semantically across languages (Chinese/English/Japanese/etc.). "
+        "Set draw_image=true only when the user asks to create/generate/draw an image/visual. "
+        "Set create_music=true only when the user asks to compose/generate music/song/track/instrumental."
+    )
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": instruction},
+                    {"text": f"Conversation history:\n{build_history_prompt(history_messages)}"},
+                    {"text": f"User message:\n{user_message}"},
+                ]
+            }
+        ]
+    }
+    try:
+        data = call_gemini_generate_content(payload, model=CHAT_MODEL)
+        raw = extract_text_from_response(data)
+        obj = extract_json_obj(raw)
+        return {
+            "draw_image": bool(obj.get("draw_image")),
+            "create_music": bool(obj.get("create_music")),
+        }
+    except Exception:
+        return {
+            "draw_image": False,
+            "create_music": False,
+        }
+
+
+def compose_message_for_friend(
+    user_message,
+    history_messages,
+    user_name,
+    friend_name,
+    ai_name,
+    style_prompt,
+    relationship="",
+):
+    relationship_line = (
+        f'"{friend_name}" is "{relationship}" to "{user_name}". You should adapt tone with this relationship.'
+        if relationship
+        else ""
+    )
+    instruction = (
+        "Return strict JSON only with keys: as_user (boolean), message_to_friend (string). "
+        f'Your name is "{ai_name}". '
+        f'You are the AI assistant of "{user_name}". '
+        f'Your speaking style is: {style_prompt}. '
+        f'Now "{user_name}" wants you to send a message to "{friend_name}". '
+        f"{relationship_line} "
+        f'If "{user_name}" did NOT explicitly ask to send in their own name, use third-person delivery to "{friend_name}". '
+        f'If "{user_name}" explicitly asks to send in their own name, use first-person. '
+        "Do not include markdown code fences."
+    )
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": instruction},
+                    {"text": f"Conversation history:\n{build_history_prompt(history_messages)}"},
+                    {"text": f"User message:\n{user_message}"},
+                ]
+            }
+        ]
+    }
+    data = call_gemini_generate_content(payload, model=CHAT_MODEL)
+    raw = extract_text_from_response(data)
+    obj = extract_json_obj(raw)
+    message = str(obj.get("message_to_friend") or "").strip()
+    as_user = bool(obj.get("as_user"))
+    if not message:
+        message = normalize_friend_outbound_text(user_message, friend_name)
+    return {
+        "as_user": as_user,
+        "message_to_friend": message,
+    }
+
+
+def sanitize_forward_message_text(user_message, outbound_text, friend_name):
+    text = (outbound_text or "").strip()
+    clean_from_user = normalize_friend_outbound_text(user_message, friend_name).strip()
+    if not text:
+        return clean_from_user
+
+    # Guardrail: if model returns command-like phrasing, prefer cleaned user intent text.
+    command_like_patterns = [
+        r"^\s*幫我",
+        r"^\s*請",
+        r"^\s*(跟|向).+(說|問|告訴)",
+        r"^\s*告訴",
+        r"^\s*tell\s+",
+        r"^\s*ask\s+",
+        r"^\s*help me\s+",
+    ]
+    is_command_like = any(re.search(p, text, flags=re.IGNORECASE) for p in command_like_patterns)
+    if is_command_like and clean_from_user:
+        return clean_from_user
+    return text
+
+
 def transcribe_audio_bytes(audio_bytes, mime_type):
     speech_client = speech.SpeechClient()
     mime = (mime_type or "").lower()
 
+    config_kwargs = {
+        "language_code": "zh-TW",
+        "alternative_language_codes": ["en-US"],
+        "enable_automatic_punctuation": True,
+        "audio_channel_count": 1,
+    }
     if "ogg" in mime:
-        encoding = speech.RecognitionConfig.AudioEncoding.OGG_OPUS
+        config_kwargs["encoding"] = speech.RecognitionConfig.AudioEncoding.OGG_OPUS
+        # Opus requires explicit supported sample rates for stable recognition.
+        config_kwargs["sample_rate_hertz"] = 48000
     elif "wav" in mime or "wave" in mime:
-        encoding = speech.RecognitionConfig.AudioEncoding.LINEAR16
+        config_kwargs["encoding"] = speech.RecognitionConfig.AudioEncoding.LINEAR16
+    elif "webm" in mime:
+        config_kwargs["encoding"] = speech.RecognitionConfig.AudioEncoding.WEBM_OPUS
+        config_kwargs["sample_rate_hertz"] = 48000
     else:
-        encoding = speech.RecognitionConfig.AudioEncoding.WEBM_OPUS
+        # Browser recorder is usually Opus in WebM/Ogg for this app.
+        config_kwargs["encoding"] = speech.RecognitionConfig.AudioEncoding.WEBM_OPUS
+        config_kwargs["sample_rate_hertz"] = 48000
 
-    config = speech.RecognitionConfig(
-        encoding=encoding,
-        language_code="zh-TW",
-        alternative_language_codes=["en-US"],
-        enable_automatic_punctuation=True,
-        audio_channel_count=1,
-    )
+    config = speech.RecognitionConfig(**config_kwargs)
     audio = speech.RecognitionAudio(content=audio_bytes)
     response = speech_client.recognize(config=config, audio=audio)
 
@@ -761,6 +1590,38 @@ def transcribe_audio_bytes(audio_bytes, mime_type):
             if text:
                 transcripts.append(text)
     return " ".join(transcripts).strip()
+
+
+@app.route("/api/speech/transcribe", methods=["POST", "OPTIONS"])
+def speech_transcribe():
+    if flask_request.method == "OPTIONS":
+        return ("", 204)
+
+    auth, auth_error = get_session_auth(required=True)
+    if auth_error:
+        err, status = auth_error
+        return jsonify(err), status
+
+    body = flask_request.get_json(silent=True) or {}
+    audio_b64 = (body.get("audio_base64") or "").strip()
+    mime_type = (body.get("mime_type") or "audio/webm").strip()
+    if not audio_b64:
+        return jsonify({"ok": False, "error": "audio_base64 is required"}), 400
+
+    try:
+        audio_bytes = base64.b64decode(audio_b64)
+    except Exception:
+        return jsonify({"ok": False, "error": "invalid base64 audio payload"}), 400
+
+    try:
+        transcript = transcribe_audio_bytes(audio_bytes, mime_type)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"speech-to-text failed: {exc}"}), 502
+
+    if not transcript:
+        return jsonify({"ok": False, "error": "speech-to-text returned empty transcript"}), 422
+
+    return jsonify({"ok": True, "transcript": transcript})
 
 
 @app.route("/")
@@ -791,6 +1652,191 @@ def chat():
     if not user_message:
         return jsonify({"error": "message is required"}), 400
 
+    if contact_id == "pisces-core" and has_forward_intent_in_ai_room(user_message):
+        if not user_id:
+            return jsonify({"error": "Please sign in first."}), 401
+        friend = find_friend_from_message(user_id, user_message)
+        if not friend:
+            reply = "Sorry, I couldn't find the contact name you mentioned. Please include an exact friend name."
+            try:
+                save_chat_message(user_id, contact_id, "user", user_message)
+                save_chat_message(user_id, contact_id, "ai", reply)
+            except Exception:
+                pass
+            return jsonify({"reply": reply, "audio_base64": "", "audio_mime_type": "", "tts": {"should_read_aloud": False}})
+
+        target_id = friend["id"]
+        friend_ctx = get_friend_context(user_id, target_id)
+        if not friend_ctx:
+            reply = "Sorry, I couldn't find that contact in your friend list."
+            try:
+                save_chat_message(user_id, contact_id, "user", user_message)
+                save_chat_message(user_id, contact_id, "ai", reply)
+            except Exception:
+                pass
+            return jsonify({"reply": reply, "audio_base64": "", "audio_mime_type": "", "tts": {"should_read_aloud": False}})
+
+        user_doc = get_firestore_client().collection("users").document(user_id).get()
+        user_data = user_doc.to_dict() if user_doc.exists else {}
+        ai_settings = get_user_ai_settings(user_id)
+        history_range = get_user_history_range(user_id)
+        friend_history = get_chat_messages(user_id, target_id, history_range=history_range)
+        decision = decide_assist_action(user_message, friend_history, friend_ctx["friend_name"])
+        media_tools = decide_media_tools(user_message, friend_history)
+        if has_explicit_voice_request(user_message):
+            decision["voice"] = True
+        style_prompt = friend_ctx["special_prompt"] or ai_settings.get("global_prompt") or AI_DEFAULT_GLOBAL_PROMPT
+        composed = compose_message_for_friend(
+            user_message=user_message,
+            history_messages=friend_history,
+            user_name=(user_data.get("display_name") or user_data.get("email") or "User"),
+            friend_name=friend_ctx["friend_name"],
+            ai_name=(user_data.get("ai_name") or "Pisces"),
+            style_prompt=style_prompt,
+            relationship=friend_ctx.get("relationship") or "",
+        )
+        composed_as_user = bool(composed.get("as_user"))
+        # Compose stage decides first/third person, but explicit phrase still overrides.
+        if has_explicit_send_as_user_intent(user_message):
+            composed_as_user = True
+        outbound_text = sanitize_forward_message_text(
+            user_message=user_message,
+            outbound_text=(composed.get("message_to_friend") or "").strip() or (decision.get("reply_to_user") or "").strip(),
+            friend_name=friend_ctx["friend_name"],
+        )
+        if media_tools.get("create_music") and not has_lyrics_request(user_message):
+            if composed_as_user:
+                outbound_text = "I made a song for you. Hope you like it."
+            else:
+                sender_name = (user_data.get("display_name") or user_data.get("email") or "your friend").strip()
+                outbound_text = f'{sender_name} made a song for you. Hope you like it.'
+        outbound_image_url = ""
+        outbound_music_url = ""
+        if media_tools.get("draw_image"):
+            try:
+                image_bytes, image_mime = generate_image_with_gemini(user_message)
+                outbound_image_url = upload_image_to_vercel_blob(user_id, image_bytes, image_mime or "image/png")
+            except Exception as exc:
+                log_tool_error(user_id, target_id, "draw_image", "chat_ai_room_forward_send", str(exc), input_snapshot={"message": user_message})
+        if media_tools.get("create_music"):
+            try:
+                music_seed = user_message
+                if has_lyrics_request(user_message) and outbound_text:
+                    music_seed = (
+                        f"{user_message}\n\n"
+                        f"Lyrics/theme reference (instrumental mood guide only):\n{outbound_text}"
+                    )
+                music_bytes = generate_music_with_lyria(music_seed)
+                outbound_music_url = upload_audio_to_vercel_blob(user_id, music_bytes, "audio/wav")
+            except Exception as exc:
+                log_tool_error(user_id, target_id, "create_music", "chat_ai_room_forward_send", str(exc), input_snapshot={"message": user_message})
+        sender_mode = "user" if composed_as_user else "ai_proxy"
+        sender_avatar_url = (
+            (user_data.get("avatar_url") or "").strip()
+            if sender_mode == "user"
+            else (user_data.get("ai_avatar_url") or "").strip() or "/images/fish.png"
+        )
+        outbound_audio_url = ""
+        if decision.get("voice"):
+            zh_len = count_zh_chars(outbound_text)
+            en_words = count_en_words(outbound_text)
+            if zh_len <= 100 and en_words <= 50:
+                try:
+                    locale = "en-US" if en_words > 0 and zh_len == 0 else "zh-TW"
+                    audio_b64_tmp, audio_mime_tmp = synthesize_tts_audio(
+                        outbound_text,
+                        locale,
+                        ai_settings.get("voice") or DEFAULT_AI_SETTINGS["voice"],
+                        "warm and caring" if locale == "en-US" else "溫柔且貼心",
+                    )
+                    outbound_audio_url = upload_audio_to_vercel_blob(
+                        user_id,
+                        base64.b64decode(audio_b64_tmp),
+                        audio_mime_tmp or "audio/wav",
+                    )
+                except Exception as exc:
+                    log_tool_error(
+                        user_id,
+                        target_id,
+                        "text_to_speech",
+                        "chat_ai_room_forward_send",
+                        str(exc),
+                        input_snapshot={"text": outbound_text},
+                    )
+        try:
+            save_chat_message(
+                user_id,
+                target_id,
+                "user" if sender_mode == "user" else "ai_proxy",
+                outbound_text,
+                extras={
+                    "visibility": "shared",
+                    "sender_mode": sender_mode,
+                    "avatar_url": sender_avatar_url,
+                    **({"audio_url": outbound_audio_url} if outbound_audio_url else {}),
+                    **({"image_url": outbound_image_url} if outbound_image_url else {}),
+                    **({"music_url": outbound_music_url} if outbound_music_url else {}),
+                },
+            )
+            save_chat_message(
+                target_id,
+                user_id,
+                "peer",
+                outbound_text,
+                extras={
+                    "visibility": "shared",
+                    "sender_mode": sender_mode,
+                    "avatar_url": sender_avatar_url,
+                    **({"audio_url": outbound_audio_url} if outbound_audio_url else {}),
+                    **({"image_url": outbound_image_url} if outbound_image_url else {}),
+                    **({"music_url": outbound_music_url} if outbound_music_url else {}),
+                },
+            )
+            upsert_chat_meta(user_id, target_id, unread_increment=0, preview_text=outbound_text)
+            upsert_chat_meta(target_id, user_id, unread_increment=1, preview_text=outbound_text)
+            payload = {
+                "message_id": str(uuid.uuid4()),
+                "sender_user_id": user_id,
+                "recipient_user_id": target_id,
+                "text": outbound_text,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "sender_display_name": (user_data.get("display_name") or ""),
+                "sender_avatar_url": sender_avatar_url,
+                "sender_mode": sender_mode,
+                "audio_url": outbound_audio_url,
+                "image_url": outbound_image_url,
+                "music_url": outbound_music_url,
+            }
+            publish_user_channel_message(target_id, payload)
+        except Exception as exc:
+            log_tool_error(user_id, target_id, "send_msg", "chat_ai_room_forward", str(exc), input_snapshot={"text": outbound_text})
+            reply = "Sorry, I couldn't deliver the message right now."
+            try:
+                save_chat_message(user_id, contact_id, "user", user_message)
+                save_chat_message(user_id, contact_id, "ai", reply)
+            except Exception:
+                pass
+            return jsonify({"reply": reply, "audio_base64": "", "audio_mime_type": "", "tts": {"should_read_aloud": False}})
+
+        reply = f"Done. I sent your message to {friend_ctx['friend_name']}."
+        audio_b64 = ""
+        audio_mime = ""
+        if has_explicit_voice_request(user_message):
+            try:
+                zh_len = count_zh_chars(reply)
+                en_words = count_en_words(reply)
+                if zh_len <= 100 and en_words <= 50:
+                    locale = "en-US" if en_words > 0 and zh_len == 0 else "zh-TW"
+                    audio_b64, audio_mime = synthesize_tts_audio(reply, locale, ai_settings.get("voice") or DEFAULT_AI_SETTINGS["voice"])
+            except Exception as exc:
+                log_tool_error(user_id, target_id, "text_to_speech", "chat_ai_room_forward", str(exc), input_snapshot={"text": reply})
+        try:
+            save_chat_message(user_id, contact_id, "user", user_message)
+            save_chat_message(user_id, contact_id, "ai", reply)
+        except Exception:
+            pass
+        return jsonify({"reply": reply, "audio_base64": audio_b64, "audio_mime_type": audio_mime, "tts": {"should_read_aloud": bool(audio_b64)}})
+
     ai_settings = get_user_ai_settings(user_id)
     history_range = get_user_history_range(user_id)
     history_messages = get_chat_messages(user_id, contact_id, history_range=history_range)
@@ -800,11 +1846,50 @@ def chat():
         return jsonify({"error": str(exc)}), 502
 
     if user_id:
+        media_tools = decide_media_tools(user_message, history_messages)
+        want_image = bool(media_tools.get("draw_image"))
+        want_music = bool(media_tools.get("create_music"))
+        image_url = ""
+        music_url = ""
+        image_error = ""
+        music_error = ""
+        if want_image:
+            try:
+                image_bytes, image_mime = generate_image_with_gemini(user_message)
+                image_url = upload_image_to_vercel_blob(user_id, image_bytes, image_mime or "image/png")
+            except Exception as exc:
+                image_error = str(exc)
+                log_tool_error(user_id, contact_id, "draw_image", "chat", str(exc), input_snapshot={"message": user_message})
+        if want_music:
+            try:
+                music_bytes = generate_music_with_lyria(user_message)
+                music_url = upload_audio_to_vercel_blob(user_id, music_bytes, "audio/wav")
+            except Exception as exc:
+                music_error = str(exc)
+                log_tool_error(user_id, contact_id, "create_music", "chat", str(exc), input_snapshot={"message": user_message})
+        if want_image or want_music:
+            status_reply = build_tool_status_reply(want_image, want_music, image_url, music_url, image_error, music_error)
+            if status_reply:
+                chat_result["reply"] = status_reply
+                chat_result["audio_base64"] = ""
+                chat_result["audio_mime_type"] = ""
+                chat_result["tts"] = {"should_read_aloud": False}
         try:
             save_chat_message(user_id, contact_id, "user", user_message)
-            save_chat_message(user_id, contact_id, "ai", chat_result.get("reply") or "")
+            save_chat_message(
+                user_id,
+                contact_id,
+                "ai",
+                chat_result.get("reply") or "",
+                extras={
+                    **({"image_url": image_url} if image_url else {}),
+                    **({"music_url": music_url} if music_url else {}),
+                },
+            )
         except Exception:
             pass
+        chat_result["image_url"] = image_url
+        chat_result["music_url"] = music_url
 
     return jsonify(chat_result)
 
@@ -845,11 +1930,50 @@ def voice_chat():
         return jsonify({"error": str(exc), "transcript": transcript}), 502
 
     if user_id:
+        media_tools = decide_media_tools(transcript, history_messages)
+        want_image = bool(media_tools.get("draw_image"))
+        want_music = bool(media_tools.get("create_music"))
+        image_url = ""
+        music_url = ""
+        image_error = ""
+        music_error = ""
+        if want_image:
+            try:
+                image_bytes, image_mime = generate_image_with_gemini(transcript)
+                image_url = upload_image_to_vercel_blob(user_id, image_bytes, image_mime or "image/png")
+            except Exception as exc:
+                image_error = str(exc)
+                log_tool_error(user_id, contact_id, "draw_image", "voice_chat", str(exc), input_snapshot={"transcript": transcript})
+        if want_music:
+            try:
+                music_bytes = generate_music_with_lyria(transcript)
+                music_url = upload_audio_to_vercel_blob(user_id, music_bytes, "audio/wav")
+            except Exception as exc:
+                music_error = str(exc)
+                log_tool_error(user_id, contact_id, "create_music", "voice_chat", str(exc), input_snapshot={"transcript": transcript})
+        if want_image or want_music:
+            status_reply = build_tool_status_reply(want_image, want_music, image_url, music_url, image_error, music_error)
+            if status_reply:
+                chat_result["reply"] = status_reply
+                chat_result["audio_base64"] = ""
+                chat_result["audio_mime_type"] = ""
+                chat_result["tts"] = {"should_read_aloud": False}
         try:
             save_chat_message(user_id, contact_id, "user", transcript)
-            save_chat_message(user_id, contact_id, "ai", chat_result.get("reply") or "")
+            save_chat_message(
+                user_id,
+                contact_id,
+                "ai",
+                chat_result.get("reply") or "",
+                extras={
+                    **({"image_url": image_url} if image_url else {}),
+                    **({"music_url": music_url} if music_url else {}),
+                },
+            )
         except Exception:
             pass
+        chat_result["image_url"] = image_url
+        chat_result["music_url"] = music_url
 
     return jsonify({"transcript": transcript, **chat_result})
 
@@ -955,6 +2079,7 @@ def auth_google():
             existing_data.get("ai_global_prompt"),
         )
         ai_avatar_url = (existing_data or {}).get("ai_avatar_url", "")
+        history_range = sanitize_history_range((existing_data or {}).get("history_range", 30))
     except Exception as exc:
         return jsonify({"ok": False, "error": f"failed to save user: {exc}"}), 500
 
@@ -968,6 +2093,7 @@ def auth_google():
         "avatar_url": google_avatar_url or (existing_data or {}).get("avatar_url", ""),
         "identify_code": (existing_data or {}).get("identify_code", ""),
         "ai_settings": ai_settings,
+        "history_range": history_range,
     }
     set_user_session(user)
     return jsonify({"ok": True, "user": user})
@@ -1019,6 +2145,7 @@ def auth_tester():
         )
         ai_avatar_url = existing_ai_avatar
         user_avatar_url = avatar_url or (existing_data.get("avatar_url") or "")
+        history_range = sanitize_history_range((existing_data or {}).get("history_range", 30))
     except Exception as exc:
         return jsonify({"ok": False, "error": f"failed to save tester user: {exc}"}), 500
 
@@ -1032,6 +2159,7 @@ def auth_tester():
         "avatar_url": user_avatar_url,
         "identify_code": (existing_data or {}).get("identify_code", ""),
         "ai_settings": ai_settings,
+        "history_range": history_range,
     }
     set_user_session(user)
     return jsonify({"ok": True, "user": user})
@@ -1067,6 +2195,7 @@ def session_me():
                 data.get("ai_global_prompt"),
             ),
             "identify_code": data.get("identify_code", ""),
+            "history_range": sanitize_history_range(data.get("history_range", 30)),
         }
         set_user_session(user)
         return jsonify({"ok": True, "authenticated": True, "user": user})
@@ -1161,6 +2290,8 @@ def update_user_settings():
         return jsonify(err), status
     user_id = auth["user_id"]
     identify_code = (body.get("identify_code") or "").strip()
+    history_range_raw = body.get("history_range")
+    history_range = sanitize_history_range(history_range_raw, 30)
 
     target_user_id = user_id
 
@@ -1174,6 +2305,7 @@ def update_user_settings():
             payload["identify_code"] = identify_code
         else:
             payload["identify_code"] = firestore.DELETE_FIELD
+        payload["history_range"] = history_range
         user_ref.set(payload, merge=True)
     except Exception as exc:
         return jsonify({"ok": False, "error": f"failed to update settings: {exc}"}), 500
@@ -1184,6 +2316,7 @@ def update_user_settings():
             "user": {
                 "id": target_user_id,
                 "identify_code": identify_code,
+                "history_range": history_range,
             },
         }
     )
@@ -1559,11 +2692,13 @@ def send_message():
     sender_user_id = auth["user_id"]
     recipient_user_id = (body.get("recipient_user_id") or "").strip()
     text = (body.get("text") or "").strip()
+    image_url = (body.get("image_url") or "").strip()
+    music_url = (body.get("music_url") or "").strip()
 
     if not recipient_user_id:
         return jsonify({"ok": False, "error": "recipient_user_id is required"}), 400
-    if not text:
-        return jsonify({"ok": False, "error": "text is required"}), 400
+    if not text and not image_url and not music_url:
+        return jsonify({"ok": False, "error": "text or attachment is required"}), 400
     if sender_user_id == recipient_user_id:
         return jsonify({"ok": False, "error": "cannot send message to yourself"}), 400
 
@@ -1578,10 +2713,34 @@ def send_message():
 
         message_id = str(uuid.uuid4())
         created_at_iso = datetime.now(timezone.utc).isoformat()
-        save_chat_message(sender_user_id, recipient_user_id, "user", text)
-        save_chat_message(recipient_user_id, sender_user_id, "peer", text)
-        upsert_chat_meta(sender_user_id, recipient_user_id, unread_increment=0, preview_text=text)
-        upsert_chat_meta(recipient_user_id, sender_user_id, unread_increment=1, preview_text=text)
+        save_chat_message(
+            sender_user_id,
+            recipient_user_id,
+            "user",
+            text,
+            extras={
+                "visibility": "shared",
+                "sender_mode": "user",
+                **({"image_url": image_url} if image_url else {}),
+                **({"music_url": music_url} if music_url else {}),
+            },
+        )
+        save_chat_message(
+            recipient_user_id,
+            sender_user_id,
+            "peer",
+            text,
+            extras={
+                "visibility": "shared",
+                "sender_mode": "user",
+                "avatar_url": (sender_data.get("avatar_url") or "").strip(),
+                **({"image_url": image_url} if image_url else {}),
+                **({"music_url": music_url} if music_url else {}),
+            },
+        )
+        preview_text = text or ("Image + Music" if image_url and music_url else "Image" if image_url else "Music")
+        upsert_chat_meta(sender_user_id, recipient_user_id, unread_increment=0, preview_text=preview_text)
+        upsert_chat_meta(recipient_user_id, sender_user_id, unread_increment=1, preview_text=preview_text)
 
         payload = {
             "message_id": message_id,
@@ -1591,6 +2750,9 @@ def send_message():
             "created_at": created_at_iso,
             "sender_display_name": (sender_data.get("display_name") or ""),
             "sender_avatar_url": (sender_data.get("avatar_url") or ""),
+            "sender_mode": "user",
+            "image_url": image_url,
+            "music_url": music_url,
         }
         publish_user_channel_message(recipient_user_id, payload)
         return jsonify({"ok": True, "message": payload})
@@ -1598,16 +2760,411 @@ def send_message():
         return jsonify({"ok": False, "error": f"failed to send message: {exc}"}), 500
 
 
-@app.route("/api/live/token", methods=["POST", "OPTIONS"])
-def live_token():
+@app.route("/api/messages/send-voice", methods=["POST", "OPTIONS"])
+def send_voice_message():
     if flask_request.method == "OPTIONS":
         return ("", 204)
+
+    body = flask_request.get_json(silent=True) or {}
     auth, auth_error = get_session_auth(required=True)
     if auth_error:
         err, status = auth_error
         return jsonify(err), status
+    sender_user_id = auth["user_id"]
+    recipient_user_id = (body.get("recipient_user_id") or "").strip()
+    audio_b64 = (body.get("audio_base64") or "").strip()
+    mime_type = (body.get("mime_type") or "audio/webm").strip()
+    duration_seconds_raw = body.get("duration_seconds")
+
+    if not recipient_user_id:
+        return jsonify({"ok": False, "error": "recipient_user_id is required"}), 400
+    if sender_user_id == recipient_user_id:
+        return jsonify({"ok": False, "error": "cannot send message to yourself"}), 400
+    if not audio_b64:
+        return jsonify({"ok": False, "error": "audio_base64 is required"}), 400
+
+    try:
+        duration_seconds = float(duration_seconds_raw or 0)
+    except Exception:
+        duration_seconds = 0.0
+    if duration_seconds < 0:
+        duration_seconds = 0.0
+    if duration_seconds > 600:
+        duration_seconds = 600.0
+
+    try:
+        audio_bytes = base64.b64decode(audio_b64)
+    except Exception:
+        return jsonify({"ok": False, "error": "invalid base64 audio payload"}), 400
+
+    try:
+        transcript = transcribe_audio_bytes(audio_bytes, mime_type)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"speech-to-text failed: {exc}"}), 502
+    if not transcript:
+        return jsonify({"ok": False, "error": "speech-to-text returned empty transcript"}), 422
+
+    try:
+        audio_url = upload_audio_to_vercel_blob(sender_user_id, audio_bytes, mime_type or "audio/webm")
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"voice upload failed: {exc}"}), 502
+
+    try:
+        client = get_firestore_client()
+        recipient_doc = client.collection("users").document(recipient_user_id).get()
+        if not recipient_doc.exists:
+            return jsonify({"ok": False, "error": "recipient does not exist"}), 404
+        sender_doc = client.collection("users").document(sender_user_id).get()
+        sender_data = sender_doc.to_dict() if sender_doc.exists else {}
+
+        message_id = str(uuid.uuid4())
+        created_at_iso = datetime.now(timezone.utc).isoformat()
+
+        save_chat_message(
+            sender_user_id,
+            recipient_user_id,
+            "user",
+            "",
+            extras={
+                "visibility": "shared",
+                "sender_mode": "user",
+                "audio_url": audio_url,
+                "audio_duration_seconds": duration_seconds,
+                "transcript_text": transcript,
+            },
+        )
+        save_chat_message(
+            recipient_user_id,
+            sender_user_id,
+            "peer",
+            "",
+            extras={
+                "visibility": "shared",
+                "sender_mode": "user",
+                "avatar_url": (sender_data.get("avatar_url") or "").strip(),
+                "audio_url": audio_url,
+                "audio_duration_seconds": duration_seconds,
+                "transcript_text": transcript,
+            },
+        )
+        upsert_chat_meta(
+            sender_user_id,
+            recipient_user_id,
+            unread_increment=0,
+            preview_text=transcript or "Voice message",
+        )
+        upsert_chat_meta(
+            recipient_user_id,
+            sender_user_id,
+            unread_increment=1,
+            preview_text=transcript or "Voice message",
+        )
+
+        payload = {
+            "message_id": message_id,
+            "sender_user_id": sender_user_id,
+            "recipient_user_id": recipient_user_id,
+            "text": "",
+            "audio_url": audio_url,
+            "audio_duration_seconds": duration_seconds,
+            "created_at": created_at_iso,
+            "sender_display_name": (sender_data.get("display_name") or ""),
+            "sender_avatar_url": (sender_data.get("avatar_url") or ""),
+            "sender_mode": "user",
+        }
+        publish_user_channel_message(recipient_user_id, payload)
+        return jsonify({"ok": True, "message": payload})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"failed to send voice message: {exc}"}), 500
+
+
+@app.route("/api/assist/message", methods=["POST", "OPTIONS"])
+def assist_message():
+    if flask_request.method == "OPTIONS":
+        return ("", 204)
+
+    auth, auth_error = get_session_auth(required=True)
+    if auth_error:
+        err, status = auth_error
+        return jsonify(err), status
+    user_id = auth["user_id"]
+    body = flask_request.get_json(silent=True) or {}
+    contact_id = (body.get("contact_id") or "").strip()
+    user_message = (body.get("message") or "").strip()
+
+    if not contact_id:
+        return jsonify({"ok": False, "error": "contact_id is required"}), 400
+    if not user_message:
+        return jsonify({"ok": False, "error": "message is required"}), 400
+    if contact_id == "pisces-core":
+        return jsonify({"ok": False, "error": "assist mode is only for friend chats"}), 400
+
+    request_id = str(uuid.uuid4())
+    try:
+        friend_ctx = get_friend_context(user_id, contact_id)
+        if not friend_ctx:
+            return jsonify({"ok": False, "error": "friend not found in this chat"}), 404
+
+        user_doc = get_firestore_client().collection("users").document(user_id).get()
+        user_data = user_doc.to_dict() if user_doc.exists else {}
+        ai_settings = get_user_ai_settings(user_id)
+        history_range = get_user_history_range(user_id)
+        history_messages = get_chat_messages(user_id, contact_id, history_range=history_range)
+
+        decision = decide_assist_action(user_message, history_messages, friend_ctx["friend_name"])
+        media_tools = decide_media_tools(user_message, history_messages)
+        if has_explicit_voice_request(user_message):
+            decision["voice"] = True
+        explicit_send_intent = has_send_to_friend_intent(user_message)
+        if explicit_send_intent or media_tools.get("draw_image") or media_tools.get("create_music"):
+            decision["send_to_friend"] = True
+        group_id = f"assist-{int(datetime.now(timezone.utc).timestamp() * 1000)}-{uuid.uuid4().hex[:8]}"
+        composed = {"as_user": False, "message_to_friend": ""}
+        if decision.get("send_to_friend"):
+            style_prompt = friend_ctx["special_prompt"] or ai_settings.get("global_prompt") or AI_DEFAULT_GLOBAL_PROMPT
+            composed = compose_message_for_friend(
+                user_message=user_message,
+                history_messages=history_messages,
+                user_name=(user_data.get("display_name") or user_data.get("email") or "User"),
+                friend_name=friend_ctx["friend_name"],
+                ai_name=(user_data.get("ai_name") or "Pisces"),
+                style_prompt=style_prompt,
+                relationship=friend_ctx.get("relationship") or "",
+            )
+            if has_explicit_send_as_user_intent(user_message):
+                composed["as_user"] = True
+
+        ai_text = (decision.get("reply_to_user") or "").strip() or "Done."
+        if decision.get("send_to_friend"):
+            if not composed.get("message_to_friend"):
+                ai_text = "Sorry, I could not compose a message to send right now."
+                decision["send_to_friend"] = False
+            else:
+                ai_text = f"Sent to {friend_ctx['friend_name']}: {composed.get('message_to_friend')}"
+
+        save_chat_message(
+            user_id,
+            contact_id,
+            "assist_user",
+            user_message,
+            extras={"visibility": "private_to_user", "assist_group_id": group_id},
+        )
+        outbound_message = None
+        assist_ai_audio_url = ""
+        if decision.get("send_to_friend"):
+            sender_mode = "user" if composed.get("as_user") else "ai_proxy"
+            outbound_text = sanitize_forward_message_text(
+                user_message=user_message,
+                outbound_text=(composed.get("message_to_friend") or "").strip(),
+                friend_name=friend_ctx["friend_name"],
+            )
+            outbound_image_url = ""
+            outbound_music_url = ""
+            if media_tools.get("draw_image"):
+                try:
+                    image_bytes, image_mime = generate_image_with_gemini(user_message)
+                    outbound_image_url = upload_image_to_vercel_blob(user_id, image_bytes, image_mime or "image/png")
+                except Exception as exc:
+                    log_tool_error(
+                        user_id,
+                        contact_id,
+                        "draw_image",
+                        "assist_message_send_to_friend",
+                        str(exc),
+                        request_id=request_id,
+                        input_snapshot={"message": user_message},
+                    )
+            if media_tools.get("create_music"):
+                try:
+                    music_bytes = generate_music_with_lyria(user_message)
+                    outbound_music_url = upload_audio_to_vercel_blob(user_id, music_bytes, "audio/wav")
+                except Exception as exc:
+                    log_tool_error(
+                        user_id,
+                        contact_id,
+                        "create_music",
+                        "assist_message_send_to_friend",
+                        str(exc),
+                        request_id=request_id,
+                        input_snapshot={"message": user_message},
+                    )
+            sender_avatar_url = (
+                (user_data.get("avatar_url") or "").strip()
+                if sender_mode == "user"
+                else (user_data.get("ai_avatar_url") or "").strip() or "/images/fish.png"
+            )
+            outbound_audio_url = ""
+            if decision.get("voice"):
+                zh_len = count_zh_chars(outbound_text)
+                en_words = count_en_words(outbound_text)
+                if zh_len <= 100 and en_words <= 50:
+                    try:
+                        locale = "en-US" if en_words > 0 and zh_len == 0 else "zh-TW"
+                        audio_b64_tmp, audio_mime_tmp = synthesize_tts_audio(
+                            outbound_text,
+                            locale,
+                            ai_settings.get("voice") or DEFAULT_AI_SETTINGS["voice"],
+                            "warm and caring" if locale == "en-US" else "溫柔且貼心",
+                        )
+                        outbound_audio_url = upload_audio_to_vercel_blob(
+                            user_id,
+                            base64.b64decode(audio_b64_tmp),
+                            audio_mime_tmp or "audio/wav",
+                        )
+                    except Exception as exc:
+                        log_tool_error(
+                            user_id,
+                            contact_id,
+                            "text_to_speech",
+                            "assist_message_send_to_friend",
+                            str(exc),
+                            request_id=request_id,
+                            input_snapshot={"text": outbound_text},
+                        )
+
+            # For assist mode, sender-side timeline should only show the assist group.
+            # Keep shared message only on recipient side.
+            save_chat_message(
+                contact_id,
+                user_id,
+                "peer",
+                "" if outbound_audio_url else outbound_text,
+                extras={
+                    "visibility": "shared",
+                    "sender_mode": sender_mode,
+                    "avatar_url": sender_avatar_url,
+                    **({"audio_url": outbound_audio_url} if outbound_audio_url else {}),
+                    **({"image_url": outbound_image_url} if outbound_image_url else {}),
+                    **({"music_url": outbound_music_url} if outbound_music_url else {}),
+                },
+            )
+            upsert_chat_meta(user_id, contact_id, unread_increment=0, preview_text=outbound_text)
+            upsert_chat_meta(contact_id, user_id, unread_increment=1, preview_text=outbound_text)
+
+            payload = {
+                "message_id": str(uuid.uuid4()),
+                "sender_user_id": user_id,
+                "recipient_user_id": contact_id,
+                "text": "" if outbound_audio_url else outbound_text,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "sender_display_name": (user_data.get("display_name") or ""),
+                "sender_avatar_url": sender_avatar_url,
+                "sender_mode": sender_mode,
+                "audio_url": outbound_audio_url,
+                "image_url": outbound_image_url,
+                "music_url": outbound_music_url,
+            }
+            publish_user_channel_message(contact_id, payload)
+            outbound_message = {
+                "text": "" if outbound_audio_url else outbound_text,
+                "as_user": sender_mode == "user",
+                "sender_mode": sender_mode,
+                "avatar_url": sender_avatar_url,
+                "message_id": payload["message_id"],
+                "audio_url": outbound_audio_url,
+                "image_url": outbound_image_url,
+                "music_url": outbound_music_url,
+            }
+            if outbound_audio_url:
+                assist_ai_audio_url = outbound_audio_url
+                ai_text = ""
+
+        audio_b64 = ""
+        audio_mime_type = ""
+        if decision.get("voice") and has_explicit_voice_request(user_message) and not (decision.get("send_to_friend") and outbound_message and outbound_message.get("audio_url")):
+            zh_len = count_zh_chars(ai_text)
+            en_words = count_en_words(ai_text)
+            if zh_len <= 100 and en_words <= 50:
+                try:
+                    voice_name = ai_settings.get("voice") or DEFAULT_AI_SETTINGS["voice"]
+                    locale = "en-US" if en_words > 0 and zh_len == 0 else "zh-TW"
+                    audio_b64, audio_mime_type = synthesize_tts_audio(
+                        ai_text,
+                        locale,
+                        voice_name,
+                        "warm and caring" if locale == "en-US" else "溫柔且貼心",
+                    )
+                except Exception as exc:
+                    log_tool_error(
+                        user_id,
+                        contact_id,
+                        "text_to_speech",
+                        "assist_message",
+                        str(exc),
+                        request_id=request_id,
+                        input_snapshot={"text": ai_text},
+                    )
+
+        save_chat_message(
+            user_id,
+            contact_id,
+            "assist_ai",
+            ai_text,
+            extras={
+                "visibility": "private_to_user",
+                "assist_group_id": group_id,
+                **({"audio_url": assist_ai_audio_url} if assist_ai_audio_url else {}),
+            },
+        )
+
+        return jsonify(
+            {
+                "ok": True,
+                "assist_group": {
+                    "id": group_id,
+                    "user_text": user_message,
+                    "ai_text": ai_text,
+                    "collapsed": False,
+                    "audio_url": (outbound_message or {}).get("audio_url") or "",
+                    "audio_base64": audio_b64,
+                    "audio_mime_type": audio_mime_type,
+                },
+                "outbound_message": outbound_message,
+            }
+        )
+    except Exception as exc:
+        log_tool_error(
+            user_id,
+            contact_id,
+            "assist_pipeline",
+            "assist_message",
+            str(exc),
+            request_id=request_id,
+            input_snapshot={"message": user_message},
+        )
+        return jsonify({"ok": False, "error": "Sorry, assist mode is currently unavailable."}), 500
+
+
+@app.route("/api/live/token", methods=["POST", "OPTIONS"])
+def live_token():
+    if flask_request.method == "OPTIONS":
+        return ("", 204)
+    body = flask_request.get_json(silent=True) or {}
+    auth, auth_error = get_session_auth(required=True)
+    if auth_error:
+        err, status = auth_error
+        return jsonify(err), status
+    user_id = auth["user_id"]
+    contact_id = (body.get("contact_id") or "pisces-core").strip() or "pisces-core"
+    request_id = str(uuid.uuid4())
     try:
         token_data = create_live_ephemeral_token()
+        live_system_prompt = build_live_system_prompt(user_id, contact_id)
+        live_context = build_live_contents_context(user_id, contact_id)
+        log_info_event(
+            user_id,
+            contact_id,
+            "live_system_prompt",
+            "live_token",
+            "Generated Gemini Live system prompt",
+            request_id=request_id,
+            input_snapshot={
+                "ai_room": contact_id == "pisces-core",
+                "contact_id": contact_id,
+                "system_prompt": live_system_prompt,
+                "live_context": live_context,
+            },
+        )
     except Exception as exc:
         return jsonify({"ok": False, "error": f"failed to create live token: {exc}"}), 500
 
@@ -1616,6 +3173,9 @@ def live_token():
             "ok": True,
             "model": LIVE_MODEL,
             "voice_name": "Leda",
+            "system_prompt": live_system_prompt,
+            "live_context": live_context,
+            "ai_room": contact_id == "pisces-core",
             **token_data,
         }
     )
