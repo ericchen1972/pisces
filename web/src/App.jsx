@@ -48,6 +48,16 @@ const MALE_VOICE_OPTIONS = [
   'Zubenelgenubi',
 ]
 
+function detectIsZhLocale() {
+  if (typeof navigator === 'undefined') return false
+  const lang = (navigator.language || '').toLowerCase()
+  return lang.startsWith('zh')
+}
+
+function tr(isZh, enText, zhText) {
+  return isZh ? zhText : enText
+}
+
 function getApiBaseUrl() {
   const envBase = (import.meta.env.VITE_API_BASE_URL || '').trim()
   if (envBase) return envBase.replace(/\/$/, '')
@@ -619,6 +629,8 @@ function MessageRichContent({ msg, variant = 'user', onImageClick }) {
 function LoginHome() {
   useBackgroundImage('/images/background.webp')
   const apiBaseUrl = useMemo(() => getApiBaseUrl(), [])
+  const isZh = useMemo(() => detectIsZhLocale(), [])
+  const t = (enText, zhText) => tr(isZh, enText, zhText)
   const isPadUp = useIsPadUp()
   const googleButtonRef = useRef(null)
   const [googleError, setGoogleError] = useState('')
@@ -874,7 +886,7 @@ function LoginHome() {
       })
       const data = await res.json()
       if (!res.ok || !data.ok) {
-        throw new Error(data.error || `Failed to load friends (HTTP ${res.status})`)
+        throw new Error(data.error || t(`Failed to load friends (HTTP ${res.status})`, `載入好友失敗（HTTP ${res.status}）`))
       }
       const friendContacts = (data.friends || []).map((friend) => ({
         id: friend.id,
@@ -931,7 +943,7 @@ function LoginHome() {
       })
       const data = await res.json()
       if (!res.ok || !data.ok) {
-        throw new Error(data.error || `Tester login failed (HTTP ${res.status})`)
+        throw new Error(data.error || t(`Tester login failed (HTTP ${res.status})`, `測試帳號登入失敗（HTTP ${res.status}）`))
       }
       applySignedInUser(data.user || null)
       loadFriendsList(data.user || null)
@@ -939,7 +951,7 @@ function LoginHome() {
       setTesterEmail('')
       setTesterAvatarUrl('')
     } catch (err) {
-      setTesterError(err?.message || 'Tester login failed.')
+      setTesterError(err?.message || t('Tester login failed.', '測試帳號登入失敗。'))
     } finally {
       setTesterSubmitting(false)
     }
@@ -1014,16 +1026,16 @@ function LoginHome() {
     const code = friendCodeInput.trim()
     const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
     if (!emailPattern.test(email)) {
-      setAddFriendError('Please enter a valid Google account email.')
+      setAddFriendError(t('Please enter a valid Google account email.', '請輸入有效的 Google 帳號 Email。'))
       return
     }
     if (alias.length < 2) {
-      setAddFriendError('Name must be at least 2 characters.')
+      setAddFriendError(t('Name must be at least 2 characters.', '名稱至少要 2 個字元。'))
       return
     }
     const aliasTaken = contacts.some((contact) => !contact.isAi && contact.name.trim().toLowerCase() === alias.toLowerCase())
     if (aliasTaken) {
-      setAddFriendError('This name is already used by another contact.')
+      setAddFriendError(t('This name is already used by another contact.', '這個名稱已被其他聯絡人使用。'))
       return
     }
 
@@ -1043,7 +1055,7 @@ function LoginHome() {
       })
       const data = await res.json()
       if (!res.ok || !data.ok) {
-        throw new Error(data.error || `Add friend failed (HTTP ${res.status})`)
+        throw new Error(data.error || t(`Add friend failed (HTTP ${res.status})`, `新增好友失敗（HTTP ${res.status}）`))
       }
       const newFriend = data?.friend || {}
       const newContact = {
@@ -1063,7 +1075,7 @@ function LoginHome() {
       setAddFriendModalOpen(false)
       setSelectedContact(null)
     } catch (err) {
-      setAddFriendError(err?.message || 'Add friend failed.')
+      setAddFriendError(err?.message || t('Add friend failed.', '新增好友失敗。'))
     } finally {
       setAddFriendSubmitting(false)
     }
@@ -1116,7 +1128,7 @@ function LoginHome() {
       })
       const data = await res.json()
       if (!res.ok || !data.ok) {
-        throw new Error(data.error || `History load failed (HTTP ${res.status})`)
+        throw new Error(data.error || t(`History load failed (HTTP ${res.status})`, `載入歷史訊息失敗（HTTP ${res.status}）`))
       }
       const nextMessages = buildViewMessages(data.messages || [])
       setMessagesByContact((prev) => ({
@@ -1133,7 +1145,7 @@ function LoginHome() {
             {
               id: `history-err-${Date.now()}`,
               role: 'ai',
-              text: err?.message || 'Failed to load history.',
+              text: err?.message || t('Failed to load history.', '載入歷史訊息失敗。'),
             },
           ],
         }
@@ -1162,14 +1174,14 @@ function LoginHome() {
       (contact) => contact.id !== editForm.id && contact.name.trim().toLowerCase() === nextAlias.toLowerCase(),
     )
     if (aliasCollision) {
-      setAvatarUploadError('This name is already used by another contact.')
+      setAvatarUploadError(t('This name is already used by another contact.', '這個名稱已被其他聯絡人使用。'))
       return
     }
     let nextAvatarUrl = editForm.avatar
 
     if (editForm.isAi) {
       if (!currentUser?.id) {
-        setAvatarUploadError('Please sign in again before saving AI settings.')
+        setAvatarUploadError(t('Please sign in again before saving AI settings.', '請重新登入後再儲存 AI 設定。'))
         return
       }
 
@@ -1209,7 +1221,7 @@ function LoginHome() {
         }
         nextAvatarUrl = saveData?.user?.ai_avatar_url || nextAvatarUrl
       } catch (err) {
-        setAvatarUploadError(err?.message || 'Save failed.')
+        setAvatarUploadError(err?.message || t('Save failed.', '儲存失敗。'))
         setIsUploadingAvatar(false)
         return
       } finally {
@@ -1217,7 +1229,7 @@ function LoginHome() {
       }
     } else {
       if (!currentUser?.id) {
-        setAvatarUploadError('Please sign in again before saving contact settings.')
+        setAvatarUploadError(t('Please sign in again before saving contact settings.', '請重新登入後再儲存聯絡人設定。'))
         return
       }
 
@@ -1239,7 +1251,7 @@ function LoginHome() {
           throw new Error(saveData.error || `Save failed (HTTP ${saveRes.status})`)
         }
       } catch (err) {
-        setAvatarUploadError(err?.message || 'Save failed.')
+        setAvatarUploadError(err?.message || t('Save failed.', '儲存失敗。'))
         return
       }
     }
@@ -2565,7 +2577,7 @@ function LoginHome() {
                               padding: 0,
                             }}
                           >
-                            {msg.collapsed ? '▶ AI Assist' : '▼ AI Assist'}
+                            {msg.collapsed ? `▶ ${t('AI Assist', 'AI 助理')}` : `▼ ${t('AI Assist', 'AI 助理')}`}
                           </button>
                           {msg.collapsed ? (
                             <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.85)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
@@ -2822,7 +2834,7 @@ function LoginHome() {
                           }
                         })
                       } catch (err) {
-                        const errText = err?.message || 'Unable to reach API.'
+                        const errText = err?.message || t('Unable to reach API.', '無法連線到 API。')
                         setMessagesByContact((prev) => {
                           const current = prev[contactId] || []
                           return {
@@ -3034,7 +3046,7 @@ function LoginHome() {
                             }
                           }
                         }}
-                        placeholder={isRecording ? '' : 'Type a message...'}
+                        placeholder={isRecording ? '' : t('Type a message...', '輸入訊息...')}
                         disabled={isRecording || isAwaitingReply}
                         style={{
                           height: CHAT_INPUT_BASE_HEIGHT,
@@ -3107,10 +3119,23 @@ function LoginHome() {
                             }}
                           >
                             <div>
-                              Click here to enter AI mode. Your text, voice, and calls will be directed to your AI.
+                              {t(
+                                'Click here to enter AI mode. Your text, voice, and calls will be directed to your AI.',
+                                '點擊這裡可進入 AI 模式。你傳送的文字、語音與通話都會導向你的 AI。',
+                              )}
                             </div>
-                            <div style={{ marginTop: 6 }}>• AI will automatically understand your conversation with this contact.</div>
-                            <div>• The other person will not see your conversation with AI.</div>
+                            <div style={{ marginTop: 6 }}>
+                              {t(
+                                '• AI will automatically understand your conversation with this contact.',
+                                '• AI 會自動理解你與此聯絡人的對話內容。',
+                              )}
+                            </div>
+                            <div>
+                              {t(
+                                '• The other person will not see your conversation with AI.',
+                                '• 對方不會看到你與 AI 的對話。',
+                              )}
+                            </div>
                           </div>
                         ) : null}
                       </div>
@@ -3370,7 +3395,7 @@ function LoginHome() {
                             }}
                           >
                             <IconEdit />
-                            <span>Edit</span>
+                            <span>{t('Edit', '編輯')}</span>
                           </button>
                           {contact.isAi ? null : (
                             <button
@@ -3391,7 +3416,7 @@ function LoginHome() {
                               }}
                             >
                               <IconTrash />
-                              <span>Delete</span>
+                              <span>{t('Delete', '刪除')}</span>
                             </button>
                           )}
                         </div>
@@ -3452,7 +3477,7 @@ function LoginHome() {
               </div>
               {isLoggingIn ? (
                 <p style={{ margin: 0, color: '#fff', fontSize: 12, textShadow: '0 2px 8px rgba(40,7,65,0.3)' }}>
-                  Signing in...
+                  {t('Signing in...', '登入中...')}
                 </p>
               ) : null}
               {googleError ? (
@@ -3596,13 +3621,13 @@ function LoginHome() {
               gap: 12,
             }}
           >
-            <div style={{ fontSize: 16, fontWeight: 700 }}>Friend Verification Code</div>
+            <div style={{ fontSize: 16, fontWeight: 700 }}>{t('Friend Verification Code', '好友驗證碼')}</div>
             <label style={{ display: 'grid', gap: 6 }}>
               <input
                 type="text"
                 value={identifyCodeInput}
                 onChange={(e) => setIdentifyCodeInput(e.target.value)}
-                placeholder="Enter code (optional)"
+                placeholder={t('Enter code (optional)', '輸入驗證碼（可選）')}
                 style={{
                   height: 38,
                   borderRadius: 10,
@@ -3615,11 +3640,13 @@ function LoginHome() {
               />
             </label>
             <p style={{ margin: 0, fontSize: 13, lineHeight: 1.45, color: 'rgba(255,255,255,0.92)' }}>
-              If you set a verification code here, anyone who adds you as a friend must enter this code.
-              If left empty, anyone can add you as a friend using your Google account.
+              {t(
+                'If you set a verification code here, anyone who adds you as a friend must enter this code. If left empty, anyone can add you as a friend using your Google account.',
+                '如果你在這裡設定驗證碼，任何新增你為好友的人都必須輸入此驗證碼。若留白，任何人都可透過你的 Google 帳號新增你為好友。',
+              )}
             </p>
             <label style={{ display: 'grid', gap: 6 }}>
-              <span style={{ fontSize: 13, opacity: 0.9 }}>History Range</span>
+              <span style={{ fontSize: 13, opacity: 0.9 }}>{t('History Range', '歷史範圍')}</span>
               <input
                 type="number"
                 min={10}
@@ -3639,8 +3666,10 @@ function LoginHome() {
               />
             </label>
             <p style={{ margin: 0, fontSize: 13, lineHeight: 1.45, color: 'rgba(255,255,255,0.92)' }}>
-              When AI needs to send messages for you or provide advice, this controls how many recent messages
-              from your conversation with that contact AI is allowed to read.
+              {t(
+                'When AI needs to send messages for you or provide advice, this controls how many recent messages from your conversation with that contact AI is allowed to read.',
+                '當你需要 AI 幫你傳遞訊息或提供意見時，這會控制 AI 可讀取你與對方最近訊息的數量。',
+              )}
             </p>
             {settingsError ? <p style={{ margin: 0, color: '#ffd7e3', fontSize: 12 }}>{settingsError}</p> : null}
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
@@ -3660,7 +3689,7 @@ function LoginHome() {
                   padding: '8px 14px',
                 }}
               >
-                Cancel
+                {t('Cancel', '取消')}
               </button>
               <button
                 type="submit"
@@ -3676,7 +3705,7 @@ function LoginHome() {
                   opacity: settingsSaving ? 0.7 : 1,
                 }}
               >
-                {settingsSaving ? 'Saving...' : 'Save'}
+                {settingsSaving ? t('Saving...', '儲存中...') : t('Save', '儲存')}
               </button>
             </div>
           </form>
@@ -3717,9 +3746,9 @@ function LoginHome() {
               gap: 12,
             }}
           >
-            <div style={{ fontSize: 16, fontWeight: 700 }}>Add Friend</div>
+            <div style={{ fontSize: 16, fontWeight: 700 }}>{t('Add Friend', '新增好友')}</div>
             <label style={{ display: 'grid', gap: 6 }}>
-              <span style={{ fontSize: 13, opacity: 0.9 }}>Google Account</span>
+              <span style={{ fontSize: 13, opacity: 0.9 }}>{t('Google Account', 'Google 帳號')}</span>
               <input
                 type="email"
                 required
@@ -3738,14 +3767,14 @@ function LoginHome() {
               />
             </label>
             <label style={{ display: 'grid', gap: 6 }}>
-              <span style={{ fontSize: 13, opacity: 0.9 }}>Name</span>
+              <span style={{ fontSize: 13, opacity: 0.9 }}>{t('Name', '名稱')}</span>
               <input
                 type="text"
                 required
                 minLength={2}
                 value={friendAliasInput}
                 onChange={(e) => setFriendAliasInput(e.target.value)}
-                placeholder="Contact name"
+                placeholder={t('Contact name', '聯絡人名稱')}
                 style={{
                   height: 38,
                   borderRadius: 10,
@@ -3758,12 +3787,12 @@ function LoginHome() {
               />
             </label>
             <label style={{ display: 'grid', gap: 6 }}>
-              <span style={{ fontSize: 13, opacity: 0.9 }}>Friend Verification Code</span>
+              <span style={{ fontSize: 13, opacity: 0.9 }}>{t('Friend Verification Code', '好友驗證碼')}</span>
               <input
                 type="text"
                 value={friendCodeInput}
                 onChange={(e) => setFriendCodeInput(e.target.value)}
-                placeholder="Optional"
+                placeholder={t('Optional', '可選')}
                 style={{
                   height: 38,
                   borderRadius: 10,
@@ -3776,7 +3805,7 @@ function LoginHome() {
               />
             </label>
             <p style={{ margin: 0, fontSize: 13, lineHeight: 1.45, color: 'rgba(255,255,255,0.92)' }}>
-              If the other user has set a verification code, please enter it here.
+              {t('If the other user has set a verification code, please enter it here.', '若對方有設定驗證碼，請在此輸入。')}
             </p>
             {addFriendError ? <p style={{ margin: 0, color: '#ffe56b', fontSize: 12 }}>{addFriendError}</p> : null}
             {addFriendSuccess ? <p style={{ margin: 0, color: '#ccffe0', fontSize: 12 }}>{addFriendSuccess}</p> : null}
@@ -3798,7 +3827,7 @@ function LoginHome() {
                   padding: '8px 14px',
                 }}
               >
-                Cancel
+                {t('Cancel', '取消')}
               </button>
               <button
                 type="submit"
@@ -3814,7 +3843,7 @@ function LoginHome() {
                   opacity: addFriendSubmitting ? 0.7 : 1,
                 }}
               >
-                {addFriendSubmitting ? 'Checking...' : 'Submit'}
+                {addFriendSubmitting ? t('Checking...', '檢查中...') : t('Submit', '送出')}
               </button>
             </div>
           </form>
@@ -3854,9 +3883,9 @@ function LoginHome() {
               gap: 12,
             }}
           >
-            <div style={{ fontSize: 16, fontWeight: 700 }}>Tester Login</div>
+            <div style={{ fontSize: 16, fontWeight: 700 }}>{t('Tester Login', '測試帳號登入')}</div>
             <label style={{ display: 'grid', gap: 6 }}>
-              <span style={{ fontSize: 13, opacity: 0.9 }}>Email</span>
+              <span style={{ fontSize: 13, opacity: 0.9 }}>{t('Email', 'Email')}</span>
               <input
                 type="email"
                 required
@@ -3875,7 +3904,7 @@ function LoginHome() {
               />
             </label>
             <label style={{ display: 'grid', gap: 6 }}>
-              <span style={{ fontSize: 13, opacity: 0.9 }}>Avatar URL</span>
+              <span style={{ fontSize: 13, opacity: 0.9 }}>{t('Avatar URL', '頭像 URL')}</span>
               <input
                 type="url"
                 value={testerAvatarUrl}
@@ -3910,7 +3939,7 @@ function LoginHome() {
                   padding: '8px 14px',
                 }}
               >
-                Cancel
+                {t('Cancel', '取消')}
               </button>
               <button
                 type="submit"
@@ -3926,7 +3955,7 @@ function LoginHome() {
                   opacity: testerSubmitting ? 0.7 : 1,
                 }}
               >
-                {testerSubmitting ? 'Signing in...' : 'Sign in'}
+                {testerSubmitting ? t('Signing in...', '登入中...') : t('Sign in', '登入')}
               </button>
             </div>
           </form>
@@ -4156,13 +4185,16 @@ function LoginHome() {
             ) : (
               <div style={{ display: 'grid', gap: 12 }}>
                 <div style={{ display: 'grid', gap: 8 }}>
-                  <div style={{ fontSize: 13, opacity: 0.88 }}>Special Prompt</div>
+                  <div style={{ fontSize: 13, opacity: 0.88 }}>{t('Special Prompt', '特殊 Prompt')}</div>
                   <textarea
                     value={editForm.specialPrompt || ''}
                     onChange={(e) => setEditForm((prev) => (prev ? { ...prev, specialPrompt: e.target.value } : prev))}
                     rows={4}
                     placeholder={
-                      'You can set a special prompt for this contact.\nWhen AI sends messages for you to this person, it will use this setting and ignore the Global Prompt.'
+                      t(
+                        'You can set a special prompt for this contact.\nWhen AI sends messages for you to this person, it will use this setting and ignore the Global Prompt.',
+                        '你可以為這位聯絡人設定特殊 Prompt。\n當 AI 為你傳訊給這位對象時，會優先使用這裡的設定並忽略 Global Prompt。',
+                      )
                     }
                     style={{
                       width: '100%',
@@ -4179,7 +4211,7 @@ function LoginHome() {
                   />
                 </div>
                 <div style={{ display: 'grid', gap: 8 }}>
-                  <div style={{ fontSize: 13, opacity: 0.88 }}>Relationship</div>
+                  <div style={{ fontSize: 13, opacity: 0.88 }}>{t('Relationship', '關係')}</div>
                   <input
                     type="text"
                     value={editForm.relationship || ''}
@@ -4227,7 +4259,7 @@ function LoginHome() {
                   fontWeight: 600,
                 }}
               >
-                Cancel
+                {t('Cancel', '取消')}
               </button>
               <button
                 type="button"
@@ -4247,7 +4279,7 @@ function LoginHome() {
                 }}
               >
                 <IconSave />
-                <span>Save</span>
+                <span>{t('Save', '儲存')}</span>
               </button>
             </div>
           </div>
@@ -4374,6 +4406,8 @@ function LoginHome() {
 
 function ChatTestLab() {
   const apiBaseUrl = useMemo(() => getApiBaseUrl(), [])
+  const isZh = useMemo(() => detectIsZhLocale(), [])
+  const t = (enText, zhText) => tr(isZh, enText, zhText)
   const [message, setMessage] = useState('')
   const [reply, setReply] = useState('')
   const [error, setError] = useState('')
@@ -4384,7 +4418,7 @@ function ChatTestLab() {
     event.preventDefault()
     const trimmed = message.trim()
     if (!trimmed) {
-      setError('Please enter a message.')
+      setError(t('Please enter a message.', '請輸入訊息。'))
       return
     }
 
@@ -4437,7 +4471,7 @@ function ChatTestLab() {
         ),
       )
     } catch (err) {
-      const errorMessage = err?.message || 'Unable to reach API.'
+      const errorMessage = err?.message || t('Unable to reach API.', '無法連線到 API。')
       setError(errorMessage)
       setDebugLog(
         JSON.stringify(
@@ -4447,7 +4481,7 @@ function ChatTestLab() {
             error: errorMessage,
             hint:
               errorMessage === 'Failed to fetch'
-                ? 'Usually CORS, HTTPS/mixed-content, DNS, or backend unavailable.'
+                ? t('Usually CORS, HTTPS/mixed-content, DNS, or backend unavailable.', '通常是 CORS、HTTPS/混合內容、DNS 或後端服務不可用。')
                 : '',
           },
           null,
@@ -4473,35 +4507,35 @@ function ChatTestLab() {
         onClick={() => navigateTo('/')}
         style={{ border: '1px solid #cad5e9', background: '#fff', borderRadius: 8, padding: '8px 12px', cursor: 'pointer' }}
       >
-        ← Back to Login
+        {t('← Back to Login', '← 回到登入頁')}
       </button>
 
-      <h1>Pisces AI Chat Test Lab</h1>
-      <p>Backend endpoint: {apiBaseUrl}</p>
+      <h1>{t('Pisces AI Chat Test Lab', 'Pisces AI 測試頁')}</h1>
+      <p>{t('Backend endpoint:', '後端端點：')} {apiBaseUrl}</p>
 
       <form onSubmit={onSubmit} style={{ display: 'grid', gap: 12 }}>
         <textarea
           rows={5}
           value={message}
           onChange={(e) => setMessage(e.target.value)}
-          placeholder="Type a message for Gemini..."
+          placeholder={t('Type a message for Gemini...', '輸入要給 Gemini 的訊息...')}
           style={{ padding: 12, fontSize: 16 }}
         />
         <button type="submit" disabled={isLoading} style={{ width: 170, padding: '10px 12px' }}>
-          {isLoading ? 'Sending...' : 'Send to AI'}
+          {isLoading ? t('Sending...', '送出中...') : t('Send to AI', '送給 AI')}
         </button>
       </form>
 
       <section style={{ marginTop: 24 }}>
-        <h2>AI Reply</h2>
+        <h2>{t('AI Reply', 'AI 回覆')}</h2>
         <div style={{ minHeight: 120, border: '1px solid #ccc', borderRadius: 8, padding: 12, whiteSpace: 'pre-wrap' }}>
-          {reply || 'No reply yet.'}
+          {reply || t('No reply yet.', '尚無回覆。')}
         </div>
         {error ? <p style={{ color: '#b00020', marginTop: 12 }}>{error}</p> : null}
       </section>
 
       <section style={{ marginTop: 24 }}>
-        <h2>Debug Log</h2>
+        <h2>{t('Debug Log', '偵錯日誌')}</h2>
         <pre
           style={{
             minHeight: 120,
@@ -4512,7 +4546,7 @@ function ChatTestLab() {
             overflowX: 'auto',
           }}
         >
-          {debugLog || 'No logs yet.'}
+          {debugLog || t('No logs yet.', '尚無日誌。')}
         </pre>
       </section>
     </main>
@@ -4520,12 +4554,14 @@ function ChatTestLab() {
 }
 
 function NotFound() {
+  const isZh = detectIsZhLocale()
+  const t = (enText, zhText) => tr(isZh, enText, zhText)
   return (
     <main style={{ padding: 24, fontFamily: 'Avenir Next, Montserrat, Helvetica Neue, sans-serif' }}>
-      <h1>Page Not Found</h1>
-      <p>This route does not exist.</p>
+      <h1>{t('Page Not Found', '找不到頁面')}</h1>
+      <p>{t('This route does not exist.', '此路由不存在。')}</p>
       <button type="button" onClick={() => navigateTo('/')} style={{ padding: '8px 12px' }}>
-        Go Home
+        {t('Go Home', '回首頁')}
       </button>
     </main>
   )
