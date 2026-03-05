@@ -398,7 +398,98 @@ def find_friend_from_message(user_id, text):
     return None
 
 
-def build_chat_tool_decision(user_message, global_prompt, history_messages):
+def find_friend_by_exact_name(user_id, name):
+    key = (name or "").strip().lower()
+    if not key:
+        return None
+    for friend in list_user_friends(user_id):
+        candidates = [friend.get("alias") or "", friend.get("display_name") or ""]
+        email = (friend.get("email") or "").strip().lower()
+        if email:
+            candidates.append(email)
+            candidates.append(email.split("@", 1)[0])
+        for candidate in candidates:
+            token = (candidate or "").strip().lower()
+            if token and token == key:
+                return friend
+    return None
+
+
+def decide_about_friend(user_message):
+    instruction = (
+        "You are a planner for tool `about_friend` in AI room. "
+        "Return strict JSON only with keys: call_about_friend (boolean), name (string). "
+        "Set call_about_friend=true only if the user is clearly talking about a specific person/contact and more context may help. "
+        "If true, set name to the exact person name mentioned by user. "
+        "If false, set name to empty string."
+    )
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": instruction},
+                    {"text": f"User message:\n{user_message}"},
+                ]
+            }
+        ]
+    }
+    try:
+        data = call_gemini_generate_content(payload, model=CHAT_MODEL)
+        raw = extract_text_from_response(data)
+        obj = extract_json_obj(raw)
+        return {
+            "call_about_friend": bool(obj.get("call_about_friend")),
+            "name": str(obj.get("name") or "").strip(),
+        }
+    except Exception:
+        return {
+            "call_about_friend": False,
+            "name": "",
+        }
+
+
+def about_friend(user_id, name, history_range):
+    friend = find_friend_by_exact_name(user_id, name)
+    if not friend:
+        return {
+            "requested_name": (name or "").strip(),
+            "friend": None,
+            "history": [],
+        }
+    history = get_chat_messages(user_id, friend["id"], history_range=history_range)
+    return {
+        "requested_name": (name or "").strip(),
+        "friend": friend,
+        "history": history,
+    }
+
+
+def build_about_friend_context(user_name, about_result):
+    friend = (about_result or {}).get("friend")
+    if not friend:
+        return ""
+    friend_name = (friend.get("alias") or friend.get("display_name") or friend.get("email") or "friend").strip()
+    history = (about_result or {}).get("history") or []
+    lines = [
+        f'Additional context from chat history between "{user_name}" and "{friend_name}".',
+        "Each line starts with the speaker name.",
+    ]
+    for msg in history:
+        role = (msg.get("role") or "").strip()
+        text = (msg.get("text") or "").strip()
+        if not text:
+            continue
+        if role == "user":
+            speaker = user_name
+        elif role in ("peer", "ai_proxy"):
+            speaker = friend_name
+        else:
+            continue
+        lines.append(f"{speaker}: {text}")
+    return "\n".join(lines)
+
+
+def build_chat_tool_decision(user_message, global_prompt, history_messages, extra_context_text=""):
     instruction = (
         "You are Pisces AI. Follow the persona/global prompt below first, then decide whether "
         "the user asked for spoken output. "
@@ -424,6 +515,7 @@ def build_chat_tool_decision(user_message, global_prompt, history_messages):
                     {"text": instruction},
                     {"text": f"Persona/Global prompt:\n{global_prompt}"},
                     {"text": f"Conversation history (oldest -> newest):\n{build_history_prompt(history_messages)}"},
+                    *([{"text": f"Extra context:\n{extra_context_text}"}] if (extra_context_text or "").strip() else []),
                     {"text": f"User message:\n{user_message}"},
                 ]
             }
@@ -1259,7 +1351,9 @@ def build_live_system_prompt(user_id, contact_id):
         f'Your name is "{ai_name}".\n'
         f'You are the AI assistant of "{user_name}".\n'
         f"Your speaking style is: {global_prompt}\n\n"
-        f'You are currently helping "{user_name}" communicate with "{receiver_name}".'
+        f'You are currently helping "{user_name}" communicate with "{receiver_name}".\n'
+        f'In this live call, you are speaking directly to "{user_name}" only.\n'
+        f'Do not greet or address "{receiver_name}" directly unless "{user_name}" explicitly asks you to compose a message for "{receiver_name}".'
     )
 
 
@@ -1305,6 +1399,10 @@ def build_live_contents_context(user_id, contact_id):
     lines.append(
         f'Please understand tone, relationship, and context. Help "{user_name}" communicate with "{receiver_name}". '
         f'Do not treat this history as direct conversation between you and "{user_name}".'
+    )
+    lines.append(
+        f'Important: during this live call, talk to "{user_name}" only. '
+        f'Do not directly address "{receiver_name}" unless explicitly asked to draft or relay a message.'
     )
     for msg in history_messages:
         role = (msg.get("role") or "").strip()
@@ -1353,10 +1451,10 @@ def get_session_auth(required=True):
     return {"user_id": user_id, "provider": provider, "email": email}, None
 
 
-def generate_gemini_reply(user_message, ai_settings, history_messages):
+def generate_gemini_reply(user_message, ai_settings, history_messages, extra_context_text=""):
     global_prompt = ai_settings.get("global_prompt") or AI_DEFAULT_GLOBAL_PROMPT
     voice_name = ai_settings.get("voice") or DEFAULT_AI_SETTINGS["voice"]
-    decision = build_chat_tool_decision(user_message, global_prompt, history_messages)
+    decision = build_chat_tool_decision(user_message, global_prompt, history_messages, extra_context_text=extra_context_text)
     reply_text = decision["reply"]
     audio_b64 = ""
     audio_mime_type = ""
@@ -1840,8 +1938,22 @@ def chat():
     ai_settings = get_user_ai_settings(user_id)
     history_range = get_user_history_range(user_id)
     history_messages = get_chat_messages(user_id, contact_id, history_range=history_range)
+    extra_context_text = ""
+    if user_id and contact_id == "pisces-core":
+        user_doc = get_firestore_client().collection("users").document(user_id).get()
+        user_data = user_doc.to_dict() if user_doc.exists else {}
+        user_name = (user_data.get("display_name") or user_data.get("email") or "User").strip()
+        about_plan = decide_about_friend(user_message)
+        if about_plan.get("call_about_friend") and (about_plan.get("name") or "").strip():
+            about_result = about_friend(user_id, about_plan.get("name"), history_range)
+            extra_context_text = build_about_friend_context(user_name, about_result)
     try:
-        chat_result = generate_gemini_reply(user_message, ai_settings, history_messages)
+        chat_result = generate_gemini_reply(
+            user_message,
+            ai_settings,
+            history_messages,
+            extra_context_text=extra_context_text,
+        )
     except Exception as exc:
         return jsonify({"error": str(exc)}), 502
 
@@ -1924,8 +2036,22 @@ def voice_chat():
     ai_settings = get_user_ai_settings(user_id)
     history_range = get_user_history_range(user_id)
     history_messages = get_chat_messages(user_id, contact_id, history_range=history_range)
+    extra_context_text = ""
+    if user_id and contact_id == "pisces-core":
+        user_doc = get_firestore_client().collection("users").document(user_id).get()
+        user_data = user_doc.to_dict() if user_doc.exists else {}
+        user_name = (user_data.get("display_name") or user_data.get("email") or "User").strip()
+        about_plan = decide_about_friend(transcript)
+        if about_plan.get("call_about_friend") and (about_plan.get("name") or "").strip():
+            about_result = about_friend(user_id, about_plan.get("name"), history_range)
+            extra_context_text = build_about_friend_context(user_name, about_result)
     try:
-        chat_result = generate_gemini_reply(transcript, ai_settings, history_messages)
+        chat_result = generate_gemini_reply(
+            transcript,
+            ai_settings,
+            history_messages,
+            extra_context_text=extra_context_text,
+        )
     except Exception as exc:
         return jsonify({"error": str(exc), "transcript": transcript}), 502
 
@@ -3177,5 +3303,50 @@ def live_token():
             "live_context": live_context,
             "ai_room": contact_id == "pisces-core",
             **token_data,
+        }
+    )
+
+
+@app.route("/api/live/about-friend-context", methods=["POST", "OPTIONS"])
+def live_about_friend_context():
+    if flask_request.method == "OPTIONS":
+        return ("", 204)
+    auth, auth_error = get_session_auth(required=True)
+    if auth_error:
+        err, status = auth_error
+        return jsonify(err), status
+
+    body = flask_request.get_json(silent=True) or {}
+    transcript = (body.get("transcript") or "").strip()
+    contact_id = (body.get("contact_id") or "pisces-core").strip() or "pisces-core"
+    if not transcript:
+        return jsonify({"ok": True, "matched": False, "context": ""})
+
+    # Only expose about_friend in AI room.
+    if contact_id != "pisces-core":
+        return jsonify({"ok": True, "matched": False, "context": ""})
+
+    user_id = auth["user_id"]
+    history_range = get_user_history_range(user_id)
+    user_doc = get_firestore_client().collection("users").document(user_id).get()
+    user_data = user_doc.to_dict() if user_doc.exists else {}
+    user_name = (user_data.get("display_name") or user_data.get("email") or "User").strip()
+
+    plan = decide_about_friend(transcript)
+    if not plan.get("call_about_friend") or not (plan.get("name") or "").strip():
+        return jsonify({"ok": True, "matched": False, "context": ""})
+
+    result = about_friend(user_id, plan.get("name"), history_range)
+    context = build_about_friend_context(user_name, result)
+    friend = result.get("friend") or {}
+    friend_name = (friend.get("alias") or friend.get("display_name") or friend.get("email") or "").strip()
+
+    return jsonify(
+        {
+            "ok": True,
+            "matched": bool(context),
+            "context": context,
+            "name": (plan.get("name") or "").strip(),
+            "friend_name": friend_name,
         }
     )

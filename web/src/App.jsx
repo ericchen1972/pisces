@@ -13,6 +13,7 @@ const UI_STORAGE_KEY = 'pisces_ui_v1'
 const AVATAR_SIZE = 256
 const CHAT_INPUT_BASE_HEIGHT = 24
 const CHAT_INPUT_MAX_HEIGHT = 132
+const FORCE_ENGLISH_UI = true
 const FEMALE_VOICE_OPTIONS = [
   'Achernar',
   'Aoede',
@@ -49,6 +50,7 @@ const MALE_VOICE_OPTIONS = [
 ]
 
 function detectIsZhLocale() {
+  if (FORCE_ENGLISH_UI) return false
   if (typeof navigator === 'undefined') return false
   const lang = (navigator.language || '').toLowerCase()
   return lang.startsWith('zh')
@@ -714,6 +716,8 @@ function LoginHome() {
   const phoneMicSourceRef = useRef(null)
   const phoneMicProcessorRef = useRef(null)
   const phoneLiveContextRef = useRef('')
+  const liveAboutFriendInjectedRef = useRef(new Set())
+  const liveAboutFriendPendingRef = useRef(new Set())
   const lastCompositionEndAtRef = useRef(0)
   const avatarFileInputRef = useRef(null)
   const chatInputRef = useRef(null)
@@ -1811,6 +1815,8 @@ function LoginHome() {
     }
     phoneLiveSessionRef.current = null
     phoneLiveConnectPromiseRef.current = null
+    liveAboutFriendInjectedRef.current.clear()
+    liveAboutFriendPendingRef.current.clear()
     setPhoneLiveStatus('idle')
 
     const ctx = phoneAudioContextRef.current
@@ -1818,6 +1824,59 @@ function LoginHome() {
     phonePlaybackTimeRef.current = 0
     if (ctx && ctx.state !== 'closed') {
       ctx.close().catch(() => {})
+    }
+  }
+
+  const maybeInjectAboutFriendLiveContext = async (transcriptText) => {
+    const normalized = String(transcriptText || '').trim()
+    if (!normalized) return
+    const contactId = selectedContact?.id || 'pisces-core'
+    if (contactId !== 'pisces-core') return
+    const key = normalized.toLowerCase()
+    if (liveAboutFriendInjectedRef.current.has(key) || liveAboutFriendPendingRef.current.has(key)) return
+    liveAboutFriendPendingRef.current.add(key)
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/live/about-friend-context`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          transcript: normalized,
+          contact_id: contactId,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || !data?.ok || !data?.matched || !data?.context) return
+      const contextText = String(data.context || '').trim()
+      if (!contextText) return
+      const activeSession = phoneLiveSessionRef.current
+      if (!activeSession) return
+      activeSession.sendClientContent({
+        turns: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text:
+                  'Additional background context only. Do not repeat this verbatim. ' +
+                  'Use it to better understand the mentioned contact.\n\n' +
+                  contextText,
+              },
+            ],
+          },
+        ],
+        turnComplete: false,
+      })
+      liveAboutFriendInjectedRef.current.add(key)
+      logPhoneLive('about_friend context injected', {
+        name: data?.name || '',
+        friendName: data?.friend_name || '',
+        contextLength: contextText.length,
+      })
+    } catch (err) {
+      logPhoneLive('about_friend context request failed', err)
+    } finally {
+      liveAboutFriendPendingRef.current.delete(key)
     }
   }
 
@@ -1873,6 +1932,15 @@ function LoginHome() {
           },
           onmessage: (message) => {
             logPhoneLive('live message', message)
+            const possibleInputText =
+              message?.serverContent?.inputTranscription?.text ||
+              message?.serverContent?.inputTranscript?.text ||
+              message?.inputTranscription?.text ||
+              message?.inputTranscript?.text ||
+              ''
+            if (possibleInputText) {
+              maybeInjectAboutFriendLiveContext(possibleInputText)
+            }
             const serverContent = message?.serverContent
             const parts = serverContent?.modelTurn?.parts || []
             parts.forEach((part) => {
@@ -1903,6 +1971,8 @@ function LoginHome() {
       })
 
       phoneLiveContextRef.current = String(tokenData.live_context || '')
+      liveAboutFriendInjectedRef.current.clear()
+      liveAboutFriendPendingRef.current.clear()
 
       phoneLiveSessionRef.current = session
       setPhoneLiveStatus('connected')
@@ -1927,34 +1997,24 @@ function LoginHome() {
     const session = phoneLiveSessionRef.current
     if (!session) return
     const contextText = (phoneLiveContextRef.current || '').trim()
-    if (contextText) {
-      try {
-        session.sendClientContent({
-          turns: [
-            {
-              role: 'user',
-              parts: [
-                {
-                  text:
-                    'Background context only. Do not repeat this verbatim. ' +
-                    'Use it to understand speakers, tone, and relationship.\n\n' +
-                    contextText,
-                },
-              ],
-            },
-          ],
-          // Seed context first, then complete the real greeting turn.
-          turnComplete: false,
-        })
-        logPhoneLive('live context seeded', { length: contextText.length })
-      } catch (err) {
-        logPhoneLive('failed to seed live context', err)
-      }
+    const greetingText = contextText
+      ? (
+          'Background context only. Do not repeat this verbatim. ' +
+          'Use it to understand speakers, tone, and relationship.\n\n' +
+          contextText +
+          '\n\n' +
+          GEMINI_LIVE_GREETING
+        )
+      : GEMINI_LIVE_GREETING
+    try {
+      session.sendClientContent({
+        turns: [{ role: 'user', parts: [{ text: greetingText }] }],
+        turnComplete: true,
+      })
+      logPhoneLive('live greeting sent', { withContext: Boolean(contextText), contextLength: contextText.length })
+    } catch (err) {
+      logPhoneLive('failed to send live greeting', err)
     }
-    session.sendClientContent({
-      turns: [{ role: 'user', parts: [{ text: GEMINI_LIVE_GREETING }] }],
-      turnComplete: true,
-    })
   }
 
   const clearPhoneUiTimers = () => {
