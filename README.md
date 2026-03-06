@@ -23,7 +23,7 @@ Pisces helps users:
 - Media storage: Vercel Blob
 
 ### Service Endpoints
-- Web: `https://pisces-plum.vercel.app`
+- Web: `https://pisces-plum.vercel.app/`
 - API: `https://pisces-315346868518.asia-east1.run.app`
 
 ## AI Models and AI Services in Use
