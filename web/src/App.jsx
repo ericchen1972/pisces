@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { GoogleGenAI, Modality } from '@google/genai'
 import * as Ably from 'ably'
+import { localeFromLanguage } from './lib/i18n.js'
 
 const FALLBACK_API_BASE_URL = 'https://pisces-315346868518.asia-east1.run.app'
 const LOCAL_API_BASE_URL = 'http://127.0.0.1:8080'
@@ -13,7 +14,6 @@ const UI_STORAGE_KEY = 'pisces_ui_v1'
 const AVATAR_SIZE = 256
 const CHAT_INPUT_BASE_HEIGHT = 24
 const CHAT_INPUT_MAX_HEIGHT = 132
-const FORCE_ENGLISH_UI = true
 const FEMALE_VOICE_OPTIONS = [
   'Achernar',
   'Aoede',
@@ -50,10 +50,8 @@ const MALE_VOICE_OPTIONS = [
 ]
 
 function detectIsZhLocale() {
-  if (FORCE_ENGLISH_UI) return false
   if (typeof navigator === 'undefined') return false
-  const lang = (navigator.language || '').toLowerCase()
-  return lang.startsWith('zh')
+  return localeFromLanguage(navigator.language) === 'zh-TW'
 }
 
 function tr(isZh, enText, zhText) {
@@ -3494,7 +3492,7 @@ function LoginHome() {
               <div style={{ display: 'grid', justifyItems: 'center', alignContent: 'center', lineHeight: 1 }}>
                 <img
                   src="/images/logo.webp"
-                  alt="Pisces"
+                  alt="Convia"
                   style={{
                     width: 'clamp(180px, 42vw, 360px)',
                     maxWidth: '78%',
@@ -3506,16 +3504,17 @@ function LoginHome() {
                 <div
                   style={{
                     color: '#ffffff',
-                    fontFamily: '"Waterfall", cursive',
-                    fontWeight: 400,
+                    fontFamily: 'ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+                    fontWeight: 700,
                     fontStyle: 'normal',
                     fontSize: 'clamp(32px, 12.5vw, 64px)',
+                    letterSpacing: '-0.035em',
                     lineHeight: 1.82,
                     marginTop: 'clamp(-22px, -3.5vw, -12px)',
                     textShadow: '0 4px 14px rgba(40, 7, 65, 0.35)',
                   }}
                 >
-                  Pisces
+                  Convia
                 </div>
               </div>
             </div>
