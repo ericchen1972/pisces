@@ -1054,6 +1054,63 @@ def test_delete_after_text_persistence_before_publish_revokes_delivery(
     assert not any("messages" in path for path in firestore.data)
 
 
+def test_text_delivery_succeeds_after_durable_write_when_realtime_publish_fails(
+    signed_in_client, monkeypatch
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+
+    private_provider_detail = "ably-secret-never-log"
+
+    def fail_publish(*_args):
+        raise RuntimeError(private_provider_detail)
+
+    logged = []
+    monkeypatch.setattr(main, "publish_user_channel_message", fail_publish)
+    monkeypatch.setattr(
+        main,
+        "log_tool_error",
+        lambda *args, **kwargs: logged.append((args, kwargs)),
+    )
+
+    response = signed_in_client.post(
+        "/api/messages/send",
+        json={"recipient_user_id": "user-b", "text": "durable hello"},
+    )
+
+    body = response.get_json()
+    assert response.status_code == 200
+    assert body["ok"] is True
+    assert body["realtime_delivered"] is False
+    message_id = body["message"]["message_id"]
+    assert firestore.read(
+        f"users/user-a/chats/user-b/messages/{message_id}"
+    )["text"] == "durable hello"
+    assert firestore.read(
+        f"users/user-b/chats/user-a/messages/{message_id}"
+    )["text"] == "durable hello"
+    assert (
+        firestore.read("users/user-b/chat_meta/user-a")["unread_count"].value
+        == 1
+    )
+    assert logged[0][0][:5] == (
+        "user-a",
+        "user-b",
+        "ably_publish",
+        "send_message",
+        "RuntimeError",
+    )
+    assert private_provider_detail not in repr(logged)
+
+
 def test_delete_after_voice_persistence_before_publish_revokes_delivery(
     signed_in_client, monkeypatch
 ):
