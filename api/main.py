@@ -96,6 +96,10 @@ class AudioInputError(ValueError):
         self.status = status
 
 
+class AcceptedFriendshipRequired(PermissionError):
+    pass
+
+
 def decode_audio_input(body):
     if not isinstance(body, dict):
         raise AudioInputError("JSON object is required")
@@ -945,6 +949,31 @@ def upload_audio_to_vercel_blob(user_id, audio_bytes, mime_type="audio/wav"):
     if not blob_url.startswith("https://"):
         raise RuntimeError("blob upload succeeded but no valid url returned")
     return blob_url
+
+
+def delete_vercel_blob(blob_url):
+    token = get_blob_rw_token()
+    if not token:
+        raise RuntimeError("BLOB_READ_WRITE_TOKEN is not configured")
+    payload = json.dumps({"urls": [blob_url]}).encode("utf-8")
+    req = request.Request(
+        "https://vercel.com/api/blob/delete",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "x-api-version": "12",
+        },
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=30):
+            return None
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"blob delete failed: {detail}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"blob delete failed: {exc}") from exc
 
 
 def validate_trusted_public_media_url(value):
@@ -2610,6 +2639,154 @@ def get_friend_context(user_id, contact_id):
     }
 
 
+def _friendship_reference(client, first_user_id, second_user_id):
+    user_a_id, user_b_id = sorted([first_user_id, second_user_id])
+    pair_key = f"{user_a_id}_{user_b_id}"
+    return (
+        client.collection("friendships").document(pair_key),
+        pair_key,
+        user_a_id,
+        user_b_id,
+    )
+
+
+def _is_accepted_friendship_snapshot(snapshot, user_a_id, user_b_id):
+    if not snapshot.exists:
+        return False
+    data = snapshot.to_dict() or {}
+    return (
+        data.get("status") == "accepted"
+        and data.get("user_a_id") == user_a_id
+        and data.get("user_b_id") == user_b_id
+    )
+
+
+def accepted_friendship_exists(client, first_user_id, second_user_id):
+    friendship_ref, _pair_key, user_a_id, user_b_id = _friendship_reference(
+        client, first_user_id, second_user_id
+    )
+    return _is_accepted_friendship_snapshot(
+        friendship_ref.get(), user_a_id, user_b_id
+    )
+
+
+def persist_friend_delivery(
+    client,
+    sender_user_id,
+    recipient_user_id,
+    message_id,
+    text,
+    sender_extras,
+    recipient_extras,
+    preview_text,
+):
+    friendship_ref, _pair_key, user_a_id, user_b_id = _friendship_reference(
+        client, sender_user_id, recipient_user_id
+    )
+    sender_message_ref = (
+        client.collection("users")
+        .document(sender_user_id)
+        .collection("chats")
+        .document(recipient_user_id)
+        .collection("messages")
+        .document(message_id)
+    )
+    recipient_message_ref = (
+        client.collection("users")
+        .document(recipient_user_id)
+        .collection("chats")
+        .document(sender_user_id)
+        .collection("messages")
+        .document(message_id)
+    )
+    sender_meta_ref = (
+        client.collection("users")
+        .document(sender_user_id)
+        .collection("chat_meta")
+        .document(recipient_user_id)
+    )
+    recipient_meta_ref = (
+        client.collection("users")
+        .document(recipient_user_id)
+        .collection("chat_meta")
+        .document(sender_user_id)
+    )
+    sender_message = {
+        "role": "user",
+        "text": (text or "").strip(),
+        "created_at": firestore.SERVER_TIMESTAMP,
+        **(sender_extras or {}),
+    }
+    recipient_message = {
+        "role": "peer",
+        "text": (text or "").strip(),
+        "created_at": firestore.SERVER_TIMESTAMP,
+        **(recipient_extras or {}),
+    }
+    sender_meta = {
+        "updated_at": firestore.SERVER_TIMESTAMP,
+        "last_message_at": firestore.SERVER_TIMESTAMP,
+        "last_message_preview": (preview_text or "").strip()[:280],
+    }
+    recipient_meta = {
+        **sender_meta,
+        "unread_count": firestore.Increment(1),
+    }
+    transaction = client.transaction()
+
+    @firestore.transactional
+    def commit(tx):
+        friendship_snapshot = next(iter(tx.get(friendship_ref)))
+        if not _is_accepted_friendship_snapshot(
+            friendship_snapshot, user_a_id, user_b_id
+        ):
+            raise AcceptedFriendshipRequired("accepted friendship required")
+        tx.set(sender_message_ref, sender_message)
+        tx.set(recipient_message_ref, recipient_message)
+        tx.set(sender_meta_ref, sender_meta, merge=True)
+        tx.set(recipient_meta_ref, recipient_meta, merge=True)
+
+    commit(transaction)
+
+
+def confirm_friend_delivery_before_publish(
+    client, sender_user_id, recipient_user_id, message_id
+):
+    friendship_ref, _pair_key, user_a_id, user_b_id = _friendship_reference(
+        client, sender_user_id, recipient_user_id
+    )
+    sender_message_ref = (
+        client.collection("users")
+        .document(sender_user_id)
+        .collection("chats")
+        .document(recipient_user_id)
+        .collection("messages")
+        .document(message_id)
+    )
+    recipient_message_ref = (
+        client.collection("users")
+        .document(recipient_user_id)
+        .collection("chats")
+        .document(sender_user_id)
+        .collection("messages")
+        .document(message_id)
+    )
+    transaction = client.transaction()
+
+    @firestore.transactional
+    def commit(tx):
+        friendship_snapshot = next(iter(tx.get(friendship_ref)))
+        if _is_accepted_friendship_snapshot(
+            friendship_snapshot, user_a_id, user_b_id
+        ):
+            return True
+        tx.delete(sender_message_ref)
+        tx.delete(recipient_message_ref)
+        return False
+
+    return commit(transaction)
+
+
 def decide_assist_action(user_message, history_messages, friend_name, user_id=""):
     return get_openai_service().decide_assist_action(
         user_id=user_id,
@@ -4244,6 +4421,77 @@ def mark_chat_read():
         return jsonify({"ok": False, "error": f"failed to mark read: {exc}"}), 500
 
 
+@app.route("/api/friend/delete", methods=["POST", "OPTIONS"])
+def delete_friend():
+    if flask_request.method == "OPTIONS":
+        return ("", 204)
+
+    auth, auth_error = get_session_auth(required=True)
+    if auth_error:
+        err, status = auth_error
+        return jsonify(err), status
+    requester_user_id = auth["user_id"]
+    body = flask_request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "JSON object is required"}), 400
+    friend_user_id = body.get("friend_user_id")
+    if not isinstance(friend_user_id, str) or not friend_user_id.strip():
+        return jsonify({"ok": False, "error": "friend_user_id is required"}), 400
+    friend_user_id = friend_user_id.strip()
+    if friend_user_id == requester_user_id:
+        return jsonify({"ok": False, "error": "cannot delete self"}), 400
+
+    user_a_id, user_b_id = sorted([requester_user_id, friend_user_id])
+    pair_key = f"{user_a_id}_{user_b_id}"
+    try:
+        client = get_firestore_client()
+        friendship_ref = client.collection("friendships").document(pair_key)
+        requester_meta_ref = (
+            client.collection("users")
+            .document(requester_user_id)
+            .collection("chat_meta")
+            .document(friend_user_id)
+        )
+        friend_meta_ref = (
+            client.collection("users")
+            .document(friend_user_id)
+            .collection("chat_meta")
+            .document(requester_user_id)
+        )
+        transaction = client.transaction()
+
+        @firestore.transactional
+        def commit(tx):
+            snapshot = next(iter(tx.get(friendship_ref)))
+            if not snapshot.exists:
+                return "already_deleted"
+            data = snapshot.to_dict() or {}
+            if (
+                data.get("status") != "accepted"
+                or data.get("user_a_id") != user_a_id
+                or data.get("user_b_id") != user_b_id
+            ):
+                return None
+            tx.delete(friendship_ref)
+            tx.delete(requester_meta_ref)
+            tx.delete(friend_meta_ref)
+            return "deleted"
+
+        delete_result = commit(transaction)
+        if delete_result is None:
+            return jsonify({"ok": False, "error": "friendship not found"}), 404
+        return jsonify(
+            {
+                "ok": True,
+                "friend_user_id": friend_user_id,
+                "pair_key": pair_key,
+                "already_deleted": delete_result == "already_deleted",
+            }
+        )
+    except Exception:
+        return jsonify({"ok": False, "error": "failed to delete friend"}), 500
+
+
 @app.route("/api/friend/settings", methods=["POST", "OPTIONS"])
 def save_friend_settings():
     if flask_request.method == "OPTIONS":
@@ -4389,39 +4637,45 @@ def send_message():
         recipient_doc = client.collection("users").document(recipient_user_id).get()
         if not recipient_doc.exists:
             return jsonify({"ok": False, "error": "recipient does not exist"}), 404
+        if not accepted_friendship_exists(
+            client, sender_user_id, recipient_user_id
+        ):
+            return jsonify(
+                {"ok": False, "error": "accepted friendship required"}
+            ), 403
         sender_doc = client.collection("users").document(sender_user_id).get()
         sender_data = sender_doc.to_dict() if sender_doc.exists else {}
 
         message_id = str(uuid.uuid4())
         created_at_iso = datetime.now(timezone.utc).isoformat()
-        save_chat_message(
-            sender_user_id,
-            recipient_user_id,
-            "user",
-            text,
-            extras={
+        sender_extras = {
                 "visibility": "shared",
                 "sender_mode": "user",
                 **({"image_url": image_url} if image_url else {}),
                 **({"music_url": music_url} if music_url else {}),
-            },
-        )
-        save_chat_message(
-            recipient_user_id,
-            sender_user_id,
-            "peer",
-            text,
-            extras={
+        }
+        recipient_extras = {
                 "visibility": "shared",
                 "sender_mode": "user",
                 "avatar_url": (sender_data.get("avatar_url") or "").strip(),
                 **({"image_url": image_url} if image_url else {}),
                 **({"music_url": music_url} if music_url else {}),
-            },
-        )
+        }
         preview_text = text or ("Image + Music" if image_url and music_url else "Image" if image_url else "Music")
-        upsert_chat_meta(sender_user_id, recipient_user_id, unread_increment=0, preview_text=preview_text)
-        upsert_chat_meta(recipient_user_id, sender_user_id, unread_increment=1, preview_text=preview_text)
+        persist_friend_delivery(
+            client,
+            sender_user_id,
+            recipient_user_id,
+            message_id,
+            text,
+            sender_extras,
+            recipient_extras,
+            preview_text,
+        )
+        if not confirm_friend_delivery_before_publish(
+            client, sender_user_id, recipient_user_id, message_id
+        ):
+            raise AcceptedFriendshipRequired("accepted friendship required")
 
         payload = {
             "message_id": message_id,
@@ -4437,6 +4691,10 @@ def send_message():
         }
         publish_user_channel_message(recipient_user_id, payload)
         return jsonify({"ok": True, "message": payload})
+    except AcceptedFriendshipRequired:
+        return jsonify(
+            {"ok": False, "error": "accepted friendship required"}
+        ), 403
     except Exception as exc:
         return jsonify({"ok": False, "error": f"failed to send message: {exc}"}), 500
 
@@ -4460,6 +4718,30 @@ def send_voice_message():
         return jsonify({"ok": False, "error": "recipient_user_id is required"}), 400
     if sender_user_id == recipient_user_id:
         return jsonify({"ok": False, "error": "cannot send message to yourself"}), 400
+
+    try:
+        client = get_firestore_client()
+        recipient_doc = client.collection("users").document(recipient_user_id).get()
+        if not recipient_doc.exists:
+            return jsonify({"ok": False, "error": "recipient does not exist"}), 404
+        if not accepted_friendship_exists(
+            client, sender_user_id, recipient_user_id
+        ):
+            return jsonify(
+                {"ok": False, "error": "accepted friendship required"}
+            ), 403
+    except Exception as exc:
+        log_tool_error(
+            sender_user_id,
+            recipient_user_id,
+            "friendship_check",
+            "send_voice_message",
+            type(exc).__name__,
+            request_id=request_id,
+        )
+        return jsonify(
+            {"ok": False, "error": "voice delivery is currently unavailable"}
+        ), 500
 
     try:
         duration_seconds = float(duration_seconds_raw or 0)
@@ -4500,55 +4782,41 @@ def send_voice_message():
         return jsonify({"ok": False, "error": "voice upload is currently unavailable"}), 502
 
     try:
-        client = get_firestore_client()
-        recipient_doc = client.collection("users").document(recipient_user_id).get()
-        if not recipient_doc.exists:
-            return jsonify({"ok": False, "error": "recipient does not exist"}), 404
         sender_doc = client.collection("users").document(sender_user_id).get()
         sender_data = sender_doc.to_dict() if sender_doc.exists else {}
 
         message_id = str(uuid.uuid4())
         created_at_iso = datetime.now(timezone.utc).isoformat()
 
-        save_chat_message(
-            sender_user_id,
-            recipient_user_id,
-            "user",
-            "",
-            extras={
+        sender_extras = {
                 "visibility": "shared",
                 "sender_mode": "user",
                 "audio_url": audio_url,
                 "audio_duration_seconds": duration_seconds,
                 "transcript_text": transcript,
-            },
-        )
-        save_chat_message(
-            recipient_user_id,
-            sender_user_id,
-            "peer",
-            "",
-            extras={
+        }
+        recipient_extras = {
                 "visibility": "shared",
                 "sender_mode": "user",
                 "avatar_url": (sender_data.get("avatar_url") or "").strip(),
                 "audio_url": audio_url,
                 "audio_duration_seconds": duration_seconds,
                 "transcript_text": transcript,
-            },
-        )
-        upsert_chat_meta(
+        }
+        persist_friend_delivery(
+            client,
             sender_user_id,
             recipient_user_id,
-            unread_increment=0,
-            preview_text=transcript or "Voice message",
+            message_id,
+            "",
+            sender_extras,
+            recipient_extras,
+            transcript or "Voice message",
         )
-        upsert_chat_meta(
-            recipient_user_id,
-            sender_user_id,
-            unread_increment=1,
-            preview_text=transcript or "Voice message",
-        )
+        if not confirm_friend_delivery_before_publish(
+            client, sender_user_id, recipient_user_id, message_id
+        ):
+            raise AcceptedFriendshipRequired("accepted friendship required")
 
         payload = {
             "message_id": message_id,
@@ -4564,6 +4832,21 @@ def send_voice_message():
         }
         publish_user_channel_message(recipient_user_id, payload)
         return jsonify({"ok": True, "message": payload})
+    except AcceptedFriendshipRequired:
+        try:
+            delete_vercel_blob(audio_url)
+        except Exception as exc:
+            log_tool_error(
+                sender_user_id,
+                recipient_user_id,
+                "voice_cleanup",
+                "send_voice_message",
+                type(exc).__name__,
+                request_id=request_id,
+            )
+        return jsonify(
+            {"ok": False, "error": "accepted friendship required"}
+        ), 403
     except Exception as exc:
         log_tool_error(
             sender_user_id,

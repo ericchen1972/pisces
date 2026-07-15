@@ -25,6 +25,12 @@ describe('AiCallOverlay', () => {
     expect(onRetry).toHaveBeenCalledOnce()
   })
 
+  it('does not expose a raw English realtime error in zh-TW', () => {
+    render(<AiCallOverlay locale="zh-TW" name="Convia AI" status="error" error={new Error('Realtime transport failed')} />)
+    expect(screen.getByText('語音通話連線失敗。')).toBeInTheDocument()
+    expect(screen.queryByText('Realtime transport failed')).not.toBeInTheDocument()
+  })
+
   it('traps focus, closes on Escape, restores the page, and isolates the background', async () => {
     const onHangUp = vi.fn()
     const { container, rerender } = render(<button type="button">Before call</button>)

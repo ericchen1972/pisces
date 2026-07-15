@@ -1,3 +1,5 @@
+import base64
+
 import pytest
 
 import main
@@ -699,3 +701,445 @@ def test_add_friend_applies_requesters_default_group_when_metadata_is_unassigned
         "unread_count": 0,
     }
     assert firestore.read("users/user-a/chat_meta/user-b")["group_id"] == "others"
+
+
+def test_delete_friend_requires_authentication(client):
+    response = client.post("/api/friend/delete", json={"friend_user_id": "user-b"})
+
+    assert response.status_code == 401
+    assert response.get_json() == {"ok": False, "error": "unauthorized"}
+
+
+def test_delete_friend_rejects_invalid_or_unrelated_contact(signed_in_client, monkeypatch):
+    firestore = FakeFirestoreClient()
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="somebody-else",
+        user_b_id="user-b",
+        status="accepted",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+
+    missing = signed_in_client.post("/api/friend/delete", json={})
+    self_delete = signed_in_client.post("/api/friend/delete", json={"friend_user_id": "user-a"})
+    unrelated = signed_in_client.post("/api/friend/delete", json={"friend_user_id": "user-b"})
+
+    assert missing.status_code == 400
+    assert self_delete.status_code == 400
+    assert unrelated.status_code == 404
+    assert firestore.read("friendships/user-a_user-b") is not None
+
+
+def test_delete_friend_rejects_malformed_swapped_members_at_the_canonical_key(
+    signed_in_client, monkeypatch
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-b",
+        user_b_id="user-a",
+        status="accepted",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+
+    response = signed_in_client.post(
+        "/api/friend/delete", json={"friend_user_id": "user-b"}
+    )
+
+    assert response.status_code == 404
+    assert response.get_json() == {"ok": False, "error": "friendship not found"}
+    assert firestore.read("friendships/user-a_user-b") is not None
+
+
+def test_delete_friend_atomically_removes_friendship_and_both_metadata_docs(signed_in_client, monkeypatch):
+    firestore = FakeFirestoreClient()
+    firestore.seed(
+        "friendships/user-a_user-b",
+        pair_key="user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+    )
+    firestore.seed("users/user-a/chat_meta/user-b", group_id="friends")
+    firestore.seed("users/user-b/chat_meta/user-a", group_id="friends")
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+
+    response = signed_in_client.post("/api/friend/delete", json={"friend_user_id": "user-b"})
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "ok": True,
+        "friend_user_id": "user-b",
+        "pair_key": "user-a_user-b",
+        "already_deleted": False,
+    }
+    assert firestore.read("friendships/user-a_user-b") is None
+    assert firestore.read("users/user-a/chat_meta/user-b") is None
+    assert firestore.read("users/user-b/chat_meta/user-a") is None
+
+
+def test_delete_friend_is_idempotent_when_the_canonical_friendship_is_already_missing(
+    signed_in_client, monkeypatch
+):
+    firestore = FakeFirestoreClient()
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+
+    first = signed_in_client.post(
+        "/api/friend/delete", json={"friend_user_id": "user-b"}
+    )
+    second = signed_in_client.post(
+        "/api/friend/delete", json={"friend_user_id": "user-b"}
+    )
+
+    assert first.status_code == 200
+    assert first.get_json() == {
+        "ok": True,
+        "friend_user_id": "user-b",
+        "pair_key": "user-a_user-b",
+        "already_deleted": True,
+    }
+    assert second.get_json() == first.get_json()
+
+
+def test_delete_friend_repeated_after_confirmed_delete_reports_already_deleted(
+    signed_in_client, monkeypatch
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+
+    deleted = signed_in_client.post(
+        "/api/friend/delete", json={"friend_user_id": "user-b"}
+    )
+    retried = signed_in_client.post(
+        "/api/friend/delete", json={"friend_user_id": "user-b"}
+    )
+
+    assert deleted.status_code == 200
+    assert deleted.get_json()["already_deleted"] is False
+    assert retried.status_code == 200
+    assert retried.get_json()["already_deleted"] is True
+
+
+def test_post_delete_text_delivery_is_rejected_without_writes_or_publish(
+    signed_in_client, monkeypatch
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    published = []
+    monkeypatch.setattr(
+        main,
+        "publish_user_channel_message",
+        lambda *args: published.append(args),
+    )
+
+    assert signed_in_client.post(
+        "/api/friend/delete", json={"friend_user_id": "user-b"}
+    ).status_code == 200
+    response = signed_in_client.post(
+        "/api/messages/send",
+        json={"recipient_user_id": "user-b", "text": "should not deliver"},
+    )
+
+    assert response.status_code == 403
+    assert response.get_json() == {"ok": False, "error": "accepted friendship required"}
+    assert published == []
+    assert not any("messages" in path for path in firestore.data)
+    assert firestore.read("users/user-a/chat_meta/user-b") is None
+    assert firestore.read("users/user-b/chat_meta/user-a") is None
+
+
+def test_post_delete_voice_delivery_is_rejected_before_provider_or_upload(
+    signed_in_client, monkeypatch
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    provider_calls = []
+    uploads = []
+    published = []
+    monkeypatch.setattr(
+        main,
+        "transcribe_audio_bytes",
+        lambda *args: provider_calls.append(args) or "voice text",
+    )
+    monkeypatch.setattr(
+        main,
+        "upload_audio_to_vercel_blob",
+        lambda *args: uploads.append(args) or "https://blob/voice.webm",
+    )
+    monkeypatch.setattr(
+        main,
+        "publish_user_channel_message",
+        lambda *args: published.append(args),
+    )
+
+    response = signed_in_client.post(
+        "/api/messages/send-voice",
+        json={
+            "recipient_user_id": "user-b",
+            "audio_base64": base64.b64encode(b"voice").decode("ascii"),
+            "mime_type": "audio/webm",
+            "duration_seconds": 1,
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.get_json() == {"ok": False, "error": "accepted friendship required"}
+    assert provider_calls == []
+    assert uploads == []
+    assert published == []
+    assert not any("messages" in path for path in firestore.data)
+
+
+class DeleteWinsTransaction(FakeTransaction):
+    def _commit(self):
+        if self.client.delete_before_next_transaction_commit:
+            self.client.delete_before_next_transaction_commit = False
+            self.client.data.pop(("friendships", "user-a_user-b"), None)
+            self._rollback()
+            raise FakeTransactionConflict("friend deletion committed first")
+        return super()._commit()
+
+
+class DeleteWinsFirestore(FakeFirestoreClient):
+    def __init__(self):
+        super().__init__()
+        self.delete_before_next_transaction_commit = True
+
+    def transaction(self):
+        self.transaction_attempts += 1
+        return DeleteWinsTransaction(self)
+
+
+def test_concurrent_delete_winning_transaction_prevents_text_delivery_and_publish(
+    signed_in_client, monkeypatch
+):
+    firestore = DeleteWinsFirestore()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    published = []
+    monkeypatch.setattr(
+        main,
+        "publish_user_channel_message",
+        lambda *args: published.append(args),
+    )
+
+    response = signed_in_client.post(
+        "/api/messages/send",
+        json={"recipient_user_id": "user-b", "text": "racing message"},
+    )
+
+    assert response.status_code == 403
+    assert published == []
+    assert not any("messages" in path for path in firestore.data)
+    assert firestore.transaction_begin_attempts == 2
+
+
+def test_concurrent_delete_winning_voice_persistence_prevents_delivery_and_publish(
+    signed_in_client, monkeypatch
+):
+    firestore = DeleteWinsFirestore()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    provider_calls = []
+    uploads = []
+    published = []
+    monkeypatch.setattr(
+        main,
+        "transcribe_audio_bytes",
+        lambda *args: provider_calls.append(args) or "racing voice",
+    )
+    monkeypatch.setattr(
+        main,
+        "upload_audio_to_vercel_blob",
+        lambda *args: uploads.append(args) or "https://blob/voice.webm",
+    )
+    monkeypatch.setattr(
+        main,
+        "publish_user_channel_message",
+        lambda *args: published.append(args),
+    )
+
+    response = signed_in_client.post(
+        "/api/messages/send-voice",
+        json={
+            "recipient_user_id": "user-b",
+            "audio_base64": base64.b64encode(b"voice").decode("ascii"),
+            "mime_type": "audio/webm",
+            "duration_seconds": 1,
+        },
+    )
+
+    assert response.status_code == 403
+    assert provider_calls
+    assert uploads
+    assert published == []
+    assert not any("messages" in path for path in firestore.data)
+    assert firestore.transaction_begin_attempts == 2
+
+
+def _delete_friendship_after_persistence(firestore, persist):
+    def wrapped(*args, **kwargs):
+        persist(*args, **kwargs)
+        firestore.data.pop(("friendships", "user-a_user-b"), None)
+        firestore.data.pop(("users", "user-a", "chat_meta", "user-b"), None)
+        firestore.data.pop(("users", "user-b", "chat_meta", "user-a"), None)
+
+    return wrapped
+
+
+def test_delete_after_text_persistence_before_publish_revokes_delivery(
+    signed_in_client, monkeypatch
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(
+        main,
+        "persist_friend_delivery",
+        _delete_friendship_after_persistence(
+            firestore, main.persist_friend_delivery
+        ),
+    )
+    published = []
+    monkeypatch.setattr(
+        main,
+        "publish_user_channel_message",
+        lambda *args: published.append(args),
+    )
+
+    response = signed_in_client.post(
+        "/api/messages/send",
+        json={"recipient_user_id": "user-b", "text": "too late"},
+    )
+
+    assert response.status_code == 403
+    assert published == []
+    assert not any("messages" in path for path in firestore.data)
+
+
+def test_delete_after_voice_persistence_before_publish_revokes_delivery(
+    signed_in_client, monkeypatch
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(
+        main,
+        "persist_friend_delivery",
+        _delete_friendship_after_persistence(
+            firestore, main.persist_friend_delivery
+        ),
+    )
+    monkeypatch.setattr(main, "transcribe_audio_bytes", lambda *_args: "voice")
+    monkeypatch.setattr(
+        main,
+        "upload_audio_to_vercel_blob",
+        lambda *_args: "https://blob/voice.webm",
+    )
+    deleted_blobs = []
+    monkeypatch.setattr(main, "delete_vercel_blob", deleted_blobs.append)
+    published = []
+    monkeypatch.setattr(
+        main,
+        "publish_user_channel_message",
+        lambda *args: published.append(args),
+    )
+
+    response = signed_in_client.post(
+        "/api/messages/send-voice",
+        json={
+            "recipient_user_id": "user-b",
+            "audio_base64": base64.b64encode(b"voice").decode("ascii"),
+            "mime_type": "audio/webm",
+        },
+    )
+
+    assert response.status_code == 403
+    assert published == []
+    assert not any("messages" in path for path in firestore.data)
+    assert deleted_blobs == ["https://blob/voice.webm"]
+
+
+def test_pre_publish_rollback_preserves_metadata_from_a_newer_friendship_generation(monkeypatch):
+    firestore = FakeFirestoreClient()
+    firestore.seed(
+        "users/user-a/chats/user-b/messages/stale-message",
+        role="user",
+        text="stale",
+    )
+    firestore.seed(
+        "users/user-b/chats/user-a/messages/stale-message",
+        role="peer",
+        text="stale",
+    )
+    firestore.seed(
+        "users/user-a/chat_meta/user-b",
+        last_message_preview="new relationship message",
+    )
+    firestore.seed(
+        "users/user-b/chat_meta/user-a",
+        last_message_preview="new relationship message",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+
+    confirmed = main.confirm_friend_delivery_before_publish(
+        firestore, "user-a", "user-b", "stale-message"
+    )
+
+    assert confirmed is False
+    assert firestore.read(
+        "users/user-a/chats/user-b/messages/stale-message"
+    ) is None
+    assert firestore.read(
+        "users/user-b/chats/user-a/messages/stale-message"
+    ) is None
+    assert firestore.read("users/user-a/chat_meta/user-b") == {
+        "last_message_preview": "new relationship message"
+    }
+    assert firestore.read("users/user-b/chat_meta/user-a") == {
+        "last_message_preview": "new relationship message"
+    }

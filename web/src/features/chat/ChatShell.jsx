@@ -23,7 +23,7 @@ export default function ChatShell({ sidebar, children, locale = 'en' }) {
   useEffect(() => {
     if (!modalDrawerOpen) return undefined
     const onKeyDown = (event) => {
-      if (event.key === 'Escape') closeDrawer()
+      if (event.key === 'Escape' && !event.defaultPrevented) closeDrawer()
     }
     const frame = window.requestAnimationFrame(() => {
       drawerRef.current?.querySelector(FOCUSABLE)?.focus()

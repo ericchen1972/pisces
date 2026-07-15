@@ -29,6 +29,16 @@ describe('ConversationHeader', () => {
     expect(onCall).toHaveBeenCalledOnce()
   })
 
+  it.each([
+    [{ id: 'pisces-core', name: 'Convia AI', isAi: true }, 'Edit Convia AI'],
+    [{ id: 'friend', name: 'Amy', isAi: false }, 'Edit Amy'],
+  ])('opens settings for every contact type', (contact, label) => {
+    const onEdit = vi.fn()
+    render(<ConversationHeader contact={contact} onEdit={onEdit} />)
+    fireEvent.click(screen.getByRole('button', { name: label }))
+    expect(onEdit).toHaveBeenCalledWith(contact)
+  })
+
   it('keeps person phone disabled and enables AI Assist voice', () => {
     const onAssistCall = vi.fn()
     render(

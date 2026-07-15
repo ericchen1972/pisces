@@ -118,3 +118,7 @@ export function SpeakerIcon(props) {
 export function LogoutIcon(props) {
   return <Icon {...props}><path d="M10 4H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h5M14 8l4 4-4 4M8 12h10" /></Icon>
 }
+
+export function BackIcon(props) {
+  return <Icon {...props}><path d="m15 18-6-6 6-6" /></Icon>
+}

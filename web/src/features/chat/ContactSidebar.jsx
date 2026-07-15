@@ -26,6 +26,8 @@ export default function ContactSidebar({
   currentUser,
   onAddFriend,
   onSelectContact,
+  onEditContact,
+  onDeleteContact,
   onOpenSettings,
   onManageGroups,
   onMoveContact,
@@ -55,7 +57,7 @@ export default function ContactSidebar({
       >
         <AiAvatar contact={aiContact} />
         <span className="contact-row__copy"><strong>Convia AI</strong></span>
-        <UnreadBadge count={aiUnread} label={`${aiUnread} unread messages from Convia AI`} />
+        <UnreadBadge count={aiUnread} label={locale === 'zh-TW' ? `Convia AI 有 ${aiUnread} 則未讀訊息` : `${aiUnread} unread messages from Convia AI`} />
       </button>
 
       <div className="contact-sidebar__groups">
@@ -70,13 +72,15 @@ export default function ContactSidebar({
             selectedContactId={selectedContactId}
             onSelectContact={onSelectContact}
             onMoveContact={onMoveContact}
+            onEditContact={onEditContact}
+            onDeleteContact={onDeleteContact}
           />
         ))}
       </div>
 
       <footer className="contact-sidebar__footer">
         <button type="button" className="contact-sidebar__account" data-close-drawer onClick={onOpenSettings}>
-          <ContactAvatar contact={{ name: currentUser?.display_name || currentUser?.email || 'Account', avatar_url: currentUser?.avatar_url }} size="small" />
+          <ContactAvatar contact={{ name: currentUser?.display_name || currentUser?.email || copy.settings, avatar_url: currentUser?.avatar_url }} size="small" locale={locale} />
           <span>{currentUser?.display_name || currentUser?.email || copy.settings}</span>
           <SettingsIcon size={18} />
         </button>

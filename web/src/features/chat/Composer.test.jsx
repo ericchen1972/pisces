@@ -65,6 +65,11 @@ describe('Composer', () => {
     expect(screen.getByRole('button', { name: 'Add attachment' })).toBeDisabled()
   })
 
+  it('localizes the AI Assist control in zh-TW', () => {
+    render(<Composer value="" onChange={() => {}} onSend={() => {}} onToggleAssist={() => {}} showAssist locale="zh-TW" />)
+    expect(screen.getByRole('button', { name: 'AI 協助' })).toBeInTheDocument()
+  })
+
   it('attaches a supported HTTPS image URL and allows attachment-only sending', () => {
     const onAttachment = vi.fn()
     const onSend = vi.fn()

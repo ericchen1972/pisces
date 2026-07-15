@@ -69,4 +69,13 @@ describe('GroupManagerDialog', () => {
     await waitFor(() => expect(props.onDelete).toHaveBeenCalledWith('family', 'friends'))
     expect(props.onRefresh).toHaveBeenCalledWith(groups)
   })
+
+  it('does not expose raw English backend errors in zh-TW', async () => {
+    const user = userEvent.setup()
+    renderManager({ locale: 'zh-TW', onCreate: vi.fn().mockRejectedValue(new Error('backend conflict')) })
+    await user.type(screen.getByLabelText('新群組名稱'), '鄰居')
+    await user.click(screen.getByRole('button', { name: '建立群組' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('無法儲存群組。')
+    expect(screen.queryByText('backend conflict')).not.toBeInTheDocument()
+  })
 })

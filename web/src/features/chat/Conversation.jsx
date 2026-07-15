@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef } from 'react'
 import ConversationHeader from './ConversationHeader.jsx'
 import MessageRow from './MessageRow.jsx'
 
-export default function Conversation({ contact, messages = [], locale = 'en', loading = false, onBack, onCall, aiAssistMode, onAssistCall, onImageClick, renderAudio, composer }) {
+export default function Conversation({ contact, messages = [], locale = 'en', loading = false, onBack, onCall, onEdit, aiAssistMode, onAssistCall, onImageClick, renderAudio, composer }) {
   const scrollRef = useRef(null)
   const contentRef = useRef(null)
   const nearBottomRef = useRef(true)
@@ -33,7 +33,7 @@ export default function Conversation({ contact, messages = [], locale = 'en', lo
 
   return (
     <section className="conversation">
-      <ConversationHeader contact={contact} locale={locale} onBack={onBack} onCall={onCall} aiAssistMode={aiAssistMode} onAssistCall={onAssistCall} />
+      <ConversationHeader contact={contact} locale={locale} onBack={onBack} onCall={onCall} onEdit={onEdit} aiAssistMode={aiAssistMode} onAssistCall={onAssistCall} />
       <div
         ref={scrollRef}
         data-testid="conversation-messages"

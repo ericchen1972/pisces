@@ -48,7 +48,7 @@ export default function AiCallOverlay({
         : (zh ? '連線中…' : 'Connecting…')
   const microphoneMessage = error?.code === 'microphone_denied'
     ? (zh ? '需要允許麥克風存取。' : 'Microphone access is required.')
-    : (error?.message || '')
+    : (error ? (zh ? '語音通話連線失敗。' : (error.message || 'Voice call connection failed.')) : '')
 
   return createPortal(
     <div ref={modalRootRef} className="ai-call-overlay">

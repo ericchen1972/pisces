@@ -1608,6 +1608,50 @@ def test_send_voice_route_uses_openai_transcription_and_preserves_shared_deliver
         "get_firestore_client",
         lambda: SimpleNamespace(collection=lambda _name: collection),
     )
+    monkeypatch.setattr(main, "accepted_friendship_exists", lambda *_args: True)
+
+    def persist_delivery(
+        _client,
+        sender_user_id,
+        recipient_user_id,
+        message_id,
+        text,
+        sender_extras,
+        recipient_extras,
+        preview_text,
+    ):
+        main.save_chat_message(
+            sender_user_id,
+            recipient_user_id,
+            "user",
+            text,
+            extras=sender_extras,
+            message_id=message_id,
+        )
+        main.save_chat_message(
+            recipient_user_id,
+            sender_user_id,
+            "peer",
+            text,
+            extras=recipient_extras,
+            message_id=message_id,
+        )
+        main.upsert_chat_meta(
+            sender_user_id,
+            recipient_user_id,
+            preview_text=preview_text,
+        )
+        main.upsert_chat_meta(
+            recipient_user_id,
+            sender_user_id,
+            unread_increment=1,
+            preview_text=preview_text,
+        )
+
+    monkeypatch.setattr(main, "persist_friend_delivery", persist_delivery)
+    monkeypatch.setattr(
+        main, "confirm_friend_delivery_before_publish", lambda *_args: True
+    )
     monkeypatch.setattr(
         main,
         "upload_audio_to_vercel_blob",
@@ -1681,6 +1725,11 @@ def test_send_voice_failures_are_stable_and_redacted(
             main,
             "get_firestore_client",
             lambda: SimpleNamespace(collection=lambda _name: collection),
+        )
+        monkeypatch.setattr(main, "accepted_friendship_exists", lambda *_args: True)
+        monkeypatch.setattr(main, "persist_friend_delivery", lambda *_args: None)
+        monkeypatch.setattr(
+            main, "confirm_friend_delivery_before_publish", lambda *_args: True
         )
     if failure_stage == "blob":
         monkeypatch.setattr(

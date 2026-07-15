@@ -46,7 +46,7 @@ export default function GroupManagerDialog({ open, locale = 'en', groups = [], o
       if (Array.isArray(authoritativeGroups)) onRefresh?.(authoritativeGroups)
       return true
     } catch (caught) {
-      setError(caught?.message || copy.unable)
+      setError(locale === 'zh-TW' ? copy.unable : (caught?.message || copy.unable))
       return false
     } finally {
       setBusy(false)

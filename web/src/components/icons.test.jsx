@@ -31,6 +31,7 @@ const iconComponents = [
   Icons.StopIcon,
   Icons.SpeakerIcon,
   Icons.LogoutIcon,
+  Icons.BackIcon,
 ]
 
 describe('icon system', () => {
@@ -43,8 +44,8 @@ describe('icon system', () => {
       </div>,
     )
 
-    expect(iconComponents).toHaveLength(19)
-    expect(container.querySelectorAll('svg')).toHaveLength(19)
+    expect(iconComponents).toHaveLength(20)
+    expect(container.querySelectorAll('svg')).toHaveLength(20)
     expect(container.querySelector('img')).not.toBeInTheDocument()
     expect(container.querySelector('svg image')).not.toBeInTheDocument()
     expect(container.textContent).toBe('')

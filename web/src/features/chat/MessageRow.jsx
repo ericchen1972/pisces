@@ -12,19 +12,19 @@ function DefaultAudio({ url, label }) {
   )
 }
 
-function RichContent({ message, onImageClick, renderAudio }) {
+function RichContent({ message, locale, onImageClick, renderAudio }) {
   const audio = (url, label, kind) => renderAudio
     ? renderAudio({ url, label, kind, message })
     : <DefaultAudio url={url} label={label} />
   return (
     <div className="message-media">
-      {message.audioUrl ? audio(message.audioUrl, 'Play voice message', 'voice') : null}
+      {message.audioUrl ? audio(message.audioUrl, locale === 'zh-TW' ? '播放語音訊息' : 'Play voice message', 'voice') : null}
       {message.imageUrl ? (
         <button type="button" className="message-media__image-button" onClick={() => onImageClick?.(message.imageUrl)}>
-          <img src={message.imageUrl} alt="Generated image" />
+          <img src={message.imageUrl} alt={locale === 'zh-TW' ? '生成的圖片' : 'Generated image'} />
         </button>
       ) : null}
-      {message.musicUrl ? audio(message.musicUrl, 'Play music', 'music') : null}
+      {message.musicUrl ? audio(message.musicUrl, locale === 'zh-TW' ? '播放音樂' : 'Play music', 'music') : null}
       {(message.text || '').trim() ? <div className="message-row__text">{message.text}</div> : null}
     </div>
   )
@@ -52,7 +52,7 @@ export default function MessageRow({ message, locale = 'en', onImageClick, onRet
         {(message.role === 'ai-typing' || message.status === 'streaming') && !(message.text || '').trim() ? (
           <span className="message-row__typing" aria-label={locale === 'zh-TW' ? '正在回覆' : 'Responding'}><i /><i /><i /></span>
         ) : (
-          <RichContent message={message} onImageClick={onImageClick} renderAudio={renderAudio} />
+          <RichContent message={message} locale={locale} onImageClick={onImageClick} renderAudio={renderAudio} />
         )}
       </div>
       {message.status === 'incomplete' ? (

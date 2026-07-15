@@ -1,0 +1,34 @@
+.login-screen { min-height: 100dvh; display: grid; place-items: center; padding: 24px; background: #212121; color: var(--text); }
+.login-card { width: min(100%, 420px); display: grid; justify-items: center; gap: 16px; padding: 42px 32px; border: 1px solid #3f3f3f; border-radius: 18px; background: #171717; box-shadow: 0 24px 70px rgba(0,0,0,.4); text-align: center; }
+.login-wordmark { width: 54px; height: 54px; display: grid; place-items: center; border-radius: 14px; background: #ececec; color: #171717; font-size: 28px; font-weight: 700; }
+.login-card h1 { margin: 0; font-size: 30px; letter-spacing: -.03em; }
+.login-card > p { margin: 0; color: var(--muted); line-height: 1.5; }
+.google-signin { width: 100%; min-height: 46px; display: flex; align-items: center; justify-content: center; gap: 10px; padding: 5px 12px; border: 1px solid #565656; border-radius: 9px; background: #fff; color: #171717; }
+.google-signin__target { min-width: 210px; min-height: 36px; }
+.text-button { border: 0; background: transparent; color: #d5d5d5; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
+.form-stack { display: grid; gap: 16px; }
+.form-stack textarea { width: 100%; padding: 10px; border: 1px solid #565656; border-radius: 8px; background: #2f2f2f; color: var(--text); resize: vertical; }
+.form-help, .voice-preview-row p { margin: -7px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.form-success { margin: 0; color: #73d9b9; font-size: 13px; }
+.form-status { margin: 0; color: var(--muted); font-size: 13px; }
+.logout-button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; margin-top: 4px; border-color: #674040 !important; color: #ffaaaa !important; }
+.profile-editor { display: grid; grid-template-columns: auto minmax(0,1fr); align-items: center; gap: 14px; }
+.profile-editor > img, .avatar-picker, .avatar-picker img { width: 72px; height: 72px; border-radius: 50%; object-fit: cover; }
+.profile-editor > span { color: var(--muted); font-size: 13px; }
+.avatar-picker { padding: 0 !important; overflow: hidden; border-radius: 50% !important; }
+.voice-preview-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px; border: 1px solid #414141; border-radius: 10px; background: #272727; }
+.voice-preview-row p { margin: 0; }
+.voice-preview-row button { flex: none; display: inline-flex; align-items: center; gap: 7px; }
+.visually-hidden { position: absolute !important; width: 1px !important; height: 1px !important; overflow: hidden !important; clip: rect(0 0 0 0) !important; white-space: nowrap !important; }
+.image-viewer-dialog { width: min(96vw, 1200px); max-height: 94dvh; background: #111; }
+.image-viewer-dialog .dialog-body { display: grid; place-items: center; max-height: calc(94dvh - 62px); padding: 12px; }
+.image-viewer-dialog__image { display: block; max-width: 100%; max-height: calc(94dvh - 90px); object-fit: contain; }
+.utility-page { min-height: 100dvh; display: grid; place-items: start center; padding: 36px 16px; background: var(--bg); color: var(--text); }
+.utility-card { width: min(100%, 760px); display: grid; gap: 22px; padding: 26px; border: 1px solid #3f3f3f; border-radius: 16px; background: #171717; }
+.utility-card--compact { width: min(100%, 420px); place-items: center; margin-top: 12vh; text-align: center; }
+.utility-card h1, .utility-card h2, .utility-card p { margin: 0; }
+.utility-card button { width: fit-content; min-height: 38px; padding: 8px 13px; border: 1px solid #565656; border-radius: 8px; background: #2f2f2f; color: var(--text); cursor: pointer; }
+.utility-card .primary-button { border-color: #ececec; background: #ececec; color: #171717; }
+.utility-output { min-height: 110px; padding: 12px; overflow: auto; border: 1px solid #414141; border-radius: 8px; background: #212121; color: var(--text); white-space: pre-wrap; }
+.utility-card summary { cursor: pointer; color: var(--muted); }
+@media (max-width: 520px) { .login-card { padding: 34px 20px; }.profile-editor { grid-template-columns: 1fr; justify-items: start; }.voice-preview-row { align-items: stretch; flex-direction: column; } }

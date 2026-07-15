@@ -52,14 +52,19 @@
 .contact-row--container { grid-template-columns: minmax(0, 1fr) auto; padding: 0 3px 0 0; position: relative; }
 .contact-row__select { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 9px; min-width: 0; min-height: 50px; padding: 6px 5px 6px 8px; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
 .contact-row__move { position: relative; }
-.contact-row__move-menu { position: absolute; top: 34px; right: 0; z-index: 8; display: grid; min-width: 164px; padding: 5px; border: 1px solid #4b4b4b; border-radius: 9px; background: #2f2f2f; box-shadow: 0 10px 28px rgba(0, 0, 0, .45); }
-.contact-row__move-menu button { min-height: 34px; padding: 6px 9px; border: 0; border-radius: 6px; background: transparent; color: #ececec; font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
-.contact-row__move-menu button:hover, .contact-row__move-menu button:focus-visible { background: #424242; }
+.contact-options-menu { position: fixed; z-index: 100; display: grid; min-width: 164px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow-y: auto; padding: 5px; border: 1px solid #4b4b4b; border-radius: 9px; background: #2f2f2f; box-shadow: 0 10px 28px rgba(0, 0, 0, .45); }
+.contact-options-menu button { min-height: 34px; display: flex; align-items: center; gap: 8px; padding: 6px 9px; border: 0; border-radius: 6px; background: transparent; color: #ececec; font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.contact-options-menu button:hover, .contact-options-menu button:focus-visible { background: #424242; }
+.contact-options-menu .contact-row__delete { color: #ff9b9b; }
 .contact-row--ai { margin-bottom: 3px; }
+.authenticated-app { width: 100%; height: 100dvh; overflow: hidden; background: var(--bg); color: var(--text); }
+.authenticated-app__conversation { min-height: 0; height: 100%; padding: 8px 18px 0; }
+.authenticated-app__conversation--selected { padding: 0; }
+@media (max-width: 767px) { .authenticated-app__conversation { padding: 50px 10px 0; }.authenticated-app__conversation--selected { padding: 0; } }
 .contact-row__copy { display: grid; min-width: 0; gap: 2px; }
 .contact-row__copy strong { overflow: hidden; color: #ececec; font-size: 14px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
 .contact-row__copy > span { overflow: hidden; color: #9b9b9b; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.contact-avatar { display: grid; place-items: center; flex: none; width: 32px; height: 32px; border-radius: 50%; object-fit: cover; background: #5b5bd6; color: white; font-size: 11px; font-weight: 650; }
+.contact-avatar { display: grid; place-items: center; flex: none; width: 32px; height: 32px; border-radius: 50%; object-fit: cover; background: #3a3a3a; color: white; font-size: 11px; font-weight: 650; }
 .contact-avatar--small { width: 30px; height: 30px; }
 .contact-avatar--ai { background: #fff; color: #171717; font-size: 15px; }
 .unread-badge { display: inline-grid; place-items: center; min-width: 19px; height: 19px; padding: 0 5px; border-radius: 999px; background: #10a37f; color: #fff; font-size: 11px; font-weight: 700; line-height: 1; }

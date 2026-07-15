@@ -100,7 +100,7 @@ export default function Composer({
           <AttachmentIcon size={20} />
         </button>
         {showAssist ? (
-          <button type="button" className="icon-button" aria-label="AI Assist" aria-pressed={assistActive} disabled={disabled} onClick={onToggleAssist}>
+          <button type="button" className="icon-button" aria-label={zh ? 'AI 協助' : 'AI Assist'} aria-pressed={assistActive} disabled={disabled} onClick={onToggleAssist}>
             <AiVoiceIcon size={20} />
           </button>
         ) : null}

@@ -23,6 +23,13 @@ describe('MessageRow', () => {
     expect(screen.getByLabelText('Play music')).toBeInTheDocument()
   })
 
+  it('localizes rich-media accessibility labels in zh-TW', () => {
+    render(<MessageRow locale="zh-TW" message={{ id: '1', role: 'ai', audioUrl: '/speech', imageUrl: '/image', musicUrl: '/music' }} />)
+    expect(screen.getByLabelText('播放語音訊息')).toBeInTheDocument()
+    expect(screen.getByRole('img', { name: '生成的圖片' })).toBeInTheDocument()
+    expect(screen.getByLabelText('播放音樂')).toBeInTheDocument()
+  })
+
   it.each([
     ['en', 'Convia AI · Only visible to you'],
     ['zh-TW', 'Convia AI · 只有你看得到'],

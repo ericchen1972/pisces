@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { localeFromLanguage, translate } from './i18n.js'
+import { localeFromLanguage, translate, visibleErrorMessage } from './i18n.js'
 
 describe('localeFromLanguage', () => {
   it.each([
@@ -25,5 +25,13 @@ describe('translate', () => {
     expect(translate('zh-TW', 'Settings', '設定')).toBe('設定')
     expect(translate('zh-CN', 'Settings', '設定')).toBe('Settings')
     expect(translate('en', 'Settings', '設定')).toBe('Settings')
+  })
+})
+
+describe('visibleErrorMessage', () => {
+  it('never exposes a raw English backend error in Traditional Chinese', () => {
+    const backendError = new Error('accepted friendship required')
+    expect(visibleErrorMessage(backendError, 'zh-TW', 'Unable to send message.', '無法傳送訊息。')).toBe('無法傳送訊息。')
+    expect(visibleErrorMessage(backendError, 'en', 'Unable to send message.', '無法傳送訊息。')).toBe('accepted friendship required')
   })
 })

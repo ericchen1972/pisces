@@ -1,8 +1,8 @@
 import { useId } from 'react'
-import { AiVoiceIcon, PhoneIcon } from '../../components/icons.jsx'
+import { AiVoiceIcon, BackIcon, EditIcon, PhoneIcon } from '../../components/icons.jsx'
 import { ContactAvatar } from './ContactGroup.jsx'
 
-export default function ConversationHeader({ contact, locale = 'en', onBack, onCall, aiAssistMode = false, onAssistCall }) {
+export default function ConversationHeader({ contact, locale = 'en', onBack, onCall, onEdit, aiAssistMode = false, onAssistCall }) {
   const callDescriptionId = useId()
   if (!contact) return null
   const zh = locale === 'zh-TW'
@@ -12,10 +12,13 @@ export default function ConversationHeader({ contact, locale = 'en', onBack, onC
   return (
     <header className="conversation-header">
       <button type="button" className="conversation-header__back" onClick={onBack} aria-label={zh ? '返回' : 'Back'}>
-        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
+        <BackIcon size={22} />
       </button>
       <ContactAvatar contact={contact} />
       <div><strong>{contact.name}</strong>{contact.isAi ? <span>Convia AI</span> : null}</div>
+      <button type="button" className="icon-button conversation-header__edit" onClick={() => onEdit?.(contact)} aria-label={zh ? `編輯 ${contact.name}` : `Edit ${contact.name}`}>
+        <EditIcon size={19} />
+      </button>
       {aiAssistMode && !contact.isAi ? (
         <button type="button" className="icon-button conversation-header__assist-call" onClick={onAssistCall} aria-label={zh ? '開始私人 AI 語音協助' : 'Start private AI voice assist'}>
           <AiVoiceIcon size={20} />
