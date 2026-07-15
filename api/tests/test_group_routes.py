@@ -1184,6 +1184,72 @@ def test_voice_delivery_succeeds_after_durable_write_when_realtime_publish_fails
     assert private_provider_detail not in repr(logged)
 
 
+@pytest.mark.parametrize("kind", ["text", "voice"])
+def test_direct_delivery_replays_same_request_without_duplicate_or_unread_increment(
+    signed_in_client, monkeypatch, kind
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    firestore.seed("friendships/user-a_user-b", user_a_id="user-a", user_b_id="user-b", status="accepted")
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    provider_calls = []
+    uploads = []
+    monkeypatch.setattr(main, "transcribe_audio_bytes", lambda *_args: provider_calls.append(True) or "voice replay")
+    monkeypatch.setattr(main, "upload_audio_to_vercel_blob", lambda *_args: uploads.append(True) or "https://blob/voice.webm")
+    attempts = []
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda uid, payload: attempts.append((uid, payload)))
+    request_id = f"stable-{kind}-1"
+    if kind == "text":
+        path = "/api/messages/send"
+        body = {"recipient_user_id": "user-b", "text": "once", "request_id": request_id}
+    else:
+        path = "/api/messages/send-voice"
+        body = {"recipient_user_id": "user-b", "audio_base64": base64.b64encode(b"voice").decode("ascii"), "mime_type": "audio/webm", "request_id": request_id}
+
+    first = signed_in_client.post(path, json=body)
+    second = signed_in_client.post(path, json=body)
+
+    assert first.status_code == second.status_code == 200
+    assert first.get_json() == second.get_json()
+    message_id = first.get_json()["message"]["message_id"]
+    assert message_id == main.deterministic_message_id("user-a", f"direct_{kind}", "user-b", request_id, "outbound")
+    assert len([path for path in firestore.data if path[-2:] == ("messages", message_id)]) == 2
+    assert firestore.read("users/user-b/chat_meta/user-a")["unread_count"].value == 1
+    assert len(attempts) == 1
+    if kind == "voice":
+        assert len(provider_calls) == len(uploads) == 1
+
+
+@pytest.mark.parametrize("kind", ["text", "voice"])
+def test_concurrent_direct_replay_after_commit_does_not_duplicate_durable_state(
+    signed_in_client, monkeypatch, kind
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    firestore.seed("friendships/user-a_user-b", user_a_id="user-a", user_b_id="user-b", status="accepted")
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(main, "transcribe_audio_bytes", lambda *_args: "voice concurrent")
+    monkeypatch.setattr(main, "upload_audio_to_vercel_blob", lambda *_args: "https://blob/voice.webm")
+    request_id = f"concurrent-{kind}-1"
+    path = "/api/messages/send" if kind == "text" else "/api/messages/send-voice"
+    body = {"recipient_user_id": "user-b", "request_id": request_id, **({"text": "once"} if kind == "text" else {"audio_base64": "YQ==", "mime_type": "audio/webm"})}
+    nested = []
+
+    def publish(_uid, _payload):
+        if not nested:
+            nested.append(signed_in_client.post(path, json=body))
+
+    monkeypatch.setattr(main, "publish_user_channel_message", publish)
+    outer = signed_in_client.post(path, json=body)
+    assert outer.status_code == nested[0].status_code == 200
+    assert outer.get_json()["message"]["message_id"] == nested[0].get_json()["message"]["message_id"]
+    message_id = outer.get_json()["message"]["message_id"]
+    assert len([key for key in firestore.data if key[-2:] == ("messages", message_id)]) == 2
+    assert firestore.read("users/user-b/chat_meta/user-a")["unread_count"].value == 1
+
+
 def test_delete_after_voice_persistence_before_publish_revokes_delivery(
     signed_in_client, monkeypatch
 ):

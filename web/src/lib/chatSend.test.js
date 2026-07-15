@@ -6,8 +6,10 @@ import {
   canonicalIncomingMessage,
   effectiveMessageRole,
   restoreAssistDraft,
+  stablePersonSendIdentity,
   sendAssistRequest,
   sendPersonRequest,
+  sendPersonVoiceRequest,
   startExclusiveSend,
   validateTrustedMediaUrl,
 } from './chatSend.js'
@@ -88,13 +90,35 @@ describe('sendPersonRequest', () => {
       contactId: 'friend-1',
       text: '',
       attachment: { kind: 'image', url: 'https://store.public.blob.vercel-storage.com/image.png' },
+      requestId: 'person-stable-1',
     })
     expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
       recipient_user_id: 'friend-1',
       text: '',
       image_url: 'https://store.public.blob.vercel-storage.com/image.png',
+      request_id: 'person-stable-1',
     })
     expect(message).toMatchObject({ id: 'server-message', role: 'user', imageUrl: 'https://store.public.blob.vercel-storage.com/image.png', avatarUrl: 'https://google/avatar' })
+  })
+
+  it('reuses one request id for a failed draft retry and allocates after content or success changes', () => {
+    const createId = vi.fn()
+      .mockReturnValueOnce('person-1')
+      .mockReturnValueOnce('person-2')
+      .mockReturnValueOnce('person-3')
+    const first = stablePersonSendIdentity(null, { contactId: 'friend-1', text: 'hello', attachment: null }, createId)
+    const retry = stablePersonSendIdentity(first, { contactId: 'friend-1', text: 'hello', attachment: null }, createId)
+    const edited = stablePersonSendIdentity(retry, { contactId: 'friend-1', text: 'hello!', attachment: null }, createId)
+    const afterSuccess = stablePersonSendIdentity(null, { contactId: 'friend-1', text: 'hello!', attachment: null }, createId)
+    expect([first.requestId, retry.requestId, edited.requestId, afterSuccess.requestId]).toEqual(['person-1', 'person-1', 'person-2', 'person-3'])
+  })
+
+  it('sends the same voice request id on retry', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ ok: true, message: { message_id: 'voice-1', audio_url: '/voice' } }))
+    const input = { fetchImpl, url: '/api/messages/send-voice', contactId: 'friend-1', audioBase64: 'YQ==', mimeType: 'audio/webm', durationSeconds: 1, requestId: 'voice-stable-1' }
+    await sendPersonVoiceRequest(input)
+    await sendPersonVoiceRequest(input)
+    expect(fetchImpl.mock.calls.map((call) => JSON.parse(call[1].body).request_id)).toEqual(['voice-stable-1', 'voice-stable-1'])
   })
 })
 

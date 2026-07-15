@@ -1410,6 +1410,7 @@ def persist_delivery_once(
     meta_writes,
     receipt_data,
     owner_token=None,
+    friendship_user_ids=None,
 ):
     """Atomically persist delivery artifacts and its idempotency receipt."""
     client = get_firestore_client()
@@ -1440,6 +1441,15 @@ def persist_delivery_once(
                     return existing, False
                 if existing.get("owner_token") != owner_token:
                     raise RuntimeError("delivery lease is no longer owned")
+            if friendship_user_ids:
+                friendship_ref, _pair_key, user_a_id, user_b_id = _friendship_reference(
+                    client, *friendship_user_ids
+                )
+                friendship_snapshot = next(iter(tx.get(friendship_ref)))
+                if not _is_accepted_friendship_snapshot(
+                    friendship_snapshot, user_a_id, user_b_id
+                ):
+                    raise AcceptedFriendshipRequired("accepted friendship required")
             for write in message_writes:
                 ref = _chat_message_ref(
                     client,
@@ -1487,6 +1497,10 @@ def persist_delivery_once(
             return existing, False
         if existing.get("owner_token") != owner_token:
             raise RuntimeError("delivery lease is no longer owned")
+    if friendship_user_ids and not accepted_friendship_exists(
+        client, *friendship_user_ids
+    ):
+        raise AcceptedFriendshipRequired("accepted friendship required")
     for write in message_writes:
         save_chat_message(
             write["user_id"],
@@ -2493,7 +2507,8 @@ def persist_friend_delivery(
 
 
 def confirm_friend_delivery_before_publish(
-    client, sender_user_id, recipient_user_id, message_id
+    client, sender_user_id, recipient_user_id, message_id,
+    receipt_route_name="", receipt_request_id="",
 ):
     friendship_ref, _pair_key, user_a_id, user_b_id = _friendship_reference(
         client, sender_user_id, recipient_user_id
@@ -2515,6 +2530,11 @@ def confirm_friend_delivery_before_publish(
         .document(message_id)
     )
     transaction = client.transaction()
+    receipt_ref = (
+        _delivery_receipt_ref(sender_user_id, receipt_route_name, receipt_request_id)
+        if receipt_route_name and receipt_request_id
+        else None
+    )
 
     @firestore.transactional
     def commit(tx):
@@ -2525,9 +2545,28 @@ def confirm_friend_delivery_before_publish(
             return True
         tx.delete(sender_message_ref)
         tx.delete(recipient_message_ref)
+        if receipt_ref is not None:
+            tx.delete(receipt_ref)
         return False
 
     return commit(transaction)
+
+
+def replay_direct_delivery(user_id, route_name, request_id, payload_hash, recipient_user_id):
+    receipt = get_delivery_receipt(user_id, route_name, request_id)
+    if not receipt or not _delivery_receipt_is_completed(receipt):
+        return None
+    if receipt.get("payload_hash") != payload_hash:
+        raise ValueError("request_id was already used for a different delivery")
+    response = replay_delivery_response(receipt, user_id)
+    stored_payload = receipt.get("ably_payload") or {}
+    if stored_payload and not receipt.get("published"):
+        try:
+            publish_user_channel_message(recipient_user_id, stored_payload)
+            save_delivery_receipt(user_id, route_name, request_id, {"published": True})
+        except Exception:
+            response["realtime_delivered"] = False
+    return response
 
 
 def decide_assist_action(user_message, history_messages, friend_name, user_id=""):
@@ -4354,6 +4393,12 @@ def send_message():
     text = (body.get("text") or "").strip()
     image_url = (body.get("image_url") or "").strip()
     music_url = (body.get("music_url") or "").strip()
+    idempotent = body.get("request_id") is not None
+    try:
+        request_id = validate_request_id(body.get("request_id"))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    route_name = "direct_text"
 
     if not recipient_user_id:
         return jsonify({"ok": False, "error": "recipient_user_id is required"}), 400
@@ -4374,6 +4419,21 @@ def send_message():
     if sender_user_id == recipient_user_id:
         return jsonify({"ok": False, "error": "cannot send message to yourself"}), 400
 
+    payload_hash = delivery_payload_hash(
+        recipient_user_id,
+        {"text": text, "image_url": image_url, "music_url": music_url},
+    )
+    if idempotent:
+        try:
+            replay = replay_direct_delivery(
+                sender_user_id, route_name, request_id, payload_hash, recipient_user_id
+            )
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 409
+        if replay is not None:
+            return jsonify(replay)
+
+    delivery_owner = ""
     try:
         client = get_firestore_client()
 
@@ -4389,7 +4449,30 @@ def send_message():
         sender_doc = client.collection("users").document(sender_user_id).get()
         sender_data = sender_doc.to_dict() if sender_doc.exists else {}
 
-        message_id = str(uuid.uuid4())
+        if idempotent:
+            try:
+                reserved, acquired = reserve_delivery_request(
+                    user_id=sender_user_id,
+                    route_name=route_name,
+                    request_id=request_id,
+                    payload_hash=payload_hash,
+                    receipt_data={"contact_id": recipient_user_id},
+                )
+            except ValueError as exc:
+                return jsonify({"ok": False, "error": str(exc)}), 409
+            if _delivery_receipt_is_completed(reserved):
+                return jsonify(replay_delivery_response(reserved, sender_user_id))
+            if not acquired:
+                return jsonify({"ok": False, "error": "request is already in progress"}), 409
+            delivery_owner = reserved["owner_token"]
+
+        message_id = (
+            deterministic_message_id(
+                sender_user_id, route_name, recipient_user_id, request_id, "outbound"
+            )
+            if idempotent
+            else str(uuid.uuid4())
+        )
         created_at_iso = datetime.now(timezone.utc).isoformat()
         sender_extras = {
                 "visibility": "shared",
@@ -4405,21 +4488,6 @@ def send_message():
                 **({"music_url": music_url} if music_url else {}),
         }
         preview_text = text or ("Image + Music" if image_url and music_url else "Image" if image_url else "Music")
-        persist_friend_delivery(
-            client,
-            sender_user_id,
-            recipient_user_id,
-            message_id,
-            text,
-            sender_extras,
-            recipient_extras,
-            preview_text,
-        )
-        if not confirm_friend_delivery_before_publish(
-            client, sender_user_id, recipient_user_id, message_id
-        ):
-            raise AcceptedFriendshipRequired("accepted friendship required")
-
         payload = {
             "message_id": message_id,
             "sender_user_id": sender_user_id,
@@ -4432,8 +4500,42 @@ def send_message():
             "image_url": image_url,
             "music_url": music_url,
         }
+        response_payload = {"ok": True, "message": payload}
+        if idempotent:
+            receipt, created = persist_delivery_once(
+                user_id=sender_user_id,
+                route_name=route_name,
+                request_id=request_id,
+                payload_hash=payload_hash,
+                owner_token=delivery_owner,
+                friendship_user_ids=(sender_user_id, recipient_user_id),
+                message_writes=[
+                    {"user_id": sender_user_id, "contact_id": recipient_user_id, "role": "user", "text": text, "extras": sender_extras, "message_id": message_id},
+                    {"user_id": recipient_user_id, "contact_id": sender_user_id, "role": "peer", "text": text, "extras": recipient_extras, "message_id": message_id},
+                ],
+                meta_writes=[
+                    {"user_id": sender_user_id, "contact_id": recipient_user_id, "preview_text": preview_text},
+                    {"user_id": recipient_user_id, "contact_id": sender_user_id, "preview_text": preview_text, "unread_increment": 1},
+                ],
+                receipt_data={"contact_id": recipient_user_id, "message_id": message_id, "ably_payload": payload, "published": False, "response": response_payload},
+            )
+            if not created:
+                return jsonify(replay_delivery_response(receipt, sender_user_id))
+        else:
+            persist_friend_delivery(
+                client, sender_user_id, recipient_user_id, message_id, text,
+                sender_extras, recipient_extras, preview_text,
+            )
+        if not confirm_friend_delivery_before_publish(
+            client, sender_user_id, recipient_user_id, message_id,
+            route_name if idempotent else "", request_id if idempotent else "",
+        ):
+            raise AcceptedFriendshipRequired("accepted friendship required")
+
         try:
             publish_user_channel_message(recipient_user_id, payload)
+            if idempotent:
+                save_delivery_receipt(sender_user_id, route_name, request_id, {"published": True})
         except Exception as exc:
             log_tool_error(
                 sender_user_id,
@@ -4451,10 +4553,14 @@ def send_message():
             )
         return jsonify({"ok": True, "message": payload})
     except AcceptedFriendshipRequired:
+        if delivery_owner:
+            safe_release_delivery_request(sender_user_id, route_name, request_id, delivery_owner)
         return jsonify(
             {"ok": False, "error": "accepted friendship required"}
         ), 403
     except Exception as exc:
+        if delivery_owner:
+            safe_release_delivery_request(sender_user_id, route_name, request_id, delivery_owner)
         return jsonify({"ok": False, "error": f"failed to send message: {exc}"}), 500
 
 
@@ -4469,7 +4575,13 @@ def send_voice_message():
         err, status = auth_error
         return jsonify(err), status
     sender_user_id = auth["user_id"]
-    request_id = str(uuid.uuid4())
+    idempotent = body.get("request_id") is not None
+    try:
+        request_id = validate_request_id(body.get("request_id"))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    route_name = "direct_voice"
+    delivery_owner = ""
     recipient_user_id = (body.get("recipient_user_id") or "").strip()
     duration_seconds_raw = body.get("duration_seconds")
 
@@ -4516,6 +4628,39 @@ def send_voice_message():
     except AudioInputError as exc:
         return jsonify({"ok": False, "error": str(exc)}), exc.status
 
+    payload_hash = delivery_payload_hash(
+        recipient_user_id,
+        {
+            "audio_sha256": hashlib.sha256(audio_bytes).hexdigest(),
+            "mime_type": mime_type,
+            "duration_seconds": duration_seconds,
+        },
+    )
+    if idempotent:
+        try:
+            replay = replay_direct_delivery(
+                sender_user_id, route_name, request_id, payload_hash, recipient_user_id
+            )
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 409
+        if replay is not None:
+            return jsonify(replay)
+        try:
+            reserved, acquired = reserve_delivery_request(
+                user_id=sender_user_id,
+                route_name=route_name,
+                request_id=request_id,
+                payload_hash=payload_hash,
+                receipt_data={"contact_id": recipient_user_id},
+            )
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 409
+        if _delivery_receipt_is_completed(reserved):
+            return jsonify(replay_delivery_response(reserved, sender_user_id))
+        if not acquired:
+            return jsonify({"ok": False, "error": "request is already in progress"}), 409
+        delivery_owner = reserved["owner_token"]
+
     try:
         transcript = transcribe_audio_bytes(
             audio_bytes,
@@ -4523,13 +4668,19 @@ def send_voice_message():
             (body.get("locale") or body.get("language") or "").strip(),
         )
     except Exception:
+        if delivery_owner:
+            safe_release_delivery_request(sender_user_id, route_name, request_id, delivery_owner)
         return jsonify({"ok": False, "error": "speech-to-text is currently unavailable"}), 502
     if not transcript:
+        if delivery_owner:
+            safe_release_delivery_request(sender_user_id, route_name, request_id, delivery_owner)
         return jsonify({"ok": False, "error": "speech-to-text returned empty transcript"}), 422
 
     try:
         audio_url = upload_audio_to_vercel_blob(sender_user_id, audio_bytes, mime_type or "audio/webm")
     except Exception as exc:
+        if delivery_owner:
+            safe_release_delivery_request(sender_user_id, route_name, request_id, delivery_owner)
         log_tool_error(
             sender_user_id,
             recipient_user_id,
@@ -4544,7 +4695,13 @@ def send_voice_message():
         sender_doc = client.collection("users").document(sender_user_id).get()
         sender_data = sender_doc.to_dict() if sender_doc.exists else {}
 
-        message_id = str(uuid.uuid4())
+        message_id = (
+            deterministic_message_id(
+                sender_user_id, route_name, recipient_user_id, request_id, "outbound"
+            )
+            if idempotent
+            else str(uuid.uuid4())
+        )
         created_at_iso = datetime.now(timezone.utc).isoformat()
 
         sender_extras = {
@@ -4562,21 +4719,6 @@ def send_voice_message():
                 "audio_duration_seconds": duration_seconds,
                 "transcript_text": transcript,
         }
-        persist_friend_delivery(
-            client,
-            sender_user_id,
-            recipient_user_id,
-            message_id,
-            "",
-            sender_extras,
-            recipient_extras,
-            transcript or "Voice message",
-        )
-        if not confirm_friend_delivery_before_publish(
-            client, sender_user_id, recipient_user_id, message_id
-        ):
-            raise AcceptedFriendshipRequired("accepted friendship required")
-
         payload = {
             "message_id": message_id,
             "sender_user_id": sender_user_id,
@@ -4589,8 +4731,42 @@ def send_voice_message():
             "sender_avatar_url": (sender_data.get("avatar_url") or ""),
             "sender_mode": "user",
         }
+        response_payload = {"ok": True, "message": payload}
+        if idempotent:
+            receipt, created = persist_delivery_once(
+                user_id=sender_user_id,
+                route_name=route_name,
+                request_id=request_id,
+                payload_hash=payload_hash,
+                owner_token=delivery_owner,
+                friendship_user_ids=(sender_user_id, recipient_user_id),
+                message_writes=[
+                    {"user_id": sender_user_id, "contact_id": recipient_user_id, "role": "user", "text": "", "extras": sender_extras, "message_id": message_id},
+                    {"user_id": recipient_user_id, "contact_id": sender_user_id, "role": "peer", "text": "", "extras": recipient_extras, "message_id": message_id},
+                ],
+                meta_writes=[
+                    {"user_id": sender_user_id, "contact_id": recipient_user_id, "preview_text": transcript or "Voice message"},
+                    {"user_id": recipient_user_id, "contact_id": sender_user_id, "preview_text": transcript or "Voice message", "unread_increment": 1},
+                ],
+                receipt_data={"contact_id": recipient_user_id, "message_id": message_id, "ably_payload": payload, "published": False, "response": response_payload},
+            )
+            if not created:
+                return jsonify(replay_delivery_response(receipt, sender_user_id))
+        else:
+            persist_friend_delivery(
+                client, sender_user_id, recipient_user_id, message_id, "",
+                sender_extras, recipient_extras, transcript or "Voice message",
+            )
+        if not confirm_friend_delivery_before_publish(
+            client, sender_user_id, recipient_user_id, message_id,
+            route_name if idempotent else "", request_id if idempotent else "",
+        ):
+            raise AcceptedFriendshipRequired("accepted friendship required")
+
         try:
             publish_user_channel_message(recipient_user_id, payload)
+            if idempotent:
+                save_delivery_receipt(sender_user_id, route_name, request_id, {"published": True})
         except Exception as exc:
             log_tool_error(
                 sender_user_id,
@@ -4609,6 +4785,8 @@ def send_voice_message():
             )
         return jsonify({"ok": True, "message": payload})
     except AcceptedFriendshipRequired:
+        if delivery_owner:
+            safe_release_delivery_request(sender_user_id, route_name, request_id, delivery_owner)
         try:
             delete_vercel_blob(audio_url)
         except Exception as exc:
@@ -4624,6 +4802,8 @@ def send_voice_message():
             {"ok": False, "error": "accepted friendship required"}
         ), 403
     except Exception as exc:
+        if delivery_owner:
+            safe_release_delivery_request(sender_user_id, route_name, request_id, delivery_owner)
         log_tool_error(
             sender_user_id,
             recipient_user_id,

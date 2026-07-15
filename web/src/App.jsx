@@ -26,6 +26,8 @@ import {
   restoreAssistDraft,
   sendAssistRequest,
   sendPersonRequest,
+  sendPersonVoiceRequest,
+  stablePersonSendIdentity,
   startExclusiveSend,
 } from './lib/chatSend.js'
 import ChatShell from './features/chat/ChatShell.jsx'
@@ -389,6 +391,7 @@ function LoginHome() {
   const aiStreamOperationRef = useRef(null)
   const assistSendOperationRef = useRef(null)
   const personSendOperationRef = useRef(null)
+  const personSendIdentityRef = useRef(null)
   const deleteContactOperationRef = useRef(null)
   const contactEditSaveRef = useRef(null)
   const aiEditSaveRef = useRef(null)
@@ -478,6 +481,7 @@ function LoginHome() {
     aiStreamOperationRef.current = null
     assistSendOperationRef.current = null
     personSendOperationRef.current = null
+    personSendIdentityRef.current = null
     deleteContactOperationRef.current = null
     contactEditSaveRef.current = null
     aiEditSaveRef.current = null
@@ -1635,23 +1639,17 @@ function LoginHome() {
             const audioBase64 = btoa(binary)
 
             if (!shouldUseAiVoiceFlow && contactId !== 'pisces-core') {
-              const res = await fetch(`${apiBaseUrl}/api/messages/send-voice`, {
-                method: 'POST',
-                credentials: 'include',
+              const voiceRequestId = createClientRequestId('person-voice')
+              const data = await sendPersonVoiceRequest({
+                url: `${apiBaseUrl}/api/messages/send-voice`,
+                contactId,
+                audioBase64,
+                mimeType: blob.type || recorder.mimeType || 'audio/webm',
+                durationSeconds: recordedDurationSeconds,
+                requestId: voiceRequestId,
                 signal: recordingOperation.signal,
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  recipient_user_id: contactId,
-                  audio_base64: audioBase64,
-                  mime_type: blob.type || recorder.mimeType || 'audio/webm',
-                  duration_seconds: recordedDurationSeconds,
-                }),
               })
-              const data = await res.json()
               if (!accountOperationScope.isOwner(recordingOperation, recordingOperationRef)) return
-              if (!res.ok || !data.ok) {
-                throw new Error(data.error || `Send failed (${res.status})`)
-              }
               const confirmedAudioUrl = data?.message?.audio_url || audioUrl
               recordedObjectUrlsRef.current.replace(audioUrl, confirmedAudioUrl)
               runIfRecordingCurrent(() => setMessagesByContact((prev) => {
@@ -2063,6 +2061,11 @@ function LoginHome() {
     const contactId = selectedContact?.id
     if (!contactId || selectedContact?.isAi || (!input && !attachment)) return false
 
+    const identity = stablePersonSendIdentity(
+      personSendIdentityRef.current,
+      { contactId, text: input, attachment },
+    )
+    personSendIdentityRef.current = identity
     const send = startExclusiveSend({
       scope: accountOperationScope,
       ownerRef: personSendOperationRef,
@@ -2071,9 +2074,11 @@ function LoginHome() {
         contactId,
         text: input,
         attachment,
+        requestId: identity.requestId,
         signal: operation.signal,
       }),
       onSuccess: (message) => {
+        if (personSendIdentityRef.current?.requestId === identity.requestId) personSendIdentityRef.current = null
         setMessagesByContact((previous) => {
           const current = previous[contactId] || []
           return current.some((item) => item.id === message.id)

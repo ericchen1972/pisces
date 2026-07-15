@@ -37,7 +37,8 @@ class FakeDocumentReference:
     def collection(self, name):
         return FakeCollectionReference(self.client, self.path + (name,))
 
-    def get(self):
+    def get(self, transaction=None):
+        del transaction
         return FakeSnapshot(self, self.client.data.get(self.path))
 
     def set(self, values, merge=False):

@@ -87,7 +87,19 @@ export async function sendAssistRequest({ fetchImpl = fetch, url, contactId, mes
   }
 }
 
-export async function sendPersonRequest({ fetchImpl = fetch, url, contactId, text, attachment, signal }) {
+export function stablePersonSendIdentity(previous, payload, createId = () => createClientRequestId('person')) {
+  const attachment = payload.attachment
+  const fingerprint = JSON.stringify({
+    contactId: payload.contactId,
+    text: payload.text,
+    attachment: attachment ? { kind: attachment.kind, url: attachment.url } : null,
+  })
+  return previous?.fingerprint === fingerprint
+    ? previous
+    : { fingerprint, requestId: createId() }
+}
+
+export async function sendPersonRequest({ fetchImpl = fetch, url, contactId, text, attachment, requestId, signal }) {
   const attachmentUrl = attachment ? validateTrustedMediaUrl(attachment.url) : ''
   const attachmentFields = attachment?.kind === 'image'
     ? { image_url: attachmentUrl }
@@ -99,11 +111,27 @@ export async function sendPersonRequest({ fetchImpl = fetch, url, contactId, tex
     credentials: 'include',
     signal,
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ recipient_user_id: contactId, text, ...attachmentFields }),
+    body: JSON.stringify({ recipient_user_id: contactId, text, ...attachmentFields, request_id: requestId }),
   })
   const message = canonicalOutboundMessage(data.message)
   if (!message) throw new Error('Message response did not include a canonical identity')
   return message
+}
+
+export async function sendPersonVoiceRequest({ fetchImpl = fetch, url, contactId, audioBase64, mimeType, durationSeconds, requestId, signal }) {
+  return jsonRequest(fetchImpl, url, {
+    method: 'POST',
+    credentials: 'include',
+    signal,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      recipient_user_id: contactId,
+      audio_base64: audioBase64,
+      mime_type: mimeType,
+      duration_seconds: durationSeconds,
+      request_id: requestId,
+    }),
+  })
 }
 
 export function restoreAssistDraft(
