@@ -2437,6 +2437,93 @@ def test_malformed_cleanup_quarantine_and_rpc_timeout_are_bounded(monkeypatch):
     assert calls[-1] == ("get-timeout", 1)
 
 
+def test_attempt_cleanup_enqueues_multi_ref_and_deletes_only_one_with_timeout(monkeypatch):
+    firestore = FakeFirestoreClient()
+    calls = []
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(
+        main,
+        "delete_vercel_blob",
+        lambda url, timeout=30: calls.append(("public", url, timeout)),
+    )
+    monkeypatch.setattr(
+        main,
+        "delete_private_audio_artifact",
+        lambda user_id, artifact_id, blob_timeout=30: calls.append(
+            ("private", user_id, artifact_id, blob_timeout)
+        ),
+    )
+
+    cleanup_request_id = main.enqueue_attempt_cleanup_job(
+        "user-a",
+        "chat_forward",
+        "attempt-multi",
+        public_blob_urls=["https://blob/one.png", "https://blob/two.png"],
+        private_artifact_ids=["private-one"],
+        payload_hash="hash-1",
+    )
+
+    assert cleanup_request_id == "attempt-multi"
+    assert calls == [("public", "https://blob/one.png", 1)]
+    cleanup_id = main.hashlib.sha256(
+        b"chat_forward:attempt-multi"
+    ).hexdigest()
+    job = firestore.read(f"users/user-a/delivery_cleanup_jobs/{cleanup_id}")
+    assert job["status"] == "pending"
+    assert job["payload_hash"] == "hash-1"
+    assert job["owned_media_refs"] == [
+        {"kind": "public_blob", "url": "https://blob/two.png"},
+        {"kind": "private_audio", "artifact_id": "private-one"},
+    ]
+    assert not any("delivery_terminals" in path for path in firestore.data)
+    main.bounded_delivery_cleanup("user-a", "chat_forward", cleanup_request_id)
+    assert calls[-1] == ("public", "https://blob/two.png", 1)
+    assert firestore.read(f"users/user-a/delivery_cleanup_jobs/{cleanup_id}")[
+        "owned_media_refs"
+    ] == [{"kind": "private_audio", "artifact_id": "private-one"}]
+
+
+def test_attempt_cleanup_private_refs_are_bounded_and_support_generated_id(monkeypatch):
+    firestore = FakeFirestoreClient()
+    calls = []
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(
+        main,
+        "delete_private_audio_artifact",
+        lambda user_id, artifact_id, blob_timeout=30: calls.append(
+            (user_id, artifact_id, blob_timeout)
+        ),
+    )
+
+    cleanup_request_id = main.enqueue_attempt_cleanup_job(
+        "user-a",
+        "assist_message",
+        "",
+        private_artifact_ids=["private-one", "private-two"],
+    )
+
+    assert cleanup_request_id.startswith("attempt-")
+    assert calls == [("user-a", "private-one", 1)]
+    cleanup_id = main.hashlib.sha256(
+        f"assist_message:{cleanup_request_id}".encode()
+    ).hexdigest()
+    job = firestore.read(f"users/user-a/delivery_cleanup_jobs/{cleanup_id}")
+    assert job["owned_media_refs"] == [
+        {"kind": "private_audio", "artifact_id": "private-two"}
+    ]
+    main.bounded_delivery_cleanup("user-a", "assist_message", cleanup_request_id)
+    assert calls[-1] == ("user-a", "private-two", 1)
+    assert firestore.read(f"users/user-a/delivery_cleanup_jobs/{cleanup_id}") is None
+
+
+def test_ai_outbound_request_boundaries_do_not_directly_loop_media_cleanup():
+    for route in (main.chat, main.assist_message):
+        source = inspect.getsource(route)
+        assert "cleanup_outbound_blobs" not in source
+        assert "delete_vercel_blob(" not in source
+        assert "delete_private_audio_artifact(" not in source
+
+
 def test_stale_claim_does_not_cleanup_media_when_rollback_reread_confirms_generation(monkeypatch):
     receipt = {
         "state": "completed",

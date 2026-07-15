@@ -2622,7 +2622,9 @@ def test_ai_room_forwarding_confirmation_failure_is_sanitized(
     monkeypatch.setattr(main, "generate_image_with_gemini", lambda *_args: (b"image", "image/png"))
     monkeypatch.setattr(main, "upload_image_to_vercel_blob", lambda *_args: "https://blob/orphan.png")
     deleted = []
-    monkeypatch.setattr(main, "delete_vercel_blob", deleted.append)
+    monkeypatch.setattr(
+        main, "delete_vercel_blob", lambda url, timeout=30: deleted.append(url)
+    )
 
     def fail_generate_text(**_kwargs):
         raise RuntimeError("provider detail sk-secret-value")
@@ -2874,7 +2876,9 @@ def test_ai_outbound_concurrent_winner_receipt_uses_generation_guard_and_cleans_
     monkeypatch.setattr(main, "persist_delivery_once", lambda **_kwargs: (winner_receipt, False))
     deleted = []
     published = []
-    monkeypatch.setattr(main, "delete_vercel_blob", deleted.append)
+    monkeypatch.setattr(
+        main, "delete_vercel_blob", lambda url, timeout=30: deleted.append(url)
+    )
     monkeypatch.setattr(main, "publish_user_channel_message", lambda *args: published.append(args))
     monkeypatch.setattr(
         main,
@@ -2926,21 +2930,18 @@ def test_forward_private_confirmation_artifact_is_cleaned_when_delivery_is_not_d
     )
 
     assert response.status_code == (200 if outcome == "loser" else 403)
-    if outcome == "loser":
-        assert deleted_artifacts == [("user-a", "private-attempt")]
-    else:
-        assert deleted_artifacts == []
-        request_id = f"private-{outcome}"
-        cleanup_id = main.hashlib.sha256(
-            f"chat_forward:{request_id}".encode()
-        ).hexdigest()
-        job = main.get_firestore_client().read(
-            f"users/user-a/delivery_cleanup_jobs/{cleanup_id}"
-        )
-        assert job["status"] == "pending"
-        assert {"kind": "private_audio", "artifact_id": "private-attempt"} in job[
-            "owned_media_refs"
-        ]
+    assert deleted_artifacts == []
+    request_id = f"private-{outcome}"
+    cleanup_id = main.hashlib.sha256(
+        f"chat_forward:{request_id}".encode()
+    ).hexdigest()
+    job = main.get_firestore_client().read(
+        f"users/user-a/delivery_cleanup_jobs/{cleanup_id}"
+    )
+    assert job["status"] == "pending"
+    assert {"kind": "private_audio", "artifact_id": "private-attempt"} in job[
+        "owned_media_refs"
+    ]
 
 
 @pytest.mark.parametrize("route_kind", ["forward", "assist"])

@@ -3061,16 +3061,20 @@ def enqueue_delivery_cleanup_job(
             merged.append(sanitized)
     if not merged:
         return False
+    payload_hash = (receipt or {}).get("payload_hash") or existing.get("payload_hash") or ""
+    job_data = {
+        "owner_user_id": user_id,
+        "route_name": route_name,
+        "request_id": request_id,
+        "status": "pending",
+        "owned_media_refs": merged,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    }
+    if payload_hash:
+        job_data["payload_hash"] = payload_hash
     _firestore_call_with_timeout(
         cleanup_ref.set,
-        {
-            "owner_user_id": user_id,
-            "route_name": route_name,
-            "request_id": request_id,
-            "status": "pending",
-            "owned_media_refs": merged,
-            "updated_at": firestore.SERVER_TIMESTAMP,
-        },
+        job_data,
         timeout=firestore_timeout,
     )
     return True
@@ -3103,6 +3107,47 @@ def bounded_delivery_cleanup(user_id, route_name, request_id, receipt=None):
         )
     except Exception:
         return False
+
+
+def enqueue_attempt_cleanup_job(
+    user_id,
+    route_name,
+    request_id="",
+    *,
+    public_blob_urls=None,
+    private_artifact_ids=None,
+    payload_hash="",
+):
+    cleanup_request_id = (request_id or "").strip() or f"attempt-{uuid.uuid4().hex}"
+    refs = [
+        {"kind": "public_blob", "url": url}
+        for url in dict.fromkeys(public_blob_urls or [])
+        if url
+    ] + [
+        {"kind": "private_audio", "artifact_id": artifact_id}
+        for artifact_id in dict.fromkeys(private_artifact_ids or [])
+        if artifact_id
+    ]
+    if not refs:
+        return cleanup_request_id
+    try:
+        enqueued = enqueue_delivery_cleanup_job(
+            user_id,
+            route_name,
+            cleanup_request_id,
+            {"owned_media_refs": refs, "payload_hash": payload_hash},
+            firestore_timeout=1,
+        )
+    except Exception:
+        return cleanup_request_id
+    if enqueued:
+        bounded_delivery_cleanup(
+            user_id,
+            route_name,
+            cleanup_request_id,
+            {"owned_media_refs": refs, "payload_hash": payload_hash},
+        )
+    return cleanup_request_id
 
 
 def drain_delivery_cleanup_job(
@@ -3705,24 +3750,15 @@ def chat():
         outbound_blob_urls = []
         private_audio_artifact_ids = []
 
-        def cleanup_outbound_blobs():
-            for blob_url in dict.fromkeys(outbound_blob_urls):
-                try:
-                    delete_vercel_blob(blob_url)
-                except Exception:
-                    log_tool_error(
-                        user_id,
-                        target_id,
-                        "outbound_cleanup",
-                        "chat_ai_room_forward",
-                        "blob_cleanup_failed",
-                        request_id=request_id,
-                    )
-            for artifact_id in dict.fromkeys(private_audio_artifact_ids):
-                try:
-                    delete_private_audio_artifact(user_id, artifact_id)
-                except Exception:
-                    pass
+        def enqueue_outbound_attempt_cleanup():
+            enqueue_attempt_cleanup_job(
+                user_id,
+                "chat_forward",
+                request_id,
+                public_blob_urls=outbound_blob_urls,
+                private_artifact_ids=private_audio_artifact_ids,
+                payload_hash=payload_hash,
+            )
 
         if media_tools.get("draw_image"):
             try:
@@ -3820,7 +3856,7 @@ def chat():
                 input_items=confirmation_input,
             )
         except Exception:
-            cleanup_outbound_blobs()
+            enqueue_outbound_attempt_cleanup()
             safe_release_delivery_request(user_id, "chat_forward", request_id, delivery_owner)
             return jsonify({"error": "AI confirmation is currently unavailable."}), 502
         audio_b64 = ""
@@ -3880,16 +3916,16 @@ def chat():
                 friendship_user_ids=(user_id, target_id),
             )
         except AcceptedFriendshipRequired:
-            cleanup_outbound_blobs()
+            enqueue_outbound_attempt_cleanup()
             safe_release_delivery_request(user_id, "chat_forward", request_id, delivery_owner)
             return jsonify({"error": "accepted friendship required"}), 403
         except Exception as exc:
-            cleanup_outbound_blobs()
+            enqueue_outbound_attempt_cleanup()
             safe_release_delivery_request(user_id, "chat_forward", request_id, delivery_owner)
             log_tool_error(user_id, target_id, "send_msg", "chat_ai_room_forward", type(exc).__name__, request_id=request_id)
             return jsonify({"error": "Message delivery is currently unavailable."}), 500
         if not created:
-            cleanup_outbound_blobs()
+            enqueue_outbound_attempt_cleanup()
             return jsonify(
                 replay_friend_delivery_receipt(
                     stored_receipt,
@@ -5740,25 +5776,17 @@ def assist_message():
     outbound_blob_urls = []
     private_audio_artifact_ids = []
     outbound_blobs_durable = False
+    payload_hash = ""
 
-    def cleanup_outbound_blobs():
-        for blob_url in dict.fromkeys(outbound_blob_urls):
-            try:
-                delete_vercel_blob(blob_url)
-            except Exception:
-                log_tool_error(
-                    user_id,
-                    contact_id,
-                    "outbound_cleanup",
-                    "assist_message",
-                    "blob_cleanup_failed",
-                    request_id=request_id,
-                )
-        for artifact_id in dict.fromkeys(private_audio_artifact_ids):
-            try:
-                delete_private_audio_artifact(user_id, artifact_id)
-            except Exception:
-                pass
+    def enqueue_outbound_attempt_cleanup():
+        enqueue_attempt_cleanup_job(
+            user_id,
+            "assist_message",
+            request_id,
+            public_blob_urls=outbound_blob_urls,
+            private_artifact_ids=private_audio_artifact_ids,
+            payload_hash=payload_hash,
+        )
 
     try:
         friend_ctx = get_friend_context(user_id, contact_id)
@@ -6094,7 +6122,7 @@ def assist_message():
                 friendship_user_ids=(user_id, contact_id),
             )
             if not created:
-                cleanup_outbound_blobs()
+                enqueue_outbound_attempt_cleanup()
                 return jsonify(
                     replay_friend_delivery_receipt(
                         stored_receipt,
@@ -6158,7 +6186,7 @@ def assist_message():
         return jsonify(response_payload)
     except AcceptedFriendshipRequired:
         if not outbound_blobs_durable:
-            cleanup_outbound_blobs()
+            enqueue_outbound_attempt_cleanup()
         if delivery_owner:
             try:
                 safe_release_delivery_request(
@@ -6169,7 +6197,7 @@ def assist_message():
         return jsonify({"ok": False, "error": "accepted friendship required"}), 403
     except Exception as exc:
         if not outbound_blobs_durable:
-            cleanup_outbound_blobs()
+            enqueue_outbound_attempt_cleanup()
         if delivery_owner:
             try:
                 safe_release_delivery_request(
