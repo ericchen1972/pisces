@@ -40,10 +40,10 @@ def normalize_group_name(name):
 
 
 def seed_group_specs(locale):
-    traditional_chinese_locales = {"zh-tw", "zh-hant", "zh-hant-tw"}
+    normalized_locale = str(locale or "").lower()
     names = (
         ["家人", "朋友", "商務", "路人甲"]
-        if str(locale or "").lower() in traditional_chinese_locales
+        if normalized_locale == "zh-tw" or normalized_locale.startswith("zh-hant")
         else ["Family", "Friends", "Business", "Others"]
     )
     final_index = len(names) - 1

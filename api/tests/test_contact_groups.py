@@ -257,14 +257,25 @@ def test_normalize_group_name_nfkc_casefolds_and_collapses_spaces():
     assert normalize_group_name("  ＦＡＭＩＬＹ   Team ") == "family team"
 
 
-def test_seed_group_specs_localizes_only_traditional_chinese_locales():
-    zh_tw = seed_group_specs("ZH-TW")
-    zh_cn = seed_group_specs("zh-CN")
+@pytest.mark.parametrize("locale", ["ZH-TW", "zh-Hant", "zh-Hant-HK", "zh-Hant-MO"])
+def test_seed_group_specs_localizes_explicit_traditional_chinese_locales(locale):
+    groups = seed_group_specs(locale)
 
-    assert [group["name"] for group in zh_tw] == ["家人", "朋友", "商務", "路人甲"]
-    assert [group["name"] for group in zh_cn] == ["Family", "Friends", "Business", "Others"]
-    assert [group["sort_order"] for group in zh_tw] == [0, 1, 2, 3]
-    assert [group["is_default"] for group in zh_tw] == [False, False, False, True]
+    assert [group["name"] for group in groups] == ["家人", "朋友", "商務", "路人甲"]
+    assert [group["sort_order"] for group in groups] == [0, 1, 2, 3]
+    assert [group["is_default"] for group in groups] == [False, False, False, True]
+
+
+@pytest.mark.parametrize("locale", ["zh-HK", "zh-MO", "zh-CN", "en"])
+def test_seed_group_specs_uses_english_without_explicit_traditional_script(locale):
+    groups = seed_group_specs(locale)
+
+    assert [group["name"] for group in groups] == [
+        "Family",
+        "Friends",
+        "Business",
+        "Others",
+    ]
 
 
 def test_sort_contact_records_orders_latest_first_then_name_and_invalid_last():
