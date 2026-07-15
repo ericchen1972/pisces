@@ -15,10 +15,24 @@ import {
 } from './lib/authRequestGuard.js'
 import { resetAccountScopedRefs, stopActiveRecordingResources } from './lib/accountScope.js'
 import { createAccountOperationScope } from './lib/operationScope.js'
+import { mergeStreamMessage, streamAiTurn } from './lib/stream.js'
+import {
+  canonicalIncomingMessage,
+  createClientRequestId,
+  effectiveMessageRole,
+  restoreAssistDraft,
+  sendAssistRequest,
+  sendPersonRequest,
+  startExclusiveSend,
+} from './lib/chatSend.js'
 import ChatShell from './features/chat/ChatShell.jsx'
 import ContactSidebar from './features/chat/ContactSidebar.jsx'
+import Composer from './features/chat/Composer.jsx'
+import Conversation from './features/chat/Conversation.jsx'
+import ConversationEmptyState from './features/chat/ConversationEmptyState.jsx'
 import GroupManagerDialog from './features/groups/GroupManagerDialog.jsx'
 import './styles/app-shell.css'
+import './styles/chat.css'
 import './styles/dialogs.css'
 
 const FALLBACK_API_BASE_URL = 'https://pisces-315346868518.asia-east1.run.app'
@@ -30,8 +44,6 @@ const LIVE_CONNECT_TIMEOUT_MS = 20000
 const AI_DEFAULT_GLOBAL_PROMPT = 'You are a polite, warm, and thoughtful AI communication partner.'
 const UI_STORAGE_KEY = 'pisces_ui_v1'
 const AVATAR_SIZE = 256
-const CHAT_INPUT_BASE_HEIGHT = 24
-const CHAT_INPUT_MAX_HEIGHT = 132
 const FEMALE_VOICE_OPTIONS = [
   'Achernar',
   'Aoede',
@@ -659,7 +671,7 @@ function LoginHome() {
   const [openContactMenuId, setOpenContactMenuId] = useState(null)
   const [selectedContact, setSelectedContact] = useState(null)
   const [chatInput, setChatInput] = useState('')
-  const [showEmojiPicker, setShowEmojiPicker] = useState(false)
+  const [pendingAttachment, setPendingAttachment] = useState(null)
   const [messagesByContact, setMessagesByContact] = useState({})
   const [unreadByContact, setUnreadByContact] = useState({})
   const [contactGroups, setContactGroups] = useState([])
@@ -670,7 +682,6 @@ function LoginHome() {
   const [isRecording, setIsRecording] = useState(false)
   const [isAwaitingReply, setIsAwaitingReply] = useState(false)
   const [isAiAssistMode, setIsAiAssistMode] = useState(false)
-  const [showAiAssistTooltip, setShowAiAssistTooltip] = useState(false)
   const [showPhoneOverlay, setShowPhoneOverlay] = useState(false)
   const [phone2RotationDeg, setPhone2RotationDeg] = useState(0)
   const [showPhonePeerAvatar, setShowPhonePeerAvatar] = useState(false)
@@ -713,9 +724,9 @@ function LoginHome() {
   const [pendingAvatarPreviewUrl, setPendingAvatarPreviewUrl] = useState('')
   const [recordElapsedMs, setRecordElapsedMs] = useState(0)
   const [imageViewerUrl, setImageViewerUrl] = useState('')
-  const [isInputComposing, setIsInputComposing] = useState(false)
   const restoredSelectedContactIdRef = useRef(null)
-  const chatScrollRef = useRef(null)
+  const selectedContactIdRef = useRef('')
+  const chatDraftVersionRef = useRef(0)
   const mediaRecorderRef = useRef(null)
   const mediaStreamRef = useRef(null)
   const recordChunksRef = useRef([])
@@ -739,9 +750,10 @@ function LoginHome() {
   const liveAboutFriendInjectedRef = useRef(new Set())
   const liveAboutFriendPendingRef = useRef(new Set())
   const recordingOperationRef = useRef(null)
-  const lastCompositionEndAtRef = useRef(0)
+  const aiStreamOperationRef = useRef(null)
+  const assistSendOperationRef = useRef(null)
+  const personSendOperationRef = useRef(null)
   const avatarFileInputRef = useRef(null)
-  const chatInputRef = useRef(null)
   const ablyRealtimeRef = useRef(null)
   const ablyChannelRef = useRef(null)
   const authRequestGuardRef = useRef(null)
@@ -772,7 +784,7 @@ function LoginHome() {
     const view = []
     const groupIndexById = {}
     rawMessages.forEach((message) => {
-      const role = message.role
+      const role = effectiveMessageRole(message)
       if (role === 'assist_user' || role === 'assist_ai') {
         const gid = message.assist_group_id || `assist-${message.id}`
         let idx = groupIndexById[gid]
@@ -798,14 +810,7 @@ function LoginHome() {
       }
       view.push({
         id: message.id || `${message.role}-${Math.random().toString(36).slice(2, 8)}`,
-        role:
-          message.role === 'user'
-            ? 'user'
-            : message.role === 'peer'
-              ? 'peer'
-              : message.role === 'ai_proxy'
-                ? 'ai_proxy'
-                : 'ai',
+        role,
         text: message.text || '',
         audioUrl: message.audio_url || '',
         audioDuration: Number(message.audio_duration_seconds || 0),
@@ -822,6 +827,9 @@ function LoginHome() {
     accountOperationScope.invalidate()
     liveOperationScope.invalidate()
     recordingOperationRef.current = null
+    aiStreamOperationRef.current = null
+    assistSendOperationRef.current = null
+    personSendOperationRef.current = null
     stopActiveRecordingResources({
       mediaRecorderRef,
       mediaStreamRef,
@@ -847,13 +855,15 @@ function LoginHome() {
       ablyRealtimeRef.current = null
     }
     setContacts([])
+    selectedContactIdRef.current = ''
     setSelectedContact(null)
     setMessagesByContact({})
+    setPendingAttachment(null)
     setUnreadByContact({})
     setContactGroups([])
     setDefaultContactGroupId('')
     setChatInput('')
-    setShowEmojiPicker(false)
+    chatDraftVersionRef.current = 0
     setIsAiAssistMode(false)
     setIsHistoryLoading(false)
     setIsAwaitingReply(false)
@@ -1261,6 +1271,7 @@ function LoginHome() {
       setFriendAliasInput('')
       setFriendCodeInput('')
       setAddFriendModalOpen(false)
+      selectedContactIdRef.current = ''
       setSelectedContact(null)
     } catch (err) {
       setAddFriendError(err?.message || t('Add friend failed.', '新增好友失敗。'))
@@ -1298,6 +1309,7 @@ function LoginHome() {
     if (contact.isAi) return
     setContacts((prev) => prev.filter((item) => item.id !== contact.id))
     if (selectedContact?.id === contact.id) {
+      selectedContactIdRef.current = ''
       setSelectedContact(null)
     }
   }
@@ -1664,6 +1676,7 @@ function LoginHome() {
     if (!isSignedIn || selectedContact || !restoredSelectedContactIdRef.current) return
     const target = contacts.find((contact) => contact.id === restoredSelectedContactIdRef.current)
     if (target) {
+      selectedContactIdRef.current = target.id
       setSelectedContact(target)
       markContactAsRead(target.id)
       loadContactHistory(target.id)
@@ -1728,12 +1741,13 @@ function LoginHome() {
           if (isCancelled || !authRequestGuard.isCurrent(subscriptionContext) || subscriptionContext.userId !== currentUser.id) return
           const payload = message?.data || {}
           const senderId = payload.sender_user_id || ''
+          const incomingMessage = canonicalIncomingMessage(payload)
           const text = payload.text || ''
           const audioUrl = payload.audio_url || ''
           const imageUrl = payload.image_url || ''
           const musicUrl = payload.music_url || ''
-          const audioDuration = Number(payload.audio_duration_seconds || 0)
           if (!senderId || (!text && !audioUrl && !imageUrl && !musicUrl)) return
+          if (!incomingMessage) return
 
           upsertFriendContact({
             id: senderId,
@@ -1749,17 +1763,7 @@ function LoginHome() {
               ...prev,
               [senderId]: [
                 ...current,
-                {
-                  id: payload.message_id || `m-${Date.now()}`,
-                  role: 'peer',
-                  text,
-                  audioUrl,
-                  audioDuration,
-                  imageUrl,
-                  musicUrl,
-                  senderMode: payload.sender_mode || 'user',
-                  avatarUrl: payload.sender_avatar_url || '',
-                },
+                incomingMessage,
               ],
             }
           })
@@ -1809,11 +1813,6 @@ function LoginHome() {
   }, [pendingAvatarPreviewUrl])
 
   useEffect(() => {
-    if (!selectedContact || !chatScrollRef.current) return
-    chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight
-  }, [selectedContact, messagesByContact])
-
-  useEffect(() => {
     if (!selectedContact || selectedContact.isAi) {
       setIsAiAssistMode(false)
     }
@@ -1849,22 +1848,6 @@ function LoginHome() {
       clearTimeout(recordTimeoutRef.current)
       recordTimeoutRef.current = null
     }
-  }
-
-  const resetChatInputHeight = () => {
-    const el = chatInputRef.current
-    if (!el) return
-    el.style.height = `${CHAT_INPUT_BASE_HEIGHT}px`
-    el.style.overflowY = 'hidden'
-  }
-
-  const adjustChatInputHeight = () => {
-    const el = chatInputRef.current
-    if (!el) return
-    el.style.height = `${CHAT_INPUT_BASE_HEIGHT}px`
-    const nextHeight = Math.max(CHAT_INPUT_BASE_HEIGHT, Math.min(el.scrollHeight, CHAT_INPUT_MAX_HEIGHT))
-    el.style.height = `${nextHeight}px`
-    el.style.overflowY = el.scrollHeight > CHAT_INPUT_MAX_HEIGHT ? 'auto' : 'hidden'
   }
 
   const playAudioOnce = async (audioEl) => {
@@ -2522,7 +2505,9 @@ function LoginHome() {
           const shouldUseAiVoiceFlow = contactId === 'pisces-core' || isAiAssistMode
           const isAssistVoiceFlow = isAiAssistMode && contactId !== 'pisces-core'
           const typingId = `vt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
-          const assistTempId = `assist-v-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+          const assistRequestId = createClientRequestId('assist-voice')
+          const assistTempId = `assist-v-${assistRequestId}`
+          let assistTranscript = ''
           runIfRecordingCurrent(() => {
             setMessagesByContact((prev) => {
               const current = prev[contactId] || []
@@ -2537,10 +2522,11 @@ function LoginHome() {
                           id: assistTempId,
                           role: 'assist_group',
                           groupId: assistTempId,
-                          collapsed: false,
+                          requestId: assistRequestId,
                           userText: '',
-                          aiText: '...',
+                          aiText: '',
                           aiAudioUrl: '',
+                          status: 'streaming',
                         },
                       ]
                     : shouldUseAiVoiceFlow
@@ -2612,23 +2598,16 @@ function LoginHome() {
               if (!sttRes.ok || !sttData.ok || !sttData.transcript) {
                 throw new Error(sttData.error || `Speech-to-text failed (${sttRes.status})`)
               }
+              assistTranscript = sttData.transcript
 
-              const res = await fetch(`${apiBaseUrl}/api/assist/message`, {
-                method: 'POST',
-                credentials: 'include',
+              const { assistGroup: assist, outboundMessage } = await sendAssistRequest({
+                url: `${apiBaseUrl}/api/assist/message`,
+                contactId,
+                message: assistTranscript,
+                requestId: assistRequestId,
                 signal: recordingOperation.signal,
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  contact_id: contactId,
-                  message: sttData.transcript,
-                }),
               })
-              const data = await res.json()
               if (!accountOperationScope.isOwner(recordingOperation, recordingOperationRef)) return
-              if (!res.ok || !data.ok) {
-                throw new Error(data.error || `Assist failed (${res.status})`)
-              }
-              const assist = data.assist_group || {}
               const assistAudioUrl = assist.audio_url
                 ? assist.audio_url
                 : assist.audio_base64 && assist.audio_mime_type
@@ -2636,21 +2615,22 @@ function LoginHome() {
                   : ''
               runIfRecordingCurrent(() => setMessagesByContact((prev) => {
                 const current = prev[contactId] || []
+                const assistMessage = {
+                  id: assist.id || assistTempId,
+                  role: 'assist_group',
+                  groupId: assist.id || assistTempId,
+                  requestId: assistRequestId,
+                  userText: assist.user_text || assistTranscript,
+                  aiText: assist.ai_text || '',
+                  aiAudioUrl: assistAudioUrl,
+                  status: 'complete',
+                }
+                const replaced = mergeStreamMessage(current, assistTempId, assistMessage)
                 return {
                   ...prev,
-                  [contactId]: current.map((m) =>
-                    m.id === assistTempId
-                      ? {
-                          id: assist.id || assistTempId,
-                          role: 'assist_group',
-                          groupId: assist.id || assistTempId,
-                          collapsed: false,
-                          userText: '',
-                          aiText: assist.ai_text || '',
-                          aiAudioUrl: assistAudioUrl,
-                        }
-                      : m,
-                  ),
+                  [contactId]: outboundMessage && !replaced.some((message) => message.id === outboundMessage.id)
+                    ? [...replaced, outboundMessage]
+                    : replaced,
                 }
               }))
             } else {
@@ -2703,7 +2683,19 @@ function LoginHome() {
                   ...prev,
                   [contactId]: current.map((m) =>
                     m.id === assistTempId
-                      ? { ...m, aiText: errText, collapsed: false }
+                      ? {
+                          ...m,
+                          userText: assistTranscript,
+                          aiText: errText,
+                          status: 'incomplete',
+                          retry: assistTranscript
+                            ? () => sendAssistText(assistTranscript, {
+                                requestId: assistRequestId,
+                                temporaryId: assistTempId,
+                                clearDraft: false,
+                              })
+                            : undefined,
+                        }
                       : m,
                   ),
                 }
@@ -2745,10 +2737,8 @@ function LoginHome() {
       recorder.start()
       runIfRecordingCurrent(() => {
         setChatInput('')
-        resetChatInputHeight()
         setIsRecording(true)
         setRecordElapsedMs(0)
-        setShowEmojiPicker(false)
       })
 
       recordIntervalRef.current = setInterval(() => {
@@ -2782,16 +2772,6 @@ function LoginHome() {
   }
 
   useEffect(() => {
-    adjustChatInputHeight()
-  }, [chatInput])
-
-  useEffect(() => {
-    if (!isRecording && !chatInput.trim()) {
-      resetChatInputHeight()
-    }
-  }, [isRecording, chatInput])
-
-  useEffect(() => {
     return () => {
       accountOperationScope.invalidate()
       recordingOperationRef.current = null
@@ -2808,10 +2788,298 @@ function LoginHome() {
 
   const selectContactFromSidebar = (contact) => {
     if (!contact?.id) return
+    setPendingAttachment(null)
+    selectedContactIdRef.current = contact.id
     setSelectedContact(contact)
     markContactAsRead(contact.id)
     loadContactHistory(contact.id)
   }
+
+  const replaceConversationMessage = (contactId, messageId, nextMessage) => {
+    setMessagesByContact((previous) => {
+      const current = previous[contactId] || []
+      return {
+        ...previous,
+        [contactId]: mergeStreamMessage(current, messageId, nextMessage),
+      }
+    })
+  }
+
+  const sendAiStream = async (input, { appendUser = true, requestId, temporaryId } = {}) => {
+    const contactId = selectedContact?.id
+    if (!contactId || !selectedContact?.isAi) return
+    const operation = accountOperationScope.beginExclusive(aiStreamOperationRef)
+    if (!operation) return
+    const userMessageId = `u-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+    const streamMessageId = temporaryId || `stream-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+
+    accountOperationScope.runIfCurrent(operation, () => {
+      setMessagesByContact((previous) => {
+        const current = previous[contactId] || []
+        const withoutPreviousAttempt = current.filter((message) => (
+          message.id !== streamMessageId && (!requestId || message.requestId !== requestId)
+        ))
+        return {
+          ...previous,
+          [contactId]: [
+            ...withoutPreviousAttempt,
+            ...(appendUser ? [{ id: userMessageId, role: 'user', text: input }] : []),
+            { id: streamMessageId, role: 'ai', text: '', status: 'streaming', originalInput: input, requestId },
+          ],
+        }
+      })
+      if (appendUser) {
+        setChatInput('')
+      }
+      setIsAwaitingReply(true)
+    })
+
+    try {
+      await streamAiTurn({
+        url: `${apiBaseUrl}/api/chat/stream`,
+        input,
+        contactId,
+        requestId,
+        signal: operation.signal,
+        onMessage: (message) => accountOperationScope.runIfCurrent(operation, () => {
+          const retry = message.status === 'incomplete'
+            ? () => sendAiStream(input, {
+                appendUser: false,
+                requestId: message.requestId,
+                temporaryId: streamMessageId,
+              })
+            : undefined
+          replaceConversationMessage(contactId, streamMessageId, { ...message, retry })
+        }),
+      })
+    } catch (error) {
+      if (error?.name !== 'AbortError') {
+        accountOperationScope.runIfCurrent(operation, () => {
+          replaceConversationMessage(contactId, streamMessageId, {
+            id: streamMessageId,
+            role: 'ai',
+            text: '',
+            status: 'incomplete',
+            error: error?.message || t('Unable to reach API.', '無法連線到 API。'),
+            retry: () => sendAiStream(input, { appendUser: false, requestId, temporaryId: streamMessageId }),
+          })
+        })
+      }
+    } finally {
+      accountOperationScope.runIfCurrent(operation, () => setIsAwaitingReply(false))
+      accountOperationScope.releaseOwner(operation, aiStreamOperationRef)
+    }
+  }
+
+  const sendAssistText = (input, {
+    requestId = createClientRequestId('assist'),
+    temporaryId = `assist-${requestId}`,
+    clearDraft = true,
+  } = {}) => {
+    const contactId = selectedContact?.id
+    if (!contactId || selectedContact?.isAi) return false
+    const submittedDraftVersion = chatDraftVersionRef.current
+
+    const send = startExclusiveSend({
+      scope: accountOperationScope,
+      ownerRef: assistSendOperationRef,
+      request: (operation) => sendAssistRequest({
+        url: `${apiBaseUrl}/api/assist/message`,
+        contactId,
+        message: input,
+        requestId,
+        signal: operation.signal,
+      }),
+      onSuccess: ({ assistGroup, outboundMessage }) => {
+        const audioUrl = assistGroup.audio_url || (
+          assistGroup.audio_base64 && assistGroup.audio_mime_type
+            ? `data:${assistGroup.audio_mime_type};base64,${assistGroup.audio_base64}`
+            : ''
+        )
+        setMessagesByContact((previous) => {
+          const current = previous[contactId] || []
+          const assistMessage = {
+            id: assistGroup.id || temporaryId,
+            role: 'assist_group',
+            groupId: assistGroup.id || temporaryId,
+            requestId,
+            userText: assistGroup.user_text || input,
+            aiText: assistGroup.ai_text || '',
+            aiAudioUrl: audioUrl,
+            status: 'complete',
+          }
+          const replaced = mergeStreamMessage(current, temporaryId, assistMessage)
+          const withCanonicalOutbound = outboundMessage && !replaced.some((message) => message.id === outboundMessage.id)
+            ? [...replaced, outboundMessage]
+            : replaced
+          return { ...previous, [contactId]: withCanonicalOutbound }
+        })
+        if (chatDraftVersionRef.current === submittedDraftVersion) {
+          setChatInput((current) => current === input ? '' : current)
+        }
+      },
+      onError: (error) => {
+        const retry = () => sendAssistText(input, { requestId, temporaryId, clearDraft: false })
+        replaceConversationMessage(contactId, temporaryId, {
+          id: temporaryId,
+          role: 'assist_group',
+          groupId: temporaryId,
+          requestId,
+          userText: input,
+          aiText: error?.message || t('AI Assist failed.', 'AI 協助失敗。'),
+          aiAudioUrl: '',
+          status: 'incomplete',
+          retry,
+        })
+        setChatInput((current) => restoreAssistDraft(
+          current,
+          input,
+          chatDraftVersionRef.current,
+          submittedDraftVersion,
+          selectedContactIdRef.current,
+          contactId,
+        ))
+      },
+      onSettled: () => setIsAwaitingReply(false),
+    })
+    if (!send.started) return false
+
+    setMessagesByContact((previous) => {
+      const current = previous[contactId] || []
+      const optimistic = {
+        id: temporaryId,
+        role: 'assist_group',
+        groupId: temporaryId,
+        requestId,
+        userText: input,
+        aiText: '',
+        aiAudioUrl: '',
+        status: 'streaming',
+      }
+      return { ...previous, [contactId]: mergeStreamMessage(current, temporaryId, optimistic) }
+    })
+    if (clearDraft) setChatInput('')
+    setIsAwaitingReply(true)
+    return true
+  }
+
+  const sendPersonText = (input, attachment = pendingAttachment) => {
+    const contactId = selectedContact?.id
+    if (!contactId || selectedContact?.isAi || (!input && !attachment)) return false
+
+    const send = startExclusiveSend({
+      scope: accountOperationScope,
+      ownerRef: personSendOperationRef,
+      request: (operation) => sendPersonRequest({
+        url: `${apiBaseUrl}/api/messages/send`,
+        contactId,
+        text: input,
+        attachment,
+        signal: operation.signal,
+      }),
+      onSuccess: (message) => {
+        setMessagesByContact((previous) => {
+          const current = previous[contactId] || []
+          return current.some((item) => item.id === message.id)
+            ? previous
+            : { ...previous, [contactId]: [...current, message] }
+        })
+        setChatInput((current) => current.trim() === input ? '' : current)
+        setPendingAttachment((current) => current === attachment ? null : current)
+      },
+      onError: (error) => {
+        setMessagesByContact((previous) => ({
+          ...previous,
+          [contactId]: [
+            ...(previous[contactId] || []),
+            {
+              id: `error-${Date.now()}`,
+              role: 'system',
+              text: error?.message || t('Unable to send message.', '無法傳送訊息。'),
+              status: 'incomplete',
+            },
+          ],
+        }))
+      },
+      onSettled: () => setIsAwaitingReply(false),
+    })
+    if (!send.started) return false
+    setIsAwaitingReply(true)
+    return true
+  }
+
+  const sendComposerText = (input) => {
+    if (!selectedContact || isRecording || isAwaitingReply) return
+    if (selectedContact.isAi) return sendAiStream(input)
+    if (isAiAssistMode) return sendAssistText(input)
+    return sendPersonText(input, pendingAttachment)
+  }
+
+  const conversationMessages = selectedContact
+    ? (messagesByContact[selectedContact.id] || []).flatMap((message) => {
+        if (message.role !== 'assist_group') return [message]
+        return [
+          { id: `${message.id}-user`, role: 'assist_user', text: message.userText || '' },
+          {
+            id: `${message.id}-ai`,
+            role: 'assist_ai',
+            text: message.aiText || '',
+            audioUrl: message.aiAudioUrl || '',
+            status: message.status === 'streaming' ? 'streaming' : message.status,
+            retry: message.retry,
+          },
+        ]
+      })
+    : []
+
+  const conversationPanel = selectedContact ? (
+    <Conversation
+      contact={selectedContact}
+      messages={conversationMessages}
+      locale={isZh ? 'zh-TW' : 'en'}
+      loading={isHistoryLoading}
+      onBack={() => {
+        selectedContactIdRef.current = ''
+        setSelectedContact(null)
+      }}
+      onCall={openPhoneOverlay}
+      callDisabled={!selectedContact.isAi}
+      onImageClick={setImageViewerUrl}
+      renderAudio={({ url, kind, message }) => (
+        <AudioMessagePlayer
+          audioUrl={url}
+          variant={message.role === 'user' ? 'user' : 'ai'}
+          durationHint={kind === 'voice' ? Number(message.audioDuration || 0) : 0}
+        />
+      )}
+      composer={(
+        <Composer
+          value={chatInput}
+          onChange={(value) => {
+            chatDraftVersionRef.current += 1
+            setChatInput(value)
+          }}
+          onSend={sendComposerText}
+          attachment={pendingAttachment}
+          onAttachment={!selectedContact.isAi && !isAiAssistMode ? setPendingAttachment : undefined}
+          onRemoveAttachment={() => setPendingAttachment(null)}
+          showAssist={!selectedContact.isAi}
+          assistActive={isAiAssistMode && !selectedContact.isAi}
+          onToggleAssist={() => {
+            setPendingAttachment(null)
+            setIsAiAssistMode((value) => !value)
+          }}
+          canRecord={micAllowed}
+          isRecording={isRecording}
+          recordingElapsedMs={recordElapsedMs}
+          maxRecordMs={MAX_RECORD_MS}
+          onToggleRecording={() => (isRecording ? stopRecording() : startRecording())}
+          isSending={isAwaitingReply}
+          locale={isZh ? 'zh-TW' : 'en'}
+        />
+      )}
+    />
+  ) : null
 
   const contactSidebar = (
     <ContactSidebar
@@ -2931,7 +3199,7 @@ function LoginHome() {
 
         {isSignedIn ? (
           <ChatShell sidebar={contactSidebar} locale={isZh ? 'zh-TW' : 'en'}>
-          <div style={{ padding: isPadUp ? '8px 18px 0' : '50px 10px 0', minHeight: 0, height: '100%', boxSizing: 'border-box' }}>
+          <div style={{ padding: selectedContact ? 0 : (isPadUp ? '8px 18px 0' : '50px 10px 0'), minHeight: 0, height: '100%', boxSizing: 'border-box' }}>
             <style>{`
               .no-scrollbar::-webkit-scrollbar { display: none; }
               @keyframes typingDot {
@@ -2944,962 +3212,9 @@ function LoginHome() {
               }
             `}</style>
             {selectedContact ? (
-              <div style={{ height: '100%', display: 'grid', gridTemplateRows: '56px 1fr auto' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: isPadUp ? '0 24px' : '0 8px' }}>
-                  <button
-                    type="button"
-                    onClick={() => setSelectedContact(null)}
-                    style={{
-                      border: 0,
-                      background: 'transparent',
-                      color: '#fff',
-                      fontSize: 34,
-                      lineHeight: 1,
-                      cursor: 'pointer',
-                      pointerEvents: 'auto',
-                      textShadow: '0 2px 8px rgba(41,10,57,0.35)',
-                    }}
-                  >
-                    &lt;
-                  </button>
-                  <div style={{ color: '#fff', fontSize: isPadUp ? '1.5rem' : '1.3rem', textShadow: '0 2px 8px rgba(41,10,57,0.35)' }}>
-                    {selectedContact.name}
-                  </div>
-                </div>
-
-                <div
-                  ref={chatScrollRef}
-                  className="no-scrollbar"
-                  style={{
-                    minHeight: 0,
-                    overflowY: 'auto',
-                    scrollbarWidth: 'none',
-                    msOverflowStyle: 'none',
-                    padding: isPadUp ? '8px 24px 4px' : '8px 8px 4px',
-                    display: 'grid',
-                    alignContent: 'start',
-                    gap: 16,
-                  }}
-                >
-                  {isHistoryLoading ? (
-                    <div style={{ color: 'rgba(255,255,255,0.85)', fontSize: 13 }}>Loading history...</div>
-                  ) : null}
-                  {(messagesByContact[selectedContact.id] || []).map((msg) => {
-                    if (msg.role === 'assist_group') {
-                      return (
-                        <div
-                          key={msg.id}
-                          style={{
-                            width: '100%',
-                            borderRadius: 14,
-                            border: '1px solid rgba(255,255,255,0.34)',
-                            background: 'rgba(62, 36, 84, 0.7)',
-                            boxShadow: '0 6px 14px rgba(0,0,0,0.22)',
-                            padding: 10,
-                            display: 'grid',
-                            gap: 8,
-                          }}
-                        >
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setMessagesByContact((prev) => {
-                                const current = prev[selectedContact.id] || []
-                                return {
-                                  ...prev,
-                                  [selectedContact.id]: current.map((m) =>
-                                    m.id === msg.id ? { ...m, collapsed: !m.collapsed } : m,
-                                  ),
-                                }
-                              })
-                            }}
-                            style={{
-                              border: 0,
-                              background: 'transparent',
-                              color: '#ffe6ff',
-                              cursor: 'pointer',
-                              textAlign: 'left',
-                              fontSize: 12,
-                              fontWeight: 700,
-                              padding: 0,
-                            }}
-                          >
-                            {msg.collapsed ? `▶ ${t('AI Assist', 'AI 助理')}` : `▼ ${t('AI Assist', 'AI 助理')}`}
-                          </button>
-                          {msg.collapsed ? (
-                            <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.85)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                              {msg.userText || msg.aiText || 'AI assist message'}
-                            </div>
-                          ) : (
-                            <div style={{ display: 'grid', gap: 8 }}>
-                              <div
-                                style={{
-                                  justifySelf: 'end',
-                                  maxWidth: isPadUp ? '64%' : '82%',
-                                  background: 'rgba(255, 186, 231, 0.24)',
-                                  color: '#fff',
-                                  borderRadius: 14,
-                                  padding: '8px 10px',
-                                  fontSize: '0.94rem',
-                                  lineHeight: 1.35,
-                                  whiteSpace: 'pre-wrap',
-                                  wordBreak: 'break-word',
-                                  overflowWrap: 'anywhere',
-                                }}
-                              >
-                                {msg.userText}
-                              </div>
-                              <div
-                                style={{
-                                  justifySelf: 'start',
-                                  maxWidth: isPadUp ? '68%' : '86%',
-                                  background: 'rgba(127, 95, 156, 0.55)',
-                                  color: '#fff',
-                                  borderRadius: 14,
-                                  padding: '8px 10px',
-                                  fontSize: '0.94rem',
-                                  lineHeight: 1.35,
-                                  whiteSpace: 'pre-wrap',
-                                  wordBreak: 'break-word',
-                                  overflowWrap: 'anywhere',
-                                }}
-                              >
-                            {msg.aiAudioUrl ? <AudioMessagePlayer audioUrl={msg.aiAudioUrl} variant="ai" durationHint={0} /> : msg.aiText}
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      )
-                    }
-
-                    if (msg.role === 'user') {
-                      const hasRich = !!(msg.audioUrl || msg.imageUrl || msg.musicUrl)
-                      return (
-                        <div key={msg.id} style={{ display: 'flex', justifyContent: 'flex-end', width: '100%' }}>
-                          <div
-                            style={{
-                              width: hasRich ? 'fit-content' : undefined,
-                              maxWidth: isPadUp ? '62%' : '78%',
-                              background: hasRich ? 'transparent' : '#79cc63',
-                              color: hasRich ? '#fff' : '#1b2817',
-                              borderRadius: 18,
-                              padding: hasRich ? '0' : '10px 12px',
-                              fontSize: '0.98rem',
-                              lineHeight: 1.35,
-                              whiteSpace: 'pre-wrap',
-                              wordBreak: 'break-word',
-                              overflowWrap: 'anywhere',
-                              boxShadow: hasRich ? 'none' : '0 3px 8px rgba(0,0,0,0.18)',
-                            }}
-                          >
-                            <MessageRichContent
-                              msg={msg}
-                              variant="user"
-                              onImageClick={(url) => setImageViewerUrl(url)}
-                            />
-                          </div>
-                        </div>
-                      )
-                    }
-
-                    if (msg.role === 'ai_proxy') {
-                      const hasRich = !!(msg.audioUrl || msg.imageUrl || msg.musicUrl)
-                      return (
-                        <div
-                          key={msg.id}
-                          style={{
-                            display: 'grid',
-                            gridTemplateColumns: '1fr auto',
-                            alignItems: 'end',
-                            columnGap: 8,
-                            width: '100%',
-                          }}
-                        >
-                          <div
-                            style={{
-                              justifySelf: 'end',
-                              width: 'fit-content',
-                              maxWidth: isPadUp ? '62%' : '78%',
-                              background: hasRich ? 'transparent' : 'rgba(55, 30, 78, 0.9)',
-                              color: '#fff',
-                              borderRadius: 18,
-                              padding: hasRich ? '0' : '10px 12px',
-                              fontSize: '0.98rem',
-                              lineHeight: 1.35,
-                              whiteSpace: 'pre-wrap',
-                              wordBreak: 'break-word',
-                              overflowWrap: 'anywhere',
-                              boxShadow: hasRich ? 'none' : '0 3px 8px rgba(0,0,0,0.18)',
-                            }}
-                          >
-                            <MessageRichContent
-                              msg={msg}
-                              variant="ai"
-                              onImageClick={(url) => setImageViewerUrl(url)}
-                            />
-                          </div>
-                          <img
-                            src={msg.avatarUrl || contacts[0]?.avatar || '/images/fish.png'}
-                            alt="AI proxy"
-                            style={{
-                              width: isPadUp ? 40 : 32,
-                              height: isPadUp ? 40 : 32,
-                              borderRadius: '50%',
-                              objectFit: 'cover',
-                              marginBottom: 4,
-                            }}
-                          />
-                        </div>
-                      )
-                    }
-
-                    return (
-                      (() => {
-                        const hasRich = !!(msg.audioUrl || msg.imageUrl || msg.musicUrl)
-                        return (
-                      <div
-                        key={msg.id}
-                        style={{
-                          display: 'grid',
-                          gridTemplateColumns: isPadUp ? '72px 1fr' : '56px 1fr',
-                          alignItems: 'start',
-                          columnGap: 8,
-                          width: '100%',
-                        }}
-                      >
-                        <img
-                          src={msg.avatarUrl || selectedContact?.avatar || '/images/fish.png'}
-                          alt="Pisces"
-                          style={{
-                            width: isPadUp ? 64 : 48,
-                            height: isPadUp ? 64 : 48,
-                            borderRadius: '50%',
-                            objectFit: 'cover',
-                            marginTop: 0,
-                          }}
-                        />
-                        <div
-                          style={{
-                            justifySelf: 'start',
-                            width: 'fit-content',
-                            maxWidth: isPadUp ? '66%' : '80%',
-                            background: hasRich ? 'transparent' : 'rgba(84, 84, 84, 0.88)',
-                            color: '#fff',
-                            borderRadius: 18,
-                            padding: hasRich ? '0' : '10px 12px',
-                            fontSize: '0.96rem',
-                            lineHeight: 1.35,
-                            whiteSpace: 'pre-wrap',
-                            wordBreak: 'break-word',
-                            overflowWrap: 'anywhere',
-                            boxShadow: hasRich ? 'none' : '0 3px 8px rgba(0,0,0,0.2)',
-                          }}
-                        >
-                          {msg.role === 'ai-typing' ? (
-                            <span style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}>
-                              <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#fff', opacity: 0.4, animation: 'typingDot 1s infinite' }} />
-                              <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#fff', opacity: 0.4, animation: 'typingDot 1s infinite 0.2s' }} />
-                              <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#fff', opacity: 0.4, animation: 'typingDot 1s infinite 0.4s' }} />
-                            </span>
-                          ) : (
-                            <MessageRichContent
-                              msg={msg}
-                              variant="ai"
-                              onImageClick={(url) => setImageViewerUrl(url)}
-                            />
-                          )}
-                        </div>
-                      </div>
-                        )
-                      })()
-                    )
-                  })}
-                </div>
-
-                <form
-                  onSubmit={async (e) => {
-                    e.preventDefault()
-                    if (isRecording || isAwaitingReply) return
-                    const input = chatInput.trim()
-                    if (!input || !selectedContact) return
-
-                    const contactId = selectedContact.id
-                    const userMessageId = `u-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
-                    const typingId = `t-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
-                    const accountOperation = accountOperationScope.begin()
-                    if (!accountOperationScope.isCurrent(accountOperation)) {
-                      accountOperationScope.finish(accountOperation)
-                      return
-                    }
-
-                    if (selectedContact.isAi) {
-                      accountOperationScope.runIfCurrent(accountOperation, () => {
-                        setMessagesByContact((prev) => {
-                          const current = prev[contactId] || []
-                          return {
-                            ...prev,
-                            [contactId]: [
-                              ...current,
-                              { id: userMessageId, role: 'user', text: input },
-                              { id: typingId, role: 'ai-typing', text: '...' },
-                            ],
-                          }
-                        })
-                        setChatInput('')
-                        setShowEmojiPicker(false)
-                        setIsAwaitingReply(true)
-                      })
-
-                      try {
-                        const res = await fetch(`${apiBaseUrl}/api/chat`, {
-                          method: 'POST',
-                          credentials: 'include',
-                          signal: accountOperation.signal,
-                          headers: { 'Content-Type': 'application/json' },
-                          body: JSON.stringify({
-                            message: input,
-                            contact_id: contactId,
-                          }),
-                        })
-                        const data = await res.json()
-                        const aiText = res.ok && data.reply ? data.reply : data.error || `Request failed (${res.status})`
-                        const aiAudioUrl =
-                          res.ok && data.audio_base64
-                            ? `data:${data.audio_mime_type || 'audio/wav'};base64,${data.audio_base64}`
-                            : ''
-                        const aiImageUrl = res.ok ? (data.image_url || '') : ''
-                        const aiMusicUrl = res.ok ? (data.music_url || '') : ''
-
-                        accountOperationScope.runIfCurrent(accountOperation, () => {
-                          setMessagesByContact((prev) => {
-                            const current = prev[contactId] || []
-                            return {
-                              ...prev,
-                              [contactId]: current.map((m) =>
-                                m.id === typingId
-                                  ? {
-                                      id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-                                      role: 'ai',
-                                      text: aiText,
-                                      audioUrl: aiAudioUrl,
-                                      imageUrl: aiImageUrl,
-                                      musicUrl: aiMusicUrl,
-                                    }
-                                  : m,
-                              ),
-                            }
-                          })
-                        })
-                      } catch (err) {
-                        const errText = err?.message || t('Unable to reach API.', '無法連線到 API。')
-                        accountOperationScope.runIfCurrent(accountOperation, () => {
-                          setMessagesByContact((prev) => {
-                            const current = prev[contactId] || []
-                            return {
-                              ...prev,
-                              [contactId]: current.map((m) =>
-                                m.id === typingId
-                                  ? { id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role: 'ai', text: errText }
-                                  : m,
-                              ),
-                            }
-                          })
-                        })
-                      } finally {
-                        accountOperationScope.runIfCurrent(accountOperation, () => setIsAwaitingReply(false))
-                        accountOperationScope.finish(accountOperation)
-                      }
-                      return
-                    }
-
-                    if (isAiAssistMode) {
-                      const assistTempId = `assist-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
-                      accountOperationScope.runIfCurrent(accountOperation, () => {
-                        setMessagesByContact((prev) => {
-                          const current = prev[contactId] || []
-                          return {
-                            ...prev,
-                            [contactId]: [
-                              ...current,
-                              {
-                                id: assistTempId,
-                                role: 'assist_group',
-                                groupId: assistTempId,
-                                collapsed: false,
-                                userText: input,
-                                aiText: '...',
-                                aiAudioUrl: '',
-                              },
-                            ],
-                          }
-                        })
-                        setChatInput('')
-                        setShowEmojiPicker(false)
-                        setIsAwaitingReply(true)
-                      })
-                      try {
-                        const res = await fetch(`${apiBaseUrl}/api/assist/message`, {
-                          method: 'POST',
-                          credentials: 'include',
-                          signal: accountOperation.signal,
-                          headers: { 'Content-Type': 'application/json' },
-                          body: JSON.stringify({
-                            contact_id: contactId,
-                            message: input,
-                          }),
-                        })
-                        const data = await res.json()
-                        if (!res.ok || !data.ok) {
-                          throw new Error(data.error || `Assist failed (${res.status})`)
-                        }
-                        const assist = data.assist_group || {}
-                        const assistAudioUrl = assist.audio_url
-                          ? assist.audio_url
-                          : assist.audio_base64 && assist.audio_mime_type
-                            ? `data:${assist.audio_mime_type};base64,${assist.audio_base64}`
-                            : ''
-                        accountOperationScope.runIfCurrent(accountOperation, () => {
-                          setMessagesByContact((prev) => {
-                            const current = prev[contactId] || []
-                            return {
-                              ...prev,
-                              [contactId]: current.map((m) =>
-                                m.id === assistTempId
-                                  ? {
-                                      id: assist.id || assistTempId,
-                                      role: 'assist_group',
-                                      groupId: assist.id || assistTempId,
-                                      collapsed: false,
-                                      userText: assist.user_text || input,
-                                      aiText: assist.ai_text || '',
-                                      aiAudioUrl: assistAudioUrl,
-                                    }
-                                  : m,
-                              ),
-                            }
-                          })
-                        })
-                      } catch (err) {
-                        const errText = err?.message || 'Assist mode failed.'
-                        accountOperationScope.runIfCurrent(accountOperation, () => {
-                          setMessagesByContact((prev) => {
-                            const current = prev[contactId] || []
-                            return {
-                              ...prev,
-                              [contactId]: current.map((m) =>
-                                m.id === assistTempId
-                                  ? { ...m, aiText: errText, collapsed: false }
-                                  : m,
-                              ),
-                            }
-                          })
-                        })
-                      } finally {
-                        accountOperationScope.runIfCurrent(accountOperation, () => setIsAwaitingReply(false))
-                        accountOperationScope.finish(accountOperation)
-                      }
-                      return
-                    }
-
-                    accountOperationScope.runIfCurrent(accountOperation, () => setIsAwaitingReply(true))
-                    try {
-                      const res = await fetch(`${apiBaseUrl}/api/messages/send`, {
-                        method: 'POST',
-                        credentials: 'include',
-                        signal: accountOperation.signal,
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                          recipient_user_id: contactId,
-                          text: input,
-                        }),
-                      })
-                      const data = await res.json()
-                      if (!res.ok || !data.ok) {
-                        throw new Error(data.error || `Send failed (${res.status})`)
-                      }
-                      accountOperationScope.runIfCurrent(accountOperation, () => {
-                        setMessagesByContact((prev) => {
-                          const current = prev[contactId] || []
-                          return {
-                            ...prev,
-                            [contactId]: [...current, { id: data?.message?.message_id || userMessageId, role: 'user', text: input }],
-                          }
-                        })
-                        setChatInput('')
-                        setShowEmojiPicker(false)
-                      })
-                    } catch (err) {
-                      accountOperationScope.runIfCurrent(accountOperation, () => {
-                        setMessagesByContact((prev) => {
-                          const current = prev[contactId] || []
-                          return {
-                            ...prev,
-                            [contactId]: [...current, { id: `e-${Date.now()}`, role: 'peer', text: err?.message || 'Unable to send message.' }],
-                          }
-                        })
-                      })
-                    } finally {
-                      accountOperationScope.runIfCurrent(accountOperation, () => setIsAwaitingReply(false))
-                      accountOperationScope.finish(accountOperation)
-                    }
-                  }}
-                  style={{ padding: isPadUp ? '8px 24px 12px' : '8px 8px 12px' }}
-                >
-                  <div
-                    style={{
-                      position: 'relative',
-                      display: 'grid',
-                      gridTemplateColumns: !selectedContact?.isAi
-                        ? (micAllowed ? '1fr auto auto auto auto' : '1fr auto auto auto')
-                        : (micAllowed ? '1fr auto auto auto' : '1fr auto auto'),
-                      alignItems: 'end',
-                      gap: 10,
-                      borderRadius: 16,
-                      border: isAiAssistMode && !selectedContact?.isAi
-                        ? '1px solid rgba(255, 196, 241, 0.9)'
-                        : '1px solid rgba(255,255,255,0.5)',
-                      background: isAiAssistMode && !selectedContact?.isAi
-                        ? 'rgba(116, 54, 125, 0.45)'
-                        : 'rgba(255,255,255,0.18)',
-                      backdropFilter: 'blur(8px)',
-                      WebkitBackdropFilter: 'blur(8px)',
-                      padding: '8px 10px',
-                    }}
-                  >
-                    <div style={{ position: 'relative', minHeight: CHAT_INPUT_BASE_HEIGHT, display: 'flex', alignItems: 'center' }}>
-                      {isRecording ? (
-                        <div
-                          style={{
-                            position: 'absolute',
-                            left: 0,
-                            right: 0,
-                            top: '50%',
-                            transform: 'translateY(-50%)',
-                            height: 4,
-                            borderRadius: 999,
-                            background: 'rgba(255,255,255,0.25)',
-                            overflow: 'hidden',
-                          }}
-                        >
-                          <div
-                            style={{
-                              height: '100%',
-                              width: `${Math.min((recordElapsedMs / MAX_RECORD_MS) * 100, 100)}%`,
-                              background: '#79cc63',
-                            transition: 'width 100ms linear',
-                          }}
-                        />
-                      </div>
-                      ) : null}
-                      <textarea
-                        ref={chatInputRef}
-                        rows={1}
-                        value={chatInput}
-                        onChange={(e) => setChatInput(e.target.value)}
-                        onFocus={() => setShowEmojiPicker(false)}
-                        onCompositionStart={() => setIsInputComposing(true)}
-                        onCompositionEnd={() => {
-                          setIsInputComposing(false)
-                          lastCompositionEndAtRef.current = Date.now()
-                        }}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter' && !e.shiftKey) {
-                            const nativeEvent = e.nativeEvent || {}
-                            const keyCode = Number(e.keyCode || nativeEvent.keyCode || nativeEvent.which || 0)
-                            const isImeComposing =
-                              isInputComposing ||
-                              e.isComposing ||
-                              nativeEvent.isComposing ||
-                              keyCode === 229 ||
-                              e.key === 'Process' ||
-                              Date.now() - lastCompositionEndAtRef.current < 40
-                            if (isImeComposing) return
-                            e.preventDefault()
-                            if (!isRecording && !isAwaitingReply && chatInput.trim()) {
-                              e.currentTarget.form?.requestSubmit()
-                            }
-                          }
-                        }}
-                        placeholder={isRecording ? '' : t('Type a message...', '輸入訊息...')}
-                        disabled={isRecording || isAwaitingReply}
-                        style={{
-                          height: CHAT_INPUT_BASE_HEIGHT,
-                          width: '100%',
-                          border: 0,
-                          outline: 'none',
-                          background: 'transparent',
-                          color: isAiAssistMode && !selectedContact?.isAi ? '#ffe9ff' : '#fff',
-                          fontSize: '1rem',
-                          lineHeight: 1.35,
-                          opacity: isRecording ? 0 : 1,
-                          resize: 'none',
-                          boxSizing: 'border-box',
-                          fontFamily: 'inherit',
-                          padding: 0,
-                        }}
-                      />
-                    </div>
-                    {!selectedContact?.isAi ? (
-                      <div
-                        style={{ position: 'relative', alignSelf: 'end', display: 'grid' }}
-                        onMouseEnter={() => setShowAiAssistTooltip(true)}
-                        onMouseLeave={() => setShowAiAssistTooltip(false)}
-                      >
-                        <button
-                          type="button"
-                          disabled={isRecording || isAwaitingReply}
-                          onClick={() => {
-                            setShowAiAssistTooltip(false)
-                            setIsAiAssistMode((v) => !v)
-                          }}
-                          onFocus={() => setShowAiAssistTooltip(true)}
-                          onBlur={() => setShowAiAssistTooltip(false)}
-                          style={{
-                            border: isAiAssistMode ? '1px solid rgba(255, 202, 247, 0.85)' : '1px solid rgba(255,255,255,0.35)',
-                            background: isAiAssistMode ? 'rgba(255, 184, 237, 0.26)' : 'transparent',
-                            color: isAiAssistMode ? '#ffd6f4' : '#fff',
-                            borderRadius: 999,
-                            cursor: isRecording || isAwaitingReply ? 'default' : 'pointer',
-                            display: 'grid',
-                            placeItems: 'center',
-                            width: 28,
-                            height: 28,
-                            opacity: isRecording || isAwaitingReply ? 0.5 : 1,
-                            alignSelf: 'end',
-                          }}
-                          aria-label="Toggle AI mode for this chat"
-                        >
-                          <IconAiSpark />
-                        </button>
-                        {showAiAssistTooltip ? (
-                          <div
-                            style={{
-                              position: 'absolute',
-                              right: 0,
-                              bottom: 40,
-                              width: 'min(360px, 78vw)',
-                              background: 'rgba(59, 35, 88, 0.96)',
-                              border: '1px solid rgba(255,255,255,0.35)',
-                              borderRadius: 12,
-                              padding: '10px 12px',
-                              color: '#ffeaff',
-                              fontSize: 13,
-                              lineHeight: 1.45,
-                              boxShadow: '0 10px 24px rgba(0,0,0,0.28)',
-                              backdropFilter: 'blur(8px)',
-                              WebkitBackdropFilter: 'blur(8px)',
-                              zIndex: 30,
-                              pointerEvents: 'none',
-                            }}
-                          >
-                            <div>
-                              {t(
-                                'Click here to enter AI mode. Your text, voice, and calls will be directed to your AI.',
-                                '點擊這裡可進入 AI 模式。你傳送的文字、語音與通話都會導向你的 AI。',
-                              )}
-                            </div>
-                            <div style={{ marginTop: 6 }}>
-                              {t(
-                                '• AI will automatically understand your conversation with this contact.',
-                                '• AI 會自動理解你與此聯絡人的對話內容。',
-                              )}
-                            </div>
-                            <div>
-                              {t(
-                                '• The other person will not see your conversation with AI.',
-                                '• 對方不會看到你與 AI 的對話。',
-                              )}
-                            </div>
-                          </div>
-                        ) : null}
-                      </div>
-                    ) : null}
-                    {micAllowed ? (
-                      <button
-                        type="button"
-                        disabled={isAwaitingReply}
-                        onClick={() => {
-                          if (isRecording) {
-                            stopRecording()
-                          } else {
-                            startRecording()
-                          }
-                        }}
-                        style={{
-                          border: 0,
-                          background: 'transparent',
-                          color: isAiAssistMode && !selectedContact?.isAi ? '#ffd6f4' : '#fff',
-                          cursor: isAwaitingReply ? 'default' : 'pointer',
-                          display: 'grid',
-                          placeItems: 'center',
-                          opacity: isAwaitingReply ? 0.5 : 1,
-                          alignSelf: 'end',
-                        }}
-                      >
-                        {isRecording ? <IconStop /> : <IconMic />}
-                      </button>
-                    ) : null}
-                    <button
-                      type="button"
-                      disabled={isRecording || isAwaitingReply}
-                      onClick={() => setShowEmojiPicker((v) => !v)}
-                      style={{
-                        border: 0,
-                        background: 'transparent',
-                        color: '#fff',
-                        cursor: isRecording || isAwaitingReply ? 'default' : 'pointer',
-                        display: 'grid',
-                        placeItems: 'center',
-                        opacity: isRecording || isAwaitingReply ? 0.5 : 1,
-                        alignSelf: 'end',
-                      }}
-                    >
-                      <IconEmoji />
-                    </button>
-                    <button
-                      type="submit"
-                      disabled={isRecording || isAwaitingReply}
-                      style={{
-                        border: 0,
-                        background: 'transparent',
-                        color: '#fff',
-                        cursor: isRecording || isAwaitingReply ? 'default' : 'pointer',
-                        display: 'grid',
-                        placeItems: 'center',
-                        opacity: isRecording || isAwaitingReply ? 0.5 : 1,
-                        alignSelf: 'end',
-                      }}
-                    >
-                      <IconSend />
-                    </button>
-                    {showEmojiPicker ? (
-                      <div
-                        style={{
-                          position: 'absolute',
-                          right: 42,
-                          bottom: 52,
-                          background: 'rgba(56, 39, 78, 0.92)',
-                          border: '1px solid rgba(255,255,255,0.3)',
-                          borderRadius: 12,
-                          padding: '8px 10px',
-                          display: 'grid',
-                          gridTemplateColumns: 'repeat(6, 1fr)',
-                          gap: 6,
-                          boxShadow: '0 8px 18px rgba(0,0,0,0.25)',
-                          backdropFilter: 'blur(8px)',
-                          WebkitBackdropFilter: 'blur(8px)',
-                        }}
-                      >
-                        {['😀', '😂', '🥹', '😍', '🙏', '🔥', '✨', '💜', '👍', '🎉', '🤔', '😎'].map((emoji) => (
-                          <button
-                            key={emoji}
-                            type="button"
-                            onClick={() => {
-                              setChatInput((v) => `${v}${emoji}`)
-                              setShowEmojiPicker(false)
-                            }}
-                            style={{
-                              border: 0,
-                              background: 'transparent',
-                              fontSize: 20,
-                              lineHeight: 1,
-                              cursor: 'pointer',
-                            }}
-                          >
-                            {emoji}
-                          </button>
-                        ))}
-                      </div>
-                    ) : null}
-                  </div>
-                </form>
-              </div>
+              conversationPanel
             ) : (
-              <div
-                className="no-scrollbar"
-                onClick={() => setOpenContactMenuId(null)}
-                style={{
-                  height: '100%',
-                  overflowY: 'auto',
-                  scrollbarWidth: 'none',
-                  msOverflowStyle: 'none',
-                  padding: isPadUp ? '0px 24px 0px' : '0px 4px 0px',
-                }}
-              >
-                {contacts.map((contact) => (
-                  <article
-                    key={contact.id}
-                    onMouseEnter={() => setHoveredContactId(contact.id)}
-                    onMouseLeave={() => setHoveredContactId(null)}
-                    onClick={() => {
-                      setOpenContactMenuId(null)
-                      setSelectedContact(contact)
-                      markContactAsRead(contact.id)
-                      loadContactHistory(contact.id)
-                    }}
-                    style={{
-                      display: 'grid',
-                      gridTemplateColumns: isPadUp ? '72px 1fr 36px' : '56px 1fr 34px',
-                      alignItems: 'center',
-                      columnGap: isPadUp ? 12 : 0,
-                      padding: '14px 10px 16px',
-                      borderRadius: 0,
-                      borderBottom: '1px solid rgb(216, 216, 216)',
-                      boxShadow: hoveredContactId === contact.id ? 'rgba(0, 0, 0, 0.45) 0px 17px 20px -20px' : 'none',
-                      transition: 'box-shadow 160ms ease, border-color 160ms ease',
-                      position: 'relative',
-                      marginBottom: 10,
-                      cursor: 'pointer',
-                      pointerEvents: 'auto',
-                    }}
-                  >
-                    <img
-                      src={contact.avatar}
-                      alt={contact.name}
-                    style={{
-                        width: isPadUp ? 64 : 48,
-                        height: isPadUp ? 64 : 48,
-                        borderRadius: '50%',
-                        objectFit: 'cover',
-                      }}
-                    />
-
-                    <div style={{ display: 'grid', alignContent: 'center', minHeight: 64 }}>
-                      <div
-                        style={{
-                          color: '#fff',
-                          fontSize: isPadUp ? '1.5rem' : '1.3rem',
-                          lineHeight: 1.05,
-                          textShadow: '0 2px 8px rgba(41, 10, 57, 0.35)',
-                          cursor: 'pointer',
-                        }}
-                      >
-                        {contact.name}
-                      </div>
-                      {contact.snippet ? (
-                        <div
-                          style={{
-                            marginTop: 4,
-                            color: 'rgba(255,255,255,0.98)',
-                            fontSize: isPadUp ? '1.2rem' : '1rem',
-                            lineHeight: 1.05,
-                            textShadow: '0 2px 8px rgba(41, 10, 57, 0.35)',
-                          }}
-                        >
-                          {contact.snippet}
-                        </div>
-                      ) : null}
-                    </div>
-                    <div style={{ justifySelf: 'end', position: 'relative' }}>
-                      {(unreadByContact[contact.id] || 0) > 0 ? (
-                        <span
-                          style={{
-                            position: 'absolute',
-                            top: -6,
-                            right: 24,
-                            minWidth: 18,
-                            height: 18,
-                            padding: '0 6px',
-                            borderRadius: 999,
-                            background: '#ff4f9a',
-                            color: '#fff',
-                            fontSize: 11,
-                            fontWeight: 700,
-                            display: 'grid',
-                            placeItems: 'center',
-                            boxShadow: '0 2px 8px rgba(0,0,0,0.28)',
-                          }}
-                        >
-                          {unreadByContact[contact.id] > 99 ? '99+' : unreadByContact[contact.id]}
-                        </span>
-                      ) : null}
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          setOpenContactMenuId((prev) => (prev === contact.id ? null : contact.id))
-                        }}
-                        style={{
-                          border: 0,
-                          background: 'transparent',
-                          color: 'rgba(255,255,255,0.92)',
-                          display: 'grid',
-                          placeItems: 'center',
-                          cursor: 'pointer',
-                          padding: 2,
-                          borderRadius: 8,
-                        }}
-                        aria-label={`Open menu for ${contact.name}`}
-                      >
-                        <IconMoreVertical />
-                      </button>
-                      {openContactMenuId === contact.id ? (
-                        <div
-                          onClick={(e) => e.stopPropagation()}
-                          style={{
-                            position: 'absolute',
-                            top: 28,
-                            right: 0,
-                            minWidth: 126,
-                            background: 'rgba(46, 26, 70, 0.94)',
-                            border: '1px solid rgba(255,255,255,0.25)',
-                            borderRadius: 10,
-                            boxShadow: '0 8px 20px rgba(0,0,0,0.25)',
-                            backdropFilter: 'blur(8px)',
-                            WebkitBackdropFilter: 'blur(8px)',
-                            zIndex: 15,
-                            padding: '6px 0',
-                          }}
-                        >
-                          <button
-                            type="button"
-                            onClick={() => onEditContact(contact)}
-                            style={{
-                              width: '100%',
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: 8,
-                              border: 0,
-                              background: 'transparent',
-                              color: '#fff',
-                              cursor: 'pointer',
-                              padding: '8px 12px',
-                              fontSize: 14,
-                              textAlign: 'left',
-                            }}
-                          >
-                            <IconEdit />
-                            <span>{t('Edit', '編輯')}</span>
-                          </button>
-                          {contact.isAi ? null : (
-                            <button
-                              type="button"
-                              onClick={() => onDeleteContact(contact)}
-                              style={{
-                                width: '100%',
-                                display: 'flex',
-                                alignItems: 'center',
-                                gap: 8,
-                                border: 0,
-                                background: 'transparent',
-                                color: '#ffd7e3',
-                                cursor: 'pointer',
-                                padding: '8px 12px',
-                                fontSize: 14,
-                                textAlign: 'left',
-                              }}
-                            >
-                              <IconTrash />
-                              <span>{t('Delete', '刪除')}</span>
-                            </button>
-                          )}
-                        </div>
-                      ) : null}
-                    </div>
-
-                  </article>
-                ))}
-              </div>
+              <ConversationEmptyState locale={isZh ? 'zh-TW' : 'en'} />
             )}
           </div>
           </ChatShell>
@@ -3999,6 +3314,7 @@ function LoginHome() {
             type="button"
             onClick={() => {
               if (!isSignedIn) return
+              selectedContactIdRef.current = ''
               setSelectedContact(null)
             }}
             disabled={!isSignedIn}

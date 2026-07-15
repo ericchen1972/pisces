@@ -36,6 +36,8 @@ MAX_AUDIO_BYTES = 10 * 1024 * 1024
 MAX_AUDIO_BASE64_CHARS = ((MAX_AUDIO_BYTES + 2) // 3) * 4
 MAX_AVATAR_BYTES = 5 * 1024 * 1024
 MAX_AVATAR_BASE64_CHARS = ((MAX_AVATAR_BYTES + 2) // 3) * 4
+MAX_PUBLIC_MEDIA_URL_LENGTH = 2048
+TRUSTED_PUBLIC_MEDIA_HOST_SUFFIX = ".blob.vercel-storage.com"
 app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 
@@ -945,14 +947,32 @@ def upload_audio_to_vercel_blob(user_id, audio_bytes, mime_type="audio/wav"):
     return blob_url
 
 
+def validate_trusted_public_media_url(value):
+    raw = value.strip() if isinstance(value, str) else ""
+    if not raw or len(raw) > MAX_PUBLIC_MEDIA_URL_LENGTH:
+        raise ValueError("must be a trusted Vercel Blob HTTPS URL")
+    try:
+        parsed = urlparse(raw)
+        hostname = (parsed.hostname or "").lower()
+        port = parsed.port
+    except (TypeError, ValueError):
+        raise ValueError("must be a trusted Vercel Blob HTTPS URL") from None
+    trusted = (
+        parsed.scheme == "https"
+        and not parsed.username
+        and not parsed.password
+        and port is None
+        and hostname.endswith(TRUSTED_PUBLIC_MEDIA_HOST_SUFFIX)
+        and parsed.path not in {"", "/"}
+    )
+    if not trusted:
+        raise ValueError("must be a trusted Vercel Blob HTTPS URL")
+    return raw
+
+
 def download_trusted_audio(audio_url, max_bytes=MAX_AUDIO_BYTES):
-    parsed = urlparse(audio_url or "")
-    hostname = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or not hostname.endswith(
-        ".blob.vercel-storage.com"
-    ):
-        raise ValueError("untrusted audio URL")
-    req = request.Request(audio_url, method="GET")
+    trusted_url = validate_trusted_public_media_url(audio_url)
+    req = request.Request(trusted_url, method="GET")
     with request.urlopen(req, timeout=30) as resp:
         audio_bytes = resp.read(max_bytes + 1)
     if not audio_bytes or len(audio_bytes) > max_bytes:
@@ -4348,6 +4368,18 @@ def send_message():
         return jsonify({"ok": False, "error": "recipient_user_id is required"}), 400
     if not text and not image_url and not music_url:
         return jsonify({"ok": False, "error": "text or attachment is required"}), 400
+    for field_name, media_url in (("image_url", image_url), ("music_url", music_url)):
+        if not media_url:
+            continue
+        try:
+            validate_trusted_public_media_url(media_url)
+        except ValueError:
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": f"{field_name} must be a trusted Vercel Blob HTTPS URL",
+                }
+            ), 400
     if sender_user_id == recipient_user_id:
         return jsonify({"ok": False, "error": "cannot send message to yourself"}), 400
 

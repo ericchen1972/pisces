@@ -3442,6 +3442,53 @@ def test_assist_send_preserves_private_roles_recipient_shape_and_ably_payload(
     assert "response" not in failed_receipt
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://store.public.blob.vercel-storage.com/images/a.png",
+        "https://audio.public.blob.vercel-storage.com/audios/a.wav?download=1",
+    ],
+)
+def test_trusted_public_media_url_accepts_existing_vercel_blob_contract(url):
+    assert main.validate_trusted_public_media_url(url) == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://store.public.blob.vercel-storage.com/a.png",
+        "https://user:pass@store.public.blob.vercel-storage.com/a.png",
+        "https://localhost/a.png",
+        "https://127.0.0.1/a.png",
+        "https://store.public.blob.vercel-storage.com.evil.example/a.png",
+        "https://store.public.blob.vercel-storage.com/" + "a" * 2050,
+    ],
+)
+def test_trusted_public_media_url_rejects_untrusted_hosts_and_shapes(url):
+    with pytest.raises(ValueError, match="trusted Vercel Blob HTTPS URL"):
+        main.validate_trusted_public_media_url(url)
+
+
+@pytest.mark.parametrize("field", ["image_url", "music_url"])
+def test_messages_send_rejects_untrusted_attachment_before_storage(
+    signed_in_client, field
+):
+    response = signed_in_client.post(
+        "/api/messages/send",
+        json={
+            "recipient_user_id": "user-b",
+            "text": "",
+            field: "https://evil.example/tracker",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {
+        "ok": False,
+        "error": f"{field} must be a trusted Vercel Blob HTTPS URL",
+    }
+
+
 def test_save_chat_message_returns_firestore_add_document_id(monkeypatch):
     class Collection:
         def add(self, _payload):
