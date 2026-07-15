@@ -2652,7 +2652,17 @@ def replay_direct_delivery(user_id, route_name, request_id, payload_hash, recipi
     stored_payload = receipt.get("ably_payload") or {}
     if stored_payload and not receipt.get("published"):
         client = get_firestore_client()
-        if not accepted_friendship_exists(client, user_id, recipient_user_id):
+        friendship_ref, _pair_key, user_a_id, user_b_id = _friendship_reference(
+            client, user_id, recipient_user_id
+        )
+        friendship_snapshot = friendship_ref.get()
+        current_generation = friendship_generation_token(
+            friendship_snapshot.to_dict() if friendship_snapshot.exists else {}
+        )
+        expected_generation = receipt.get("friendship_generation") or ""
+        if not _is_accepted_friendship_snapshot(
+            friendship_snapshot, user_a_id, user_b_id
+        ) or (expected_generation and current_generation != expected_generation):
             response["realtime_delivered"] = False
         else:
             try:

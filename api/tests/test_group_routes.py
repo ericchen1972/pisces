@@ -1356,6 +1356,38 @@ def test_unpublished_text_replay_does_not_publish_after_friendship_revoked(
     assert published == []
 
 
+@pytest.mark.parametrize("kind", ["text", "voice"])
+def test_unpublished_direct_replay_does_not_cross_friendship_generation(
+    signed_in_client, monkeypatch, kind
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    firestore.seed("friendships/user-a_user-b", user_a_id="user-a", user_b_id="user-b", status="accepted", accepted_at="generation-new")
+    request_id = f"cross-generation-{kind}"
+    route_name = f"direct_{kind}"
+    payload = {"message_id": "old-message", "sender_user_id": "user-a", "recipient_user_id": "user-b", "text": "old" if kind == "text" else ""}
+    if kind == "text":
+        request_body = {"recipient_user_id": "user-b", "text": "old", "request_id": request_id}
+        payload_hash = main.delivery_payload_hash("user-b", {"text": "old", "image_url": "", "music_url": ""})
+        path = "/api/messages/send"
+    else:
+        request_body = {"recipient_user_id": "user-b", "audio_base64": "YQ==", "mime_type": "audio/webm", "request_id": request_id}
+        payload_hash = main.delivery_payload_hash("user-b", {"audio_sha256": main.hashlib.sha256(b"a").hexdigest(), "mime_type": "audio/webm", "duration_seconds": 0.0})
+        path = "/api/messages/send-voice"
+    receipt_id = main.hashlib.sha256(f"{route_name}:{request_id}".encode()).hexdigest()
+    receipt_path = f"users/user-a/delivery_receipts/{receipt_id}"
+    firestore.seed(receipt_path, state="completed", payload_hash=payload_hash, friendship_generation="accepted_at:generation-old", published=False, ably_payload=payload, response={"ok": True, "message": payload})
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    published = []
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *args: published.append(args))
+    response = signed_in_client.post(path, json=request_body)
+    assert response.status_code == 200
+    assert response.get_json()["realtime_delivered"] is False
+    assert published == []
+    assert firestore.read(receipt_path)["published"] is False
+
+
 @pytest.mark.parametrize("publish_succeeds", [True, False])
 def test_unpublished_text_replay_reports_and_records_republish_outcome(
     signed_in_client, monkeypatch, publish_succeeds
