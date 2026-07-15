@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { GoogleGenAI, Modality } from '@google/genai'
 import * as Ably from 'ably'
 import { localeFromLanguage } from './lib/i18n.js'
 import {
@@ -31,6 +30,8 @@ import Composer from './features/chat/Composer.jsx'
 import Conversation from './features/chat/Conversation.jsx'
 import ConversationEmptyState from './features/chat/ConversationEmptyState.jsx'
 import GroupManagerDialog from './features/groups/GroupManagerDialog.jsx'
+import AiCallOverlay from './features/calls/AiCallOverlay.jsx'
+import { useOpenAIRealtime } from './features/calls/useOpenAIRealtime.js'
 import './styles/app-shell.css'
 import './styles/chat.css'
 import './styles/dialogs.css'
@@ -39,8 +40,6 @@ const FALLBACK_API_BASE_URL = 'https://pisces-315346868518.asia-east1.run.app'
 const LOCAL_API_BASE_URL = 'http://127.0.0.1:8080'
 const GOOGLE_CLIENT_ID = '315346868518-os2tf8uc5282bggj40jbpkaltae1phi9.apps.googleusercontent.com'
 const MAX_RECORD_MS = 30000
-const GEMINI_LIVE_GREETING = '請你先開場打招呼，用自然簡短的電話語氣先問候我。'
-const LIVE_CONNECT_TIMEOUT_MS = 20000
 const AI_DEFAULT_GLOBAL_PROMPT = 'You are a polite, warm, and thoughtful AI communication partner.'
 const UI_STORAGE_KEY = 'pisces_ui_v1'
 const AVATAR_SIZE = 256
@@ -388,11 +387,6 @@ function formatTime(seconds) {
   return `${m}:${String(s).padStart(2, '0')}`
 }
 
-function logPhoneLive(...args) {
-  // Keep a single namespace so debugging call flow is easy in DevTools.
-  console.log('[Pisces Live]', ...args)
-}
-
 function loadImageFile(file) {
   return new Promise((resolve, reject) => {
     const image = new Image()
@@ -467,37 +461,6 @@ function blobToBase64(blob) {
     reader.onerror = () => reject(new Error('Failed to read image blob.'))
     reader.readAsDataURL(blob)
   })
-}
-
-function float32ToInt16(float32Array) {
-  const out = new Int16Array(float32Array.length)
-  for (let i = 0; i < float32Array.length; i += 1) {
-    const s = Math.max(-1, Math.min(1, float32Array[i]))
-    out[i] = s < 0 ? s * 32768 : s * 32767
-  }
-  return out
-}
-
-function downsampleBuffer(float32Array, inputRate, outputRate) {
-  if (outputRate >= inputRate) return float32Array
-  const sampleRateRatio = inputRate / outputRate
-  const newLength = Math.round(float32Array.length / sampleRateRatio)
-  const result = new Float32Array(newLength)
-  let offsetResult = 0
-  let offsetBuffer = 0
-  while (offsetResult < result.length) {
-    const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio)
-    let accum = 0
-    let count = 0
-    for (let i = offsetBuffer; i < nextOffsetBuffer && i < float32Array.length; i += 1) {
-      accum += float32Array[i]
-      count += 1
-    }
-    result[offsetResult] = count > 0 ? accum / count : 0
-    offsetResult += 1
-    offsetBuffer = nextOffsetBuffer
-  }
-  return result
 }
 
 function AudioMessagePlayer({ audioUrl, variant = 'user', durationHint = 0 }) {
@@ -678,14 +641,11 @@ function LoginHome() {
   const [defaultContactGroupId, setDefaultContactGroupId] = useState('')
   const [groupManagerOpen, setGroupManagerOpen] = useState(false)
   const [isHistoryLoading, setIsHistoryLoading] = useState(false)
-  const [micAllowed, setMicAllowed] = useState(false)
+  const [micAllowed, setMicAllowed] = useState(() => Boolean(navigator.mediaDevices?.getUserMedia))
   const [isRecording, setIsRecording] = useState(false)
   const [isAwaitingReply, setIsAwaitingReply] = useState(false)
   const [isAiAssistMode, setIsAiAssistMode] = useState(false)
-  const [showPhoneOverlay, setShowPhoneOverlay] = useState(false)
-  const [phone2RotationDeg, setPhone2RotationDeg] = useState(0)
-  const [showPhonePeerAvatar, setShowPhonePeerAvatar] = useState(false)
-  const [phoneLiveStatus, setPhoneLiveStatus] = useState('idle')
+  const [activeCall, setActiveCall] = useState(null)
   const [contacts, setContacts] = useState([
     {
       id: 'pisces-core',
@@ -732,23 +692,6 @@ function LoginHome() {
   const recordChunksRef = useRef([])
   const recordIntervalRef = useRef(null)
   const recordTimeoutRef = useRef(null)
-  const phoneRingAudioRef = useRef(null)
-  const phonePickupAudioRef = useRef(null)
-  const phoneAudioSeqRef = useRef(0)
-  const phoneAvatarTimerRef = useRef(null)
-  const phoneHangupTimersRef = useRef([])
-  const phoneLiveSessionRef = useRef(null)
-  const phoneLiveConnectPromiseRef = useRef(null)
-  const phoneAudioContextRef = useRef(null)
-  const phonePlaybackTimeRef = useRef(0)
-  const phoneMicStreamRef = useRef(null)
-  const phoneMicAudioContextRef = useRef(null)
-  const phoneMicSourceRef = useRef(null)
-  const phoneMicProcessorRef = useRef(null)
-  const phoneLiveContextRef = useRef('')
-  const phoneLiveOperationContextRef = useRef(null)
-  const liveAboutFriendInjectedRef = useRef(new Set())
-  const liveAboutFriendPendingRef = useRef(new Set())
   const recordingOperationRef = useRef(null)
   const aiStreamOperationRef = useRef(null)
   const assistSendOperationRef = useRef(null)
@@ -776,9 +719,13 @@ function LoginHome() {
   const liveOperationScope = liveOperationScopeRef.current
   const aiContactAvatar = contacts.find((c) => c.isAi)?.avatar || '/images/fish.png'
   const aiAvatarForCall = currentUser?.ai_avatar_url || aiContactAvatar || '/images/fish.png'
-  const callPeerAvatarUrl = selectedContact
-    ? (selectedContact.isAi || isAiAssistMode ? aiAvatarForCall : selectedContact.avatar)
-    : aiAvatarForCall
+  const realtimeCall = useOpenAIRealtime({
+    active: Boolean(activeCall),
+    apiBaseUrl,
+    mode: activeCall?.mode || 'ai',
+    contactId: activeCall?.contactId || 'pisces-core',
+    operationScope: liveOperationScope,
+  })
 
   const buildViewMessages = (rawMessages = []) => {
     const view = []
@@ -836,8 +783,7 @@ function LoginHome() {
       recordChunksRef,
       clearTimers: clearRecordingTimers,
     })
-    stopPhoneSounds()
-    void closePhoneLiveSession()
+    realtimeCall.hangUp()
     if (ablyChannelRef.current) {
       try {
         ablyChannelRef.current.unsubscribe()
@@ -886,13 +832,8 @@ function LoginHome() {
     setAddFriendSuccess('')
     setPendingAvatarBlob(null)
     setImageViewerUrl('')
-    setShowPhoneOverlay(false)
-    resetAccountScopedRefs({
-      restoredSelectedContactIdRef,
-      phoneLiveContextRef,
-      liveAboutFriendInjectedRef,
-      liveAboutFriendPendingRef,
-    })
+    setActiveCall(null)
+    resetAccountScopedRefs({ restoredSelectedContactIdRef })
     if (pendingAvatarPreviewUrl) {
       URL.revokeObjectURL(pendingAvatarPreviewUrl)
       setPendingAvatarPreviewUrl('')
@@ -1818,27 +1759,6 @@ function LoginHome() {
     }
   }, [selectedContact?.id, selectedContact?.isAi])
 
-  useEffect(() => {
-    let cancelled = false
-    const askMic = async () => {
-      if (!navigator.mediaDevices?.getUserMedia) {
-        setMicAllowed(false)
-        return
-      }
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-        stream.getTracks().forEach((t) => t.stop())
-        if (!cancelled) setMicAllowed(true)
-      } catch {
-        if (!cancelled) setMicAllowed(false)
-      }
-    }
-    askMic()
-    return () => {
-      cancelled = true
-    }
-  }, [])
-
   const clearRecordingTimers = () => {
     if (recordIntervalRef.current) {
       clearInterval(recordIntervalRef.current)
@@ -1850,577 +1770,29 @@ function LoginHome() {
     }
   }
 
-  const playAudioOnce = async (audioEl) => {
-    if (!audioEl) return
-    audioEl.currentTime = 0
-    await audioEl.play()
-    await new Promise((resolve) => {
-      const done = () => {
-        audioEl.removeEventListener('ended', done)
-        audioEl.removeEventListener('error', done)
-        resolve()
-      }
-      audioEl.addEventListener('ended', done)
-      audioEl.addEventListener('error', done)
+  const openAiCall = () => {
+    if (!selectedContact?.isAi) return
+    setActiveCall({
+      mode: 'ai',
+      contactId: selectedContact.id || 'pisces-core',
+      name: selectedContact.name || 'Convia AI',
+      avatar: aiAvatarForCall,
     })
   }
 
-  const getOrCreatePhoneAudioContext = () => {
-    let ctx = phoneAudioContextRef.current
-    if (!ctx || ctx.state === 'closed') {
-      const AudioCtx = window.AudioContext || window.webkitAudioContext
-      if (!AudioCtx) return null
-      ctx = new AudioCtx()
-      phoneAudioContextRef.current = ctx
-      phonePlaybackTimeRef.current = ctx.currentTime
-    }
-    if (ctx.state === 'suspended') {
-      ctx.resume().catch(() => {})
-    }
-    return ctx
-  }
-
-  const stopPhoneMicStreaming = () => {
-    if (phoneMicProcessorRef.current) {
-      phoneMicProcessorRef.current.disconnect()
-      phoneMicProcessorRef.current.onaudioprocess = null
-      phoneMicProcessorRef.current = null
-    }
-    if (phoneMicSourceRef.current) {
-      phoneMicSourceRef.current.disconnect()
-      phoneMicSourceRef.current = null
-    }
-    if (phoneMicAudioContextRef.current) {
-      const ctx = phoneMicAudioContextRef.current
-      phoneMicAudioContextRef.current = null
-      if (ctx.state !== 'closed') {
-        ctx.close().catch(() => {})
-      }
-    }
-    if (phoneMicStreamRef.current) {
-      phoneMicStreamRef.current.getTracks().forEach((t) => t.stop())
-      phoneMicStreamRef.current = null
-    }
-  }
-
-  const startPhoneMicStreaming = async () => {
-    stopPhoneMicStreaming()
-    const session = phoneLiveSessionRef.current
-    const liveContext = phoneLiveOperationContextRef.current
-    if (!session || !liveOperationScope.isCurrent(liveContext)) return
-
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
+  const openAssistCall = () => {
+    if (!selectedContact || selectedContact.isAi || !isAiAssistMode) return
+    setActiveCall({
+      mode: 'assist',
+      contactId: selectedContact.id,
+      name: 'Convia AI',
+      avatar: aiAvatarForCall,
     })
-    if (!liveOperationScope.isCurrent(liveContext) || phoneLiveSessionRef.current !== session) {
-      stream.getTracks().forEach((track) => track.stop())
-      return
-    }
-    phoneMicStreamRef.current = stream
-
-    const AudioCtx = window.AudioContext || window.webkitAudioContext
-    if (!AudioCtx) {
-      throw new Error('AudioContext is not supported in this browser')
-    }
-
-    const ctx = new AudioCtx()
-    phoneMicAudioContextRef.current = ctx
-    const source = ctx.createMediaStreamSource(stream)
-    phoneMicSourceRef.current = source
-
-    const processor = ctx.createScriptProcessor(2048, 1, 1)
-    phoneMicProcessorRef.current = processor
-
-    processor.onaudioprocess = (event) => {
-      const activeSession = phoneLiveSessionRef.current
-      if (
-        !activeSession
-        || activeSession !== session
-        || !liveOperationScope.isCurrent(liveContext)
-      ) return
-      const input = event.inputBuffer.getChannelData(0)
-      const downsampled = downsampleBuffer(input, ctx.sampleRate, 16000)
-      const pcm16 = float32ToInt16(downsampled)
-      const bytes = new Uint8Array(pcm16.buffer)
-      let binary = ''
-      for (let i = 0; i < bytes.byteLength; i += 1) {
-        binary += String.fromCharCode(bytes[i])
-      }
-      const b64 = btoa(binary)
-      try {
-        activeSession.sendRealtimeInput({
-          audio: {
-            data: b64,
-            mimeType: 'audio/pcm;rate=16000',
-          },
-        })
-      } catch (err) {
-        logPhoneLive('sendRealtimeInput(audio) failed', err)
-      }
-    }
-
-    source.connect(processor)
-    processor.connect(ctx.destination)
-    await ctx.resume().catch(() => {})
-    logPhoneLive('mic streaming started', { sampleRate: ctx.sampleRate })
   }
 
-  const playPcm16Chunk = (base64Data, mimeType = '') => {
-    const ctx = getOrCreatePhoneAudioContext()
-    if (!ctx || !base64Data) return
-
-    const rateMatch = /rate=(\d+)/i.exec(mimeType || '')
-    const sampleRate = rateMatch ? Number(rateMatch[1]) : 24000
-
-    const binary = atob(base64Data)
-    const bytes = new Uint8Array(binary.length)
-    for (let i = 0; i < binary.length; i += 1) {
-      bytes[i] = binary.charCodeAt(i)
-    }
-
-    const sampleCount = Math.floor(bytes.length / 2)
-    if (sampleCount <= 0) return
-    const samples = new Float32Array(sampleCount)
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-    for (let i = 0; i < sampleCount; i += 1) {
-      const s = view.getInt16(i * 2, true)
-      samples[i] = Math.max(-1, Math.min(1, s / 32768))
-    }
-
-    const buffer = ctx.createBuffer(1, sampleCount, sampleRate)
-    buffer.getChannelData(0).set(samples)
-
-    const source = ctx.createBufferSource()
-    source.buffer = buffer
-    source.connect(ctx.destination)
-
-    const when = Math.max(ctx.currentTime + 0.01, phonePlaybackTimeRef.current)
-    source.start(when)
-    phonePlaybackTimeRef.current = when + buffer.duration
-  }
-
-  const closePhoneLiveSession = async () => {
-    const existingSession = phoneLiveSessionRef.current
-    liveOperationScope.invalidate()
-    phoneLiveOperationContextRef.current = null
-    phoneLiveSessionRef.current = null
-    phoneLiveConnectPromiseRef.current = null
-    if (existingSession) {
-      try {
-        existingSession.sendRealtimeInput({ audioStreamEnd: true })
-      } catch {
-        // ignore
-      }
-    }
-    stopPhoneMicStreaming()
-    liveAboutFriendInjectedRef.current.clear()
-    liveAboutFriendPendingRef.current.clear()
-    setPhoneLiveStatus('idle')
-
-    const ctx = phoneAudioContextRef.current
-    phoneAudioContextRef.current = null
-    phonePlaybackTimeRef.current = 0
-    if (ctx && ctx.state !== 'closed') {
-      ctx.close().catch(() => {})
-    }
-
-    try {
-      if (existingSession?.close) {
-        await existingSession.close()
-      }
-    } catch {
-      // ignore close errors
-    }
-  }
-
-  const maybeInjectAboutFriendLiveContext = async (
-    transcriptText,
-    liveContext = phoneLiveOperationContextRef.current,
-  ) => {
-    const normalized = String(transcriptText || '').trim()
-    if (!normalized || !liveOperationScope.isCurrent(liveContext)) return
-    const contactId = selectedContact?.id || 'pisces-core'
-    if (contactId !== 'pisces-core') return
-    const key = normalized.toLowerCase()
-    if (liveAboutFriendInjectedRef.current.has(key) || liveAboutFriendPendingRef.current.has(key)) return
-    const contextOperation = liveOperationScope.fork(liveContext)
-    if (!liveOperationScope.isCurrent(contextOperation)) return
-    liveAboutFriendPendingRef.current.add(key)
-    try {
-      const res = await fetch(`${apiBaseUrl}/api/live/about-friend-context`, {
-        method: 'POST',
-        credentials: 'include',
-        signal: contextOperation.signal,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          transcript: normalized,
-          contact_id: contactId,
-        }),
-      })
-      const data = await res.json().catch(() => ({}))
-      if (!liveOperationScope.isCurrent(contextOperation)) return
-      if (!res.ok || !data?.ok || !data?.matched || !data?.context) return
-      const contextText = String(data.context || '').trim()
-      if (!contextText) return
-      const activeSession = phoneLiveSessionRef.current
-      if (
-        !activeSession
-        || phoneLiveOperationContextRef.current !== liveContext
-        || !liveOperationScope.isCurrent(liveContext)
-      ) return
-      activeSession.sendClientContent({
-        turns: [
-          {
-            role: 'user',
-            parts: [
-              {
-                text:
-                  'Additional background context only. Do not repeat this verbatim. ' +
-                  'Use it to better understand the mentioned contact.\n\n' +
-                  contextText,
-              },
-            ],
-          },
-        ],
-        turnComplete: false,
-      })
-      liveAboutFriendInjectedRef.current.add(key)
-      logPhoneLive('about_friend context injected', {
-        name: data?.name || '',
-        friendName: data?.friend_name || '',
-        contextLength: contextText.length,
-      })
-    } catch (err) {
-      if (!liveOperationScope.isCurrent(contextOperation) || err?.name === 'AbortError') return
-      logPhoneLive('about_friend context request failed', err)
-    } finally {
-      liveOperationScope.runIfCurrent(contextOperation, () => {
-        liveAboutFriendPendingRef.current.delete(key)
-      })
-      liveOperationScope.finish(contextOperation)
-    }
-  }
-
-  const connectPhoneLive = async () => {
-    if (
-      phoneLiveSessionRef.current
-      && liveOperationScope.isCurrent(phoneLiveOperationContextRef.current)
-    ) return true
-    if (phoneLiveSessionRef.current) await closePhoneLiveSession()
-    if (phoneLiveConnectPromiseRef.current) return phoneLiveConnectPromiseRef.current
-    const liveContext = liveOperationScope.begin()
-    phoneLiveOperationContextRef.current = liveContext
-
-    const connectPromise = (async () => {
-      liveOperationScope.runIfCurrent(liveContext, () => setPhoneLiveStatus('connecting'))
-      logPhoneLive('requesting /api/live/token')
-      const tokenRes = await fetch(`${apiBaseUrl}/api/live/token`, {
-        method: 'POST',
-        credentials: 'include',
-        signal: liveContext.signal,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contact_id: selectedContact?.id || 'pisces-core',
-        }),
-      })
-      const tokenData = await tokenRes.json()
-      if (!liveOperationScope.isCurrent(liveContext)) return false
-      logPhoneLive('live token response', { status: tokenRes.status, data: tokenData })
-      if (!tokenRes.ok || !tokenData.ok || !tokenData.token) {
-        throw new Error(tokenData.error || `Live token failed (${tokenRes.status})`)
-      }
-
-      const ai = new GoogleGenAI({
-        apiKey: tokenData.token,
-        httpOptions: { apiVersion: 'v1alpha' },
-      })
-      logPhoneLive('connecting live session', { model: tokenData.model, voice: tokenData.voice_name })
-      const session = await ai.live.connect({
-        model: tokenData.model || 'gemini-live-2.5-flash-preview',
-        config: {
-          responseModalities: [Modality.AUDIO],
-          ...(tokenData.system_prompt
-            ? {
-                systemInstruction: {
-                  parts: [{ text: tokenData.system_prompt }],
-                },
-              }
-            : {}),
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName: tokenData.voice_name || 'Leda',
-              },
-            },
-          },
-        },
-        callbacks: {
-          onopen: () => {
-            if (!liveOperationScope.isCurrent(liveContext)) return
-            setPhoneLiveStatus('connected')
-            logPhoneLive('live session opened')
-          },
-          onmessage: (message) => {
-            if (!liveOperationScope.isCurrent(liveContext)) return
-            logPhoneLive('live message', message)
-            const possibleInputText =
-              message?.serverContent?.inputTranscription?.text ||
-              message?.serverContent?.inputTranscript?.text ||
-              message?.inputTranscription?.text ||
-              message?.inputTranscript?.text ||
-              ''
-            if (possibleInputText) {
-              maybeInjectAboutFriendLiveContext(possibleInputText, liveContext)
-            }
-            const serverContent = message?.serverContent
-            const parts = serverContent?.modelTurn?.parts || []
-            parts.forEach((part) => {
-              const inlineData = part?.inlineData
-              if (!inlineData?.data) return
-              if ((inlineData.mimeType || '').toLowerCase().includes('audio/pcm')) {
-                playPcm16Chunk(inlineData.data, inlineData.mimeType || '')
-              }
-            })
-          },
-          onerror: (evt) => {
-            if (!liveOperationScope.isCurrent(liveContext)) return
-            setPhoneLiveStatus('error')
-            logPhoneLive('live session error', evt)
-          },
-          onclose: (evt) => {
-            if (
-              !liveOperationScope.isCurrent(liveContext)
-              || phoneLiveOperationContextRef.current !== liveContext
-            ) return
-            phoneLiveSessionRef.current = null
-            phoneLiveConnectPromiseRef.current = null
-            phoneLiveContextRef.current = ''
-            liveAboutFriendInjectedRef.current.clear()
-            liveAboutFriendPendingRef.current.clear()
-            setPhoneLiveStatus('closed')
-            stopPhoneMicStreaming()
-            liveOperationScope.invalidate()
-            phoneLiveOperationContextRef.current = null
-            logPhoneLive('live session closed', {
-              code: evt?.code,
-              reason: evt?.reason,
-              wasClean: evt?.wasClean,
-              event: evt,
-            })
-          },
-        },
-      })
-
-      if (!liveOperationScope.isCurrent(liveContext)) {
-        try {
-          await session?.close?.()
-        } catch {
-          // ignore stale late-session close errors
-        }
-        return false
-      }
-
-      phoneLiveContextRef.current = String(tokenData.live_context || '')
-      liveAboutFriendInjectedRef.current.clear()
-      liveAboutFriendPendingRef.current.clear()
-
-      phoneLiveSessionRef.current = session
-      phoneLiveOperationContextRef.current = liveContext
-      setPhoneLiveStatus('connected')
-      return true
-    })()
-
-    phoneLiveConnectPromiseRef.current = connectPromise
-    try {
-      const ok = await connectPromise
-      return ok
-    } catch (err) {
-      liveOperationScope.runIfCurrent(liveContext, () => {
-        phoneLiveSessionRef.current = null
-        phoneLiveOperationContextRef.current = null
-        setPhoneLiveStatus('error')
-      })
-      if (!liveOperationScope.isCurrent(liveContext) || err?.name === 'AbortError') return false
-      throw err
-    } finally {
-      if (phoneLiveConnectPromiseRef.current === connectPromise) {
-        phoneLiveConnectPromiseRef.current = null
-      }
-      liveOperationScope.finish(liveContext)
-    }
-  }
-
-  const startGeminiLiveGreeting = () => {
-    const session = phoneLiveSessionRef.current
-    const liveContext = phoneLiveOperationContextRef.current
-    if (!session || !liveOperationScope.isCurrent(liveContext)) return
-    const contextText = (phoneLiveContextRef.current || '').trim()
-    const greetingText = contextText
-      ? (
-          'Background context only. Do not repeat this verbatim. ' +
-          'Use it to understand speakers, tone, and relationship.\n\n' +
-          contextText +
-          '\n\n' +
-          GEMINI_LIVE_GREETING
-        )
-      : GEMINI_LIVE_GREETING
-    try {
-      session.sendClientContent({
-        turns: [{ role: 'user', parts: [{ text: greetingText }] }],
-        turnComplete: true,
-      })
-      logPhoneLive('live greeting sent', { withContext: Boolean(contextText), contextLength: contextText.length })
-    } catch (err) {
-      logPhoneLive('failed to send live greeting', err)
-    }
-  }
-
-  const clearPhoneUiTimers = () => {
-    if (phoneAvatarTimerRef.current) {
-      clearTimeout(phoneAvatarTimerRef.current)
-      phoneAvatarTimerRef.current = null
-    }
-    if (phoneHangupTimersRef.current.length > 0) {
-      phoneHangupTimersRef.current.forEach((timerId) => clearTimeout(timerId))
-      phoneHangupTimersRef.current = []
-    }
-  }
-
-  const stopPhoneSounds = () => {
-    phoneAudioSeqRef.current += 1
-    clearPhoneUiTimers()
-    const ring = phoneRingAudioRef.current
-    const pickup = phonePickupAudioRef.current
-    if (ring) {
-      ring.pause()
-      ring.currentTime = 0
-    }
-    if (pickup) {
-      pickup.pause()
-      pickup.currentTime = 0
-    }
-  }
-
-  const openPhoneOverlay = async () => {
-    await closePhoneLiveSession()
-    setShowPhoneOverlay(true)
-    setPhone2RotationDeg(0)
-    setShowPhonePeerAvatar(false)
-    stopPhoneSounds()
-
-    const seq = phoneAudioSeqRef.current
-    let liveConnected = false
-    const connectPromise = connectPhoneLive()
-      .then(() => {
-        liveConnected = true
-        return true
-      })
-      .catch((err) => {
-        logPhoneLive('connectPhoneLive failed', err)
-        return false
-      })
-
-    try {
-      await playAudioOnce(phoneRingAudioRef.current)
-      if (seq !== phoneAudioSeqRef.current) return
-
-      let connected = liveConnected
-      if (!connected) {
-        logPhoneLive('ring finished before connected, entering ring loop')
-        const ring = phoneRingAudioRef.current
-        if (ring) {
-          ring.loop = true
-          ring.currentTime = 0
-          ring.play().catch(() => {})
-        }
-        connected = await Promise.race([
-          connectPromise,
-          new Promise((resolve) =>
-            window.setTimeout(() => {
-              logPhoneLive('live connect timeout', { timeoutMs: LIVE_CONNECT_TIMEOUT_MS })
-              resolve(false)
-            }, LIVE_CONNECT_TIMEOUT_MS),
-          ),
-        ])
-        if (ring) {
-          ring.pause()
-          ring.loop = false
-          ring.currentTime = 0
-        }
-      }
-
-      if (seq !== phoneAudioSeqRef.current) {
-        await closePhoneLiveSession()
-        return
-      }
-      if (!connected) {
-        setPhoneLiveStatus('error')
-        logPhoneLive('live not connected, aborting call flow')
-        return
-      }
-
-      logPhoneLive('connected, starting pickup flow')
-      setPhone2RotationDeg(-90)
-      phoneAvatarTimerRef.current = window.setTimeout(() => {
-        setShowPhonePeerAvatar(true)
-        phoneAvatarTimerRef.current = null
-      }, 1000)
-      await playAudioOnce(phonePickupAudioRef.current)
-      if (seq !== phoneAudioSeqRef.current) {
-        await closePhoneLiveSession()
-        return
-      }
-      try {
-        await startPhoneMicStreaming()
-      } catch (err) {
-        logPhoneLive('failed to start mic streaming', err)
-      }
-      logPhoneLive('pickup completed, sending greeting prompt')
-      startGeminiLiveGreeting()
-    } catch {
-      // Browser autoplay or audio decode failures are non-blocking for UI.
-      logPhoneLive('openPhoneOverlay flow failed unexpectedly')
-    }
-  }
-
-  const closePhoneOverlay = async () => {
-    stopPhoneSounds()
-    await closePhoneLiveSession()
-    setShowPhoneOverlay(false)
-    setPhone2RotationDeg(0)
-    setShowPhonePeerAvatar(false)
-  }
-
-  const onPhoneImageClick = () => {
-    const isOffhook = phone2RotationDeg === -90
-    stopPhoneSounds()
-    if (isOffhook) {
-      closePhoneLiveSession().catch(() => {})
-      const pickup = phonePickupAudioRef.current
-      if (pickup) {
-        pickup.currentTime = 0
-        pickup.play().catch(() => {})
-      }
-      const t1 = window.setTimeout(() => {
-        setShowPhonePeerAvatar(false)
-      }, 220)
-      const t2 = window.setTimeout(() => {
-        setPhone2RotationDeg(0)
-      }, 640)
-      const t3 = window.setTimeout(() => {
-        setShowPhoneOverlay(false)
-        setShowPhonePeerAvatar(false)
-      }, 1680)
-      phoneHangupTimersRef.current.push(t1, t2, t3)
-      return
-    }
-    closePhoneLiveSession().catch(() => {})
-    setShowPhoneOverlay(false)
-    setShowPhonePeerAvatar(false)
+  const closePhoneOverlay = () => {
+    realtimeCall.hangUp()
+    setActiveCall(null)
   }
 
   const stopRecording = () => {
@@ -2781,8 +2153,7 @@ function LoginHome() {
         recordChunksRef,
         clearTimers: clearRecordingTimers,
       })
-      stopPhoneSounds()
-      closePhoneLiveSession().catch(() => {})
+      realtimeCall.hangUp()
     }
   }, [])
 
@@ -3042,8 +2413,9 @@ function LoginHome() {
         selectedContactIdRef.current = ''
         setSelectedContact(null)
       }}
-      onCall={openPhoneOverlay}
-      callDisabled={!selectedContact.isAi}
+      onCall={openAiCall}
+      aiAssistMode={isAiAssistMode && !selectedContact.isAi}
+      onAssistCall={openAssistCall}
       onImageClick={setImageViewerUrl}
       renderAudio={({ url, kind, message }) => (
         <AudioMessagePlayer
@@ -3338,22 +2710,23 @@ function LoginHome() {
             type="button"
             onClick={() => {
               if (!isSignedIn || !selectedContact) return
-              openPhoneOverlay()
+              if (selectedContact.isAi) openAiCall()
+              else if (isAiAssistMode) openAssistCall()
             }}
-            disabled={!isSignedIn || !selectedContact}
+            disabled={!isSignedIn || !selectedContact || (!selectedContact.isAi && !isAiAssistMode)}
             style={{
               border: 0,
               background: 'transparent',
               color: 'inherit',
-              cursor: isSignedIn && selectedContact ? 'pointer' : 'default',
+              cursor: isSignedIn && selectedContact && (selectedContact.isAi || isAiAssistMode) ? 'pointer' : 'default',
               display: 'grid',
               placeItems: 'center',
               width: '100%',
               height: '100%',
               padding: 0,
-              opacity: isSignedIn && selectedContact ? 1 : 0.45,
+              opacity: isSignedIn && selectedContact && (selectedContact.isAi || isAiAssistMode) ? 1 : 0.45,
             }}
-            aria-label="Open phone modal"
+            aria-label={selectedContact && !selectedContact.isAi && !isAiAssistMode ? t('Person-to-person calls coming later', '真人通話稍後開放') : t('Start AI voice call', '開始 AI 語音通話')}
           >
             <IconPhone />
           </button>
@@ -4091,89 +3464,21 @@ function LoginHome() {
           </div>
         </div>
       ) : null}
-      {showPhoneOverlay ? (
-        <div
-          onClick={closePhoneOverlay}
-          style={{
-            position: 'fixed',
-            inset: 0,
-            background: 'rgba(6, 5, 12, 0.58)',
-            backdropFilter: 'blur(2px)',
-            WebkitBackdropFilter: 'blur(2px)',
-            zIndex: 50,
-            display: 'grid',
-            placeItems: 'center',
-            padding: 16,
-          }}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              position: 'relative',
-              width: 'min(64vw, 380px)',
-              aspectRatio: '9 / 13',
-              maxWidth: 'calc(100vw - 32px)',
-              maxHeight: 'calc(100vh - 32px)',
-            }}
-          >
-            <img
-              src={callPeerAvatarUrl}
-              alt="Caller avatar"
-              style={{
-                position: 'absolute',
-                top: '14%',
-                left: '50%',
-                transform: 'translateX(-50%)',
-                width: 150,
-                height: 'auto',
-                cursor: 'pointer',
-                filter: 'drop-shadow(rgba(0, 0, 0, 0.36) 0px 10px 20px)',
-                borderRadius: '50%',
-                opacity: showPhonePeerAvatar ? 1 : 0,
-                transition: 'opacity 420ms ease',
-                zIndex: 4,
-              }}
-              onClick={onPhoneImageClick}
-            />
-            <img
-              src="/images/phone1.webp"
-              alt="Phone 1"
-              onClick={onPhoneImageClick}
-              style={{
-                position: 'absolute',
-                top: '40%',
-                left: '50%',
-                transform: 'translateX(-50%)',
-                width: '50%',
-                height: 'auto',
-                cursor: 'pointer',
-                filter: 'drop-shadow(0 10px 20px rgba(0,0,0,0.36))',
-                zIndex: 1,
-              }}
-            />
-            <img
-              src="/images/phone2.webp"
-              alt="Phone 2"
-              onClick={onPhoneImageClick}
-              style={{
-                position: 'absolute',
-                top: '40%',
-                left: '50%',
-                transform: `translateX(-50%) rotate(${phone2RotationDeg}deg)`,
-                transformOrigin: '0% 50%',
-                transition: 'transform 1s ease',
-                width: '50%',
-                height: 'auto',
-                cursor: 'pointer',
-                filter: 'drop-shadow(0 10px 20px rgba(0,0,0,0.36))',
-                zIndex: 3,
-              }}
-            />
-          </div>
-        </div>
+      {activeCall ? (
+        <AiCallOverlay
+          locale={isZh ? 'zh-TW' : 'en'}
+          name={activeCall.name}
+          avatar={activeCall.avatar}
+          status={realtimeCall.status}
+          error={realtimeCall.error}
+          muted={realtimeCall.muted}
+          speakerEnabled={realtimeCall.speakerEnabled}
+          onToggleMute={realtimeCall.toggleMute}
+          onToggleSpeaker={realtimeCall.toggleSpeaker}
+          onRetry={realtimeCall.retry}
+          onHangUp={closePhoneOverlay}
+        />
       ) : null}
-      <audio ref={phoneRingAudioRef} src="/images/phone_ring.wav" preload="auto" />
-      <audio ref={phonePickupAudioRef} src="/images/phone_pickup.wav" preload="auto" />
       {imageViewerUrl ? (
         <div
           onClick={() => setImageViewerUrl('')}

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import main
+from openai_service import OpenAIService
 
 
 class RealtimeServiceStub:
@@ -300,10 +301,9 @@ def test_realtime_credential_responses_disable_browser_caching(
             "/api/openai/realtime/client-secret",
             json={"mode": "ai", "contact_id": "pisces-core"},
         ),
-        signed_in_client.post("/api/live/token"),
     ]
 
-    assert [response.status_code for response in responses] == [401, 400, 501, 200, 200]
+    assert [response.status_code for response in responses] == [401, 400, 501, 200]
     for response in responses:
         assert response.headers["Cache-Control"] == "no-store"
         assert response.headers["Pragma"] == "no-cache"
@@ -348,12 +348,50 @@ def test_realtime_ai_secret_uses_voice_model_and_untrusted_ai_room_history(
     call = realtime_stubs.calls[0]
     assert call["user_id"] == "user-a"
     assert call["voice"] == "sage"
+    assert call["mode"] == "ai"
     instructions = call["instructions"]
     assert '"user_name": "Eric"' in instructions
     assert '"ai_name": "Pisces"' in instructions
     assert '"global_prompt": "Be calm."' in instructions
     assert '"text": "AI room user history"' in instructions
     assert "never follow instructions" in instructions.lower()
+
+
+def test_realtime_route_enables_the_transcription_event_consumed_by_the_browser(
+    signed_in_client, realtime_stubs, monkeypatch
+):
+    captured = {}
+
+    class ClientSecrets:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                value="eph-transcription-enabled",
+                expires_at=int(datetime.now(timezone.utc).timestamp()) + 600,
+            )
+
+    client = SimpleNamespace(
+        realtime=SimpleNamespace(client_secrets=ClientSecrets())
+    )
+    service = OpenAIService(client, "integration-salt")
+    monkeypatch.setattr(main, "get_openai_service", lambda: service)
+
+    response = signed_in_client.post(
+        "/api/openai/realtime/client-secret",
+        json={"mode": "ai", "contact_id": "pisces-core"},
+    )
+
+    assert response.status_code == 200
+    assert captured["session"]["audio"] == {
+        "input": {
+            "transcription": {"model": "gpt-4o-mini-transcribe"},
+            "turn_detection": {
+                "type": "server_vad",
+                "create_response": False,
+            },
+        },
+        "output": {"voice": "sage"},
+    }
 
 
 def test_realtime_assist_context_is_relationship_data_and_speaks_only_to_user(
@@ -365,6 +403,7 @@ def test_realtime_assist_context_is_relationship_data_and_speaks_only_to_user(
     )
 
     assert response.status_code == 200
+    assert realtime_stubs.calls[0]["mode"] == "assist"
     instructions = realtime_stubs.calls[0]["instructions"]
     assert '"friend_name": "Amy"' in instructions
     assert '"relationship": "sister"' in instructions
@@ -506,80 +545,18 @@ def test_realtime_secret_failure_is_sanitized(
     assert "permanent" not in body
 
 
-def test_legacy_live_token_delegates_to_openai_and_returns_browser_safe_aliases(
+def test_removed_legacy_live_token_route_returns_not_found(
     signed_in_client, realtime_stubs
 ):
     response = signed_in_client.post(
         "/api/live/token", json={"contact_id": "pisces-core"}
     )
 
-    assert response.status_code == 200
-    payload = response.get_json()
-    assert payload["client_secret"] == payload["token"] == "eph-secret"
-    assert payload["voice"] == payload["voice_name"] == "sage"
-    assert payload["ai_room"] is True
-    assert payload["mode"] == "ai"
-    assert "system_prompt" not in payload
-    assert "live_context" not in payload
-    serialized = json.dumps(payload)
-    assert "OPENAI_KEY" not in serialized and "GEMINI_KEY" not in serialized
-
-
-def test_legacy_live_token_infers_assist_for_accepted_real_contact(
-    signed_in_client, realtime_stubs
-):
-    response = signed_in_client.post(
-        "/api/live/token", json={"contact_id": "friend-a"}
-    )
-
-    assert response.status_code == 200
-    assert response.get_json()["mode"] == "assist"
-    assert response.get_json()["ai_room"] is False
-    assert '"friend_name": "Amy"' in realtime_stubs.calls[0]["instructions"]
-
-
-def test_legacy_live_token_treats_blank_contact_as_ai_room(
-    signed_in_client, realtime_stubs
-):
-    response = signed_in_client.post("/api/live/token", json={"contact_id": ""})
-
-    assert response.status_code == 200
-    assert response.get_json()["mode"] == "ai"
-    assert response.get_json()["ai_room"] is True
-
-
-def test_legacy_live_token_treats_empty_body_as_ai_room(
-    signed_in_client, realtime_stubs
-):
-    response = signed_in_client.post("/api/live/token")
-
-    assert response.status_code == 200
-    assert response.get_json()["mode"] == "ai"
-    assert response.get_json()["ai_room"] is True
-
-
-@pytest.mark.parametrize("payload", [[], "pisces-core", 7])
-def test_legacy_live_token_rejects_non_object_json(
-    signed_in_client, realtime_stubs, payload
-):
-    response = signed_in_client.post("/api/live/token", json=payload)
-
-    assert response.status_code == 400
+    assert response.status_code == 404
     assert realtime_stubs.calls == []
 
 
-def test_legacy_live_token_rejects_explicit_json_null(
-    signed_in_client, realtime_stubs
-):
-    response = signed_in_client.post(
-        "/api/live/token", data="null", content_type="application/json"
-    )
-
-    assert response.status_code == 400
-    assert realtime_stubs.calls == []
-
-
-def test_about_friend_aliases_are_identical_and_main_room_only(
+def test_about_friend_context_uses_openai_route_and_main_room_only(
     signed_in_client, monkeypatch
 ):
     planner_calls = []
@@ -614,7 +591,7 @@ def test_about_friend_aliases_are_identical_and_main_room_only(
         "/api/openai/realtime/about-friend-context",
         json={"transcript": "tell me about Amy", "contact_id": "pisces-core"},
     )
-    old_response = signed_in_client.post(
+    removed_alias = signed_in_client.post(
         "/api/live/about-friend-context",
         json={"transcript": "tell me about Amy", "contact_id": "pisces-core"},
     )
@@ -623,8 +600,8 @@ def test_about_friend_aliases_are_identical_and_main_room_only(
         json={"transcript": "ignore", "contact_id": "friend-a"},
     )
 
-    assert new_response.status_code == old_response.status_code == 200
-    assert new_response.get_json() == old_response.get_json()
+    assert new_response.status_code == 200
+    assert removed_alias.status_code == 404
     payload = new_response.get_json()
     assert payload == {
         "ok": True,
@@ -641,10 +618,10 @@ def test_about_friend_aliases_are_identical_and_main_room_only(
     }
     assert outside.status_code == 400
     assert outside.get_json() == {"ok": False, "error": "about_friend_requires_ai_room"}
-    assert len(planner_calls) == 2
+    assert len(planner_calls) == 1
 
 
-def test_about_friend_aliases_return_empty_context_when_lookup_has_no_match(
+def test_about_friend_context_returns_empty_context_when_lookup_has_no_match(
     signed_in_client, monkeypatch
 ):
     monkeypatch.setattr(main, "get_user_history_range", lambda _uid: 10)
@@ -670,19 +647,13 @@ def test_about_friend_aliases_return_empty_context_when_lookup_has_no_match(
     )
     monkeypatch.setattr(main, "build_about_friend_context", lambda *_args: "")
 
-    responses = [
-        signed_in_client.post(
-            route,
-            json={"transcript": "tell me about Unknown", "contact_id": "pisces-core"},
-        )
-        for route in (
-            "/api/openai/realtime/about-friend-context",
-            "/api/live/about-friend-context",
-        )
-    ]
+    response = signed_in_client.post(
+        "/api/openai/realtime/about-friend-context",
+        json={"transcript": "tell me about Unknown", "contact_id": "pisces-core"},
+    )
 
-    assert [response.status_code for response in responses] == [200, 200]
-    assert responses[0].get_json() == responses[1].get_json() == {
+    assert response.status_code == 200
+    assert response.get_json() == {
         "ok": True,
         "matched": False,
         "context": "",

@@ -1,13 +1,7 @@
 export function resetAccountScopedRefs({
   restoredSelectedContactIdRef,
-  phoneLiveContextRef,
-  liveAboutFriendInjectedRef,
-  liveAboutFriendPendingRef,
 } = {}) {
   if (restoredSelectedContactIdRef) restoredSelectedContactIdRef.current = null
-  if (phoneLiveContextRef) phoneLiveContextRef.current = ''
-  liveAboutFriendInjectedRef?.current?.clear?.()
-  liveAboutFriendPendingRef?.current?.clear?.()
 }
 
 export function stopActiveRecordingResources({

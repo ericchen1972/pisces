@@ -4,17 +4,11 @@ import { resetAccountScopedRefs, stopActiveRecordingResources } from './accountS
 it('clears all account-bound cache refs on activation or logout', () => {
   const refs = {
     restoredSelectedContactIdRef: { current: 'contact-a' },
-    phoneLiveContextRef: { current: 'private context' },
-    liveAboutFriendInjectedRef: { current: new Set(['topic']) },
-    liveAboutFriendPendingRef: { current: new Set(['pending']) },
   }
 
   resetAccountScopedRefs(refs)
 
   expect(refs.restoredSelectedContactIdRef.current).toBeNull()
-  expect(refs.phoneLiveContextRef.current).toBe('')
-  expect([...refs.liveAboutFriendInjectedRef.current]).toEqual([])
-  expect([...refs.liveAboutFriendPendingRef.current]).toEqual([])
 })
 
 it('invalidates recorder callbacks before stopping active recording resources', async () => {

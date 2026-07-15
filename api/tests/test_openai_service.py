@@ -705,7 +705,7 @@ def test_realtime_uses_typed_client_with_exact_session_and_safety_header():
     service = OpenAIService(client, "server-salt")
 
     result = service.create_realtime_client_secret(
-        user_id="user-a", instructions="Be friendly", voice="marin"
+        user_id="user-a", instructions="Be friendly", voice="marin", mode="ai"
     )
 
     assert result == {"value": "ek_public-client-secret"}
@@ -717,7 +717,16 @@ def test_realtime_uses_typed_client_with_exact_session_and_safety_header():
                 "model": "gpt-realtime-2.1",
                 "instructions": "Be friendly",
                 "reasoning": {"effort": "low"},
-                "audio": {"output": {"voice": "marin"}},
+                "audio": {
+                    "input": {
+                        "transcription": {"model": "gpt-4o-mini-transcribe"},
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "create_response": False,
+                        },
+                    },
+                    "output": {"voice": "marin"},
+                },
                 "max_output_tokens": 2048,
             },
             "extra_headers": {
@@ -725,6 +734,23 @@ def test_realtime_uses_typed_client_with_exact_session_and_safety_header():
             },
         }
     ]
+
+
+def test_realtime_assist_keeps_automatic_server_vad_responses():
+    client = FakeClient()
+    service = OpenAIService(client, "server-salt")
+
+    service.create_realtime_client_secret(
+        user_id="user-a", instructions="Private assist", voice="marin", mode="assist"
+    )
+
+    assert client.client_secrets.calls[0]["session"]["audio"]["input"] == {
+        "transcription": {"model": "gpt-4o-mini-transcribe"},
+        "turn_detection": {
+            "type": "server_vad",
+            "create_response": True,
+        },
+    }
 
 
 def test_realtime_falls_back_to_raw_post_when_typed_resource_is_absent():
@@ -740,7 +766,7 @@ def test_realtime_falls_back_to_raw_post_when_typed_resource_is_absent():
     service = OpenAIService(client, "salt")
 
     assert service.create_realtime_client_secret(
-        user_id="u", instructions="Help", voice="alloy"
+        user_id="u", instructions="Help", voice="alloy", mode="ai"
     ) == {"value": "ek_fallback"}
     assert client.calls == [
         (
@@ -753,7 +779,16 @@ def test_realtime_falls_back_to_raw_post_when_typed_resource_is_absent():
                         "model": "gpt-realtime-2.1",
                         "instructions": "Help",
                         "reasoning": {"effort": "low"},
-                        "audio": {"output": {"voice": "alloy"}},
+                        "audio": {
+                            "input": {
+                                "transcription": {"model": "gpt-4o-mini-transcribe"},
+                                "turn_detection": {
+                                    "type": "server_vad",
+                                    "create_response": False,
+                                },
+                            },
+                            "output": {"voice": "alloy"},
+                        },
                         "max_output_tokens": 2048,
                     }
                 },
@@ -791,7 +826,7 @@ def test_realtime_falls_back_when_typed_create_signature_is_incompatible():
     service = OpenAIService(client, "salt")
 
     assert service.create_realtime_client_secret(
-        user_id="u", instructions="Help", voice="alloy"
+        user_id="u", instructions="Help", voice="alloy", mode="ai"
     ) == {"value": "ek_incompatible_fallback"}
     assert client.client_secrets.calls == []
     assert client.post_calls == [
@@ -805,7 +840,16 @@ def test_realtime_falls_back_when_typed_create_signature_is_incompatible():
                         "model": "gpt-realtime-2.1",
                         "instructions": "Help",
                         "reasoning": {"effort": "low"},
-                        "audio": {"output": {"voice": "alloy"}},
+                        "audio": {
+                            "input": {
+                                "transcription": {"model": "gpt-4o-mini-transcribe"},
+                                "turn_detection": {
+                                    "type": "server_vad",
+                                    "create_response": False,
+                                },
+                            },
+                            "output": {"voice": "alloy"},
+                        },
                         "max_output_tokens": 2048,
                     }
                 },
@@ -845,7 +889,7 @@ def test_realtime_real_sdk_serializes_expiry_and_bounded_session_exactly():
     service = OpenAIService(client, "salt")
 
     result = service.create_realtime_client_secret(
-        user_id="u", instructions="Help", voice="marin"
+        user_id="u", instructions="Help", voice="marin", mode="ai"
     )
 
     assert result.value == "ek_test"
@@ -858,7 +902,16 @@ def test_realtime_real_sdk_serializes_expiry_and_bounded_session_exactly():
                 "model": "gpt-realtime-2.1",
                 "instructions": "Help",
                 "reasoning": {"effort": "low"},
-                "audio": {"output": {"voice": "marin"}},
+                "audio": {
+                    "input": {
+                        "transcription": {"model": "gpt-4o-mini-transcribe"},
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "create_response": False,
+                        },
+                    },
+                    "output": {"voice": "marin"},
+                },
                 "max_output_tokens": 2048,
             },
         },
@@ -892,7 +945,7 @@ def test_realtime_real_sdk_raw_post_returns_dict_and_sends_safety_header():
     service = OpenAIService(RawSDKClient(sdk_client), "salt")
 
     result = service.create_realtime_client_secret(
-        user_id="u", instructions="Help", voice="marin"
+        user_id="u", instructions="Help", voice="marin", mode="ai"
     )
 
     assert result == {"value": "ek_raw", "expires_at": 12345}
@@ -905,7 +958,16 @@ def test_realtime_real_sdk_raw_post_returns_dict_and_sends_safety_header():
                 "model": "gpt-realtime-2.1",
                 "instructions": "Help",
                 "reasoning": {"effort": "low"},
-                "audio": {"output": {"voice": "marin"}},
+                "audio": {
+                    "input": {
+                        "transcription": {"model": "gpt-4o-mini-transcribe"},
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "create_response": False,
+                        },
+                    },
+                    "output": {"voice": "marin"},
+                },
                 "max_output_tokens": 2048,
             },
         },
@@ -920,7 +982,7 @@ def test_service_repr_and_results_do_not_expose_api_key_or_salt():
     service = OpenAIService(client, salt)
 
     result = service.create_realtime_client_secret(
-        user_id="u", instructions="Help", voice="alloy"
+        user_id="u", instructions="Help", voice="alloy", mode="ai"
     )
     exposed_text = repr(service) + repr(result) + str(result)
 

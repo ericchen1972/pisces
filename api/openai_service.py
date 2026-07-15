@@ -274,13 +274,25 @@ class OpenAIService:
         user_id: str,
         instructions: str,
         voice: str,
+        mode: str,
     ) -> Any:
+        if mode not in {"ai", "assist"}:
+            raise ValueError("Realtime mode must be ai or assist")
         session = {
             "type": "realtime",
             "model": self.models.realtime,
             "instructions": instructions,
             "reasoning": {"effort": "low"},
-            "audio": {"output": {"voice": voice}},
+            "audio": {
+                "input": {
+                    "transcription": {"model": self.models.transcription},
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "create_response": mode != "ai",
+                    },
+                },
+                "output": {"voice": voice},
+            },
             "max_output_tokens": 2048,
         }
         expires_after = {"anchor": "created_at", "seconds": 600}

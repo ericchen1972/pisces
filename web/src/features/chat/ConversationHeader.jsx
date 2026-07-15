@@ -1,12 +1,14 @@
 import { useId } from 'react'
-import { PhoneIcon } from '../../components/icons.jsx'
+import { AiVoiceIcon, PhoneIcon } from '../../components/icons.jsx'
 import { ContactAvatar } from './ContactGroup.jsx'
 
-export default function ConversationHeader({ contact, locale = 'en', onBack, onCall, callDisabled = false }) {
+export default function ConversationHeader({ contact, locale = 'en', onBack, onCall, aiAssistMode = false, onAssistCall }) {
+  const callDescriptionId = useId()
   if (!contact) return null
   const zh = locale === 'zh-TW'
-  const callDescriptionId = useId()
-  const personCallDescription = zh ? '真人通話將於稍後開放' : 'Person-to-person calls are coming later'
+  const personCallDescription = zh ? '真人通話稍後開放' : 'Person-to-person calls coming later'
+  const personCallLongDescription = zh ? '真人通話將於稍後開放' : 'Person-to-person calls are coming later'
+  const personCallDisabled = !contact.isAi
   return (
     <header className="conversation-header">
       <button type="button" className="conversation-header__back" onClick={onBack} aria-label={zh ? '返回' : 'Back'}>
@@ -14,10 +16,15 @@ export default function ConversationHeader({ contact, locale = 'en', onBack, onC
       </button>
       <ContactAvatar contact={contact} />
       <div><strong>{contact.name}</strong>{contact.isAi ? <span>Convia AI</span> : null}</div>
-      <button type="button" className="icon-button conversation-header__call" onClick={onCall} disabled={callDisabled} aria-label={zh ? '語音通話' : 'Voice call'} aria-describedby={callDisabled ? callDescriptionId : undefined} title={callDisabled ? personCallDescription : undefined}>
+      {aiAssistMode && !contact.isAi ? (
+        <button type="button" className="icon-button conversation-header__assist-call" onClick={onAssistCall} aria-label={zh ? '開始私人 AI 語音協助' : 'Start private AI voice assist'}>
+          <AiVoiceIcon size={20} />
+        </button>
+      ) : null}
+      <button type="button" className="icon-button conversation-header__call" onClick={onCall} disabled={personCallDisabled} aria-label={personCallDisabled ? personCallDescription : (zh ? '語音通話' : 'Voice call')} aria-describedby={personCallDisabled ? callDescriptionId : undefined} title={personCallDisabled ? personCallLongDescription : undefined}>
         <PhoneIcon size={20} />
       </button>
-      {callDisabled ? <span id={callDescriptionId} className="sr-only">{personCallDescription}</span> : null}
+      {personCallDisabled ? <span id={callDescriptionId} className="sr-only">{personCallLongDescription}</span> : null}
     </header>
   )
 }

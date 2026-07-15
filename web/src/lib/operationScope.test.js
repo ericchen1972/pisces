@@ -44,9 +44,9 @@ it('forks live context work that becomes stale when its live generation resets',
   const connect = liveScope.begin()
   const contextRequest = liveScope.fork(connect)
   const response = deferred()
-  const accountASession = { sendClientContent: vi.fn() }
+  const accountASession = { sendConversationItem: vi.fn() }
   const completion = response.promise.then((context) => {
-    liveScope.runIfCurrent(contextRequest, () => accountASession.sendClientContent(context))
+    liveScope.runIfCurrent(contextRequest, () => accountASession.sendConversationItem(context))
   })
 
   liveScope.invalidate()
@@ -55,7 +55,7 @@ it('forks live context work that becomes stale when its live generation resets',
   await completion
 
   expect(contextRequest.signal.aborted).toBe(true)
-  expect(accountASession.sendClientContent).not.toHaveBeenCalled()
+  expect(accountASession.sendConversationItem).not.toHaveBeenCalled()
 })
 
 it('prevents a queued recorder onstop callback from sending after re-authentication', async () => {

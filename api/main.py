@@ -5103,17 +5103,11 @@ def realtime_credential_response(payload=None, status=200, extra_headers=None):
     return response
 
 
-def parse_realtime_session_body(body, *, infer_legacy_mode=False):
+def parse_realtime_session_body(body):
     if not isinstance(body, dict):
         raise ValueError("JSON object body is required")
     mode_value = body.get("mode")
     contact_value = body.get("contact_id")
-    if infer_legacy_mode and isinstance(contact_value, str) and not contact_value.strip():
-        contact_value = "pisces-core"
-    if infer_legacy_mode and mode_value is None:
-        mode_value = "ai" if contact_value in (None, "", "pisces-core") else "assist"
-    if contact_value is None and infer_legacy_mode:
-        contact_value = "pisces-core"
     if not isinstance(mode_value, str) or not isinstance(contact_value, str):
         raise ValueError("mode and contact_id must be strings")
     mode = mode_value.strip().lower()
@@ -5159,7 +5153,7 @@ def extract_realtime_secret(result):
     return value.strip(), expires_at
 
 
-def create_realtime_session_response(user_id, mode, contact_id, *, legacy_aliases=False):
+def create_realtime_session_response(user_id, mode, contact_id):
     if mode == "peer":
         return {
             "ok": False,
@@ -5215,6 +5209,7 @@ def create_realtime_session_response(user_id, mode, contact_id, *, legacy_aliase
             user_id=user_id,
             instructions=instructions,
             voice=voice,
+            mode=mode,
         )
         client_secret, expires_at = extract_realtime_secret(provider_result)
         payload = {
@@ -5225,14 +5220,6 @@ def create_realtime_session_response(user_id, mode, contact_id, *, legacy_aliase
             "voice": voice,
             "mode": mode,
         }
-        if legacy_aliases:
-            payload.update(
-                {
-                    "token": client_secret,
-                    "voice_name": voice,
-                    "ai_room": mode == "ai",
-                }
-            )
         return payload, 200, {}
     except Exception as exc:
         log_tool_error(
@@ -5265,31 +5252,8 @@ def openai_realtime_client_secret():
     return realtime_credential_response(payload, status, headers)
 
 
-@app.route("/api/live/token", methods=["POST", "OPTIONS"])
-def live_token():
-    if flask_request.method == "OPTIONS":
-        return realtime_credential_response(status=204)
-    auth, auth_error = get_session_auth(required=True)
-    if auth_error:
-        err, status = auth_error
-        return realtime_credential_response(err, status)
-    body = flask_request.get_json(silent=True)
-    if body is None and not flask_request.get_data(cache=True):
-        body = {}
-    try:
-        mode, contact_id = parse_realtime_session_body(body, infer_legacy_mode=True)
-    except ValueError as exc:
-        return realtime_credential_response({"ok": False, "error": str(exc)}, 400)
-    user_id = auth["user_id"]
-    payload, status, headers = create_realtime_session_response(
-        user_id, mode, contact_id, legacy_aliases=True
-    )
-    return realtime_credential_response(payload, status, headers)
-
-
 @app.route("/api/openai/realtime/about-friend-context", methods=["POST", "OPTIONS"])
-@app.route("/api/live/about-friend-context", methods=["POST", "OPTIONS"])
-def live_about_friend_context():
+def openai_realtime_about_friend_context():
     if flask_request.method == "OPTIONS":
         return ("", 204)
     auth, auth_error = get_session_auth(required=True)
