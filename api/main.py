@@ -3150,6 +3150,28 @@ def enqueue_attempt_cleanup_job(
     return cleanup_request_id
 
 
+def _delivery_media_ref_identity(item):
+    if not isinstance(item, dict):
+        return None
+    if item.get("kind") == "public_blob" and item.get("url"):
+        return "public_blob", item["url"]
+    if item.get("kind") == "private_audio" and item.get("artifact_id"):
+        return "private_audio", item["artifact_id"]
+    return None
+
+
+def _receipt_has_active_cleanup_lease(receipt, now):
+    for field in ("lease_expires_at", "publish_lease_expires_at"):
+        expires_at = (receipt or {}).get(field)
+        if not isinstance(expires_at, datetime):
+            continue
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at > now:
+            return True
+    return False
+
+
 def drain_delivery_cleanup_job(
     user_id, route_name, request_id, *, max_refs=None, blob_timeout=30
 ):
@@ -3165,10 +3187,39 @@ def drain_delivery_cleanup_job(
     owner_user_id = (job.get("owner_user_id") or "").strip()
     if owner_user_id and owner_user_id != user_id:
         return False
-    remaining = [
+    original_remaining = [
         dict(item)
         for item in (job.get("owned_media_refs") or [])
         if isinstance(item, dict)
+    ]
+    try:
+        receipt_snapshot = _firestore_call_with_timeout(
+            _delivery_receipt_ref(user_id, route_name, request_id).get,
+            timeout=1,
+        )
+    except Exception:
+        return False
+    receipt = (receipt_snapshot.to_dict() or {}) if receipt_snapshot.exists else None
+    protected_identities = set()
+    if receipt:
+        receipt_state = (receipt.get("state") or "").strip()
+        if receipt_state == "completed":
+            protected_identities = {
+                identity
+                for identity in (
+                    _delivery_media_ref_identity(item)
+                    for item in (receipt.get("owned_media_refs") or [])
+                )
+                if identity is not None
+            }
+        elif receipt_state != "failed" or _receipt_has_active_cleanup_lease(
+            receipt, datetime.now(timezone.utc)
+        ):
+            return False
+    remaining = [
+        item
+        for item in original_remaining
+        if _delivery_media_ref_identity(item) not in protected_identities
     ]
     attempted = 0
     for item in list(remaining):
@@ -3194,34 +3245,24 @@ def drain_delivery_cleanup_job(
         except Exception:
             continue
         remaining.remove(item)
+    if remaining != original_remaining:
         if remaining:
+            values = {
+                **job,
+                "status": "pending",
+                "owned_media_refs": remaining,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            }
             if blob_timeout <= 1:
                 _firestore_call_with_timeout(
-                    cleanup_ref.set,
-                    {
-                        **job,
-                        "status": "pending",
-                        "owned_media_refs": remaining,
-                        "updated_at": firestore.SERVER_TIMESTAMP,
-                    },
-                    timeout=blob_timeout,
+                    cleanup_ref.set, values, timeout=blob_timeout
                 )
             else:
-                cleanup_ref.set(
-                    {
-                        **job,
-                        "status": "pending",
-                        "owned_media_refs": remaining,
-                        "updated_at": firestore.SERVER_TIMESTAMP,
-                    }
-                )
+                cleanup_ref.set(values)
+        elif blob_timeout <= 1:
+            _firestore_call_with_timeout(cleanup_ref.delete, timeout=blob_timeout)
         else:
-            if blob_timeout <= 1:
-                _firestore_call_with_timeout(
-                    cleanup_ref.delete, timeout=blob_timeout
-                )
-            else:
-                cleanup_ref.delete()
+            cleanup_ref.delete()
     return not remaining
 
 

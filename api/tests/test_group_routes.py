@@ -2524,6 +2524,97 @@ def test_ai_outbound_request_boundaries_do_not_directly_loop_media_cleanup():
         assert "delete_private_audio_artifact(" not in source
 
 
+def test_completed_receipt_protects_owned_refs_and_only_deletes_loser_extra(monkeypatch):
+    firestore = FakeFirestoreClient()
+    request_id = "receipt-protect"
+    record_id = main.hashlib.sha256(f"chat_forward:{request_id}".encode()).hexdigest()
+    receipt_path = f"users/user-a/delivery_receipts/{record_id}"
+    cleanup_path = f"users/user-a/delivery_cleanup_jobs/{record_id}"
+    protected = [
+        {"kind": "public_blob", "url": "https://blob/shared.png"},
+        {"kind": "private_audio", "artifact_id": "shared-private"},
+    ]
+    firestore.seed(
+        receipt_path,
+        state="completed",
+        payload_hash="winner-hash",
+        owned_media_refs=protected,
+        response={"ok": True},
+    )
+    firestore.seed(
+        cleanup_path,
+        owner_user_id="user-a",
+        route_name="chat_forward",
+        request_id=request_id,
+        payload_hash="loser-hash",
+        status="pending",
+        owned_media_refs=[
+            *protected,
+            {"kind": "public_blob", "url": "https://blob/loser-1.png"},
+            {"kind": "public_blob", "url": "https://blob/loser-2.png"},
+        ],
+    )
+    calls = []
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(
+        main,
+        "delete_vercel_blob",
+        lambda url, timeout=30: calls.append((url, timeout)),
+    )
+    monkeypatch.setattr(
+        main,
+        "delete_private_audio_artifact",
+        lambda *_args, **_kwargs: pytest.fail("winner private ref must be protected"),
+    )
+
+    main.bounded_delivery_cleanup("user-a", "chat_forward", request_id)
+
+    assert calls == [("https://blob/loser-1.png", 1)]
+    assert firestore.read(cleanup_path)["owned_media_refs"] == [
+        {"kind": "public_blob", "url": "https://blob/loser-2.png"}
+    ]
+
+
+def test_processing_receipt_and_receipt_read_timeout_keep_cleanup_pending(monkeypatch):
+    firestore = FakeFirestoreClient()
+    request_id = "receipt-processing"
+    record_id = main.hashlib.sha256(f"assist_message:{request_id}".encode()).hexdigest()
+    receipt_path = f"users/user-a/delivery_receipts/{record_id}"
+    cleanup_path = f"users/user-a/delivery_cleanup_jobs/{record_id}"
+    refs = [{"kind": "public_blob", "url": "https://blob/pending.png"}]
+    firestore.seed(
+        receipt_path,
+        state="processing",
+        payload_hash="hash-1",
+        lease_expires_at=main.datetime.now(main.timezone.utc) + main.timedelta(minutes=1),
+    )
+    firestore.seed(
+        cleanup_path,
+        owner_user_id="user-a",
+        route_name="assist_message",
+        request_id=request_id,
+        status="pending",
+        owned_media_refs=refs,
+    )
+    calls = []
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(main, "delete_vercel_blob", lambda *_args, **_kwargs: calls.append("delete"))
+
+    assert main.bounded_delivery_cleanup("user-a", "assist_message", request_id) is False
+    assert calls == []
+    assert firestore.read(cleanup_path)["owned_media_refs"] == refs
+
+    class TimeoutReceiptRef:
+        def get(self, timeout=None):
+            assert timeout == 1
+            raise TimeoutError("receipt read deadline")
+
+    monkeypatch.setattr(main, "_delivery_receipt_ref", lambda *_args: TimeoutReceiptRef())
+    assert main.bounded_delivery_cleanup("user-a", "assist_message", request_id) is False
+    assert calls == []
+    assert firestore.read(cleanup_path)["owned_media_refs"] == refs
+
+
 def test_stale_claim_does_not_cleanup_media_when_rollback_reread_confirms_generation(monkeypatch):
     receipt = {
         "state": "completed",

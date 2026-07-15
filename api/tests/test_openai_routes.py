@@ -2654,6 +2654,57 @@ def test_ai_room_forwarding_confirmation_failure_is_sanitized(
     assert "sk-secret-value" not in response.get_data(as_text=True)
 
 
+def test_persist_server_commit_then_client_timeout_does_not_cleanup_durable_media(
+    signed_in_client, forwarding_stubs, monkeypatch
+):
+    service, _saved, _published = forwarding_stubs
+    service.assist_decision = {"send_to_friend": True, "voice": True, "reason": "send"}
+    service.media_decision = {"draw_image": True, "create_music": False}
+    service.composed = {"as_user": False, "message_to_friend": "Hello Amy"}
+    service.text = "Delivery confirmed."
+    monkeypatch.setattr(main, "has_explicit_voice_request", lambda _text: True)
+    monkeypatch.setattr(main, "generate_image_with_gemini", lambda *_args: (b"image", "image/png"))
+    monkeypatch.setattr(main, "upload_image_to_vercel_blob", lambda *_args: "https://blob/durable.png")
+    monkeypatch.setattr(main, "upload_audio_to_vercel_blob", lambda *_args: "https://blob/durable.wav")
+    monkeypatch.setattr(main, "create_private_audio_artifact", lambda *_args: "private-durable")
+    monkeypatch.setattr(
+        main,
+        "delete_vercel_blob",
+        lambda *_args, **_kwargs: pytest.fail("durable public media must be protected"),
+    )
+    monkeypatch.setattr(
+        main,
+        "delete_private_audio_artifact",
+        lambda *_args, **_kwargs: pytest.fail("durable private media must be protected"),
+    )
+    request_id = "commit-timeout-durable"
+    firestore = main.get_firestore_client()
+
+    def commit_then_timeout(**kwargs):
+        receipt_id = main.hashlib.sha256(
+            f"chat_forward:{request_id}".encode()
+        ).hexdigest()
+        firestore.seed(
+            f"users/user-a/delivery_receipts/{receipt_id}",
+            state="completed",
+            payload_hash=kwargs["payload_hash"],
+            response=kwargs["receipt_data"]["response"],
+            owned_media_refs=kwargs["receipt_data"]["owned_media_refs"],
+        )
+        raise TimeoutError("client lost commit acknowledgement")
+
+    monkeypatch.setattr(main, "persist_delivery_once", commit_then_timeout)
+
+    response = signed_in_client.post(
+        "/api/chat",
+        json={"message": "Send Amy a voice message", "request_id": request_id},
+    )
+
+    assert response.status_code == 500
+    cleanup_id = main.hashlib.sha256(f"chat_forward:{request_id}".encode()).hexdigest()
+    assert firestore.read(f"users/user-a/delivery_cleanup_jobs/{cleanup_id}") is None
+
+
 def test_concurrent_delivery_loser_replays_stored_winner_only(
     signed_in_client, forwarding_stubs, monkeypatch
 ):
