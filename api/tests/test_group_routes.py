@@ -27,6 +27,10 @@ class StubContactGroupService:
         self.calls.append(("list_groups", user_id))
         return [{"id": "friends", "name": "Friends", "sort_order": 0}]
 
+    def get_default_group_id(self, user_id):
+        self.calls.append(("get_default_group_id", user_id))
+        return "friends"
+
     def create(self, user_id, name):
         self.calls.append(("create", user_id, name))
 
@@ -56,6 +60,78 @@ def test_contact_group_list_requires_authentication(client):
     assert response.get_json()["ok"] is False
 
 
+def test_contact_group_list_returns_authoritative_default_when_it_is_not_last(
+    signed_in_client, monkeypatch
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", default_contact_group_id="family")
+    firestore.seed(
+        "users/user-a/contact_groups/business",
+        name="Business",
+        normalized_name="business",
+        sort_order=0,
+    )
+    firestore.seed(
+        "users/user-a/contact_groups/family",
+        name="Home",
+        normalized_name="home",
+        sort_order=1,
+    )
+    firestore.seed(
+        "users/user-a/contact_groups/friends",
+        name="Friends",
+        normalized_name="friends",
+        sort_order=2,
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+
+    response = signed_in_client.post("/api/contact-groups/list", json={})
+
+    assert response.status_code == 200
+    assert response.get_json()["default_contact_group_id"] == "family"
+    assert [group["id"] for group in response.get_json()["groups"]] == [
+        "business",
+        "family",
+        "friends",
+    ]
+
+
+def test_delete_response_returns_the_new_authoritative_default_and_groups(
+    signed_in_client, monkeypatch
+):
+    class DefaultChangingService(StubContactGroupService):
+        def __init__(self):
+            super().__init__()
+            self.default_group_id = "source"
+
+        def get_default_group_id(self, user_id):
+            self.calls.append(("get_default_group_id", user_id))
+            return self.default_group_id
+
+        def delete(self, user_id, group_id, move_to_group_id):
+            deletion = super().delete(user_id, group_id, move_to_group_id)
+            self.default_group_id = move_to_group_id
+            return deletion
+
+    service = DefaultChangingService()
+    monkeypatch.setattr(main, "get_contact_group_service", lambda: service)
+
+    response = signed_in_client.post(
+        "/api/contact-groups/delete",
+        json={"group_id": "source", "move_to_group_id": "friends"},
+    )
+
+    assert response.get_json() == {
+        "ok": True,
+        "deletion": {
+            "deleted_group_id": "source",
+            "move_to_group_id": "friends",
+        },
+        "groups": [{"id": "friends", "name": "Friends", "sort_order": 0}],
+        "default_contact_group_id": "friends",
+    }
+
+
 def test_contact_group_bootstrap_uses_session_user_and_locale(
     signed_in_client, monkeypatch
 ):
@@ -70,10 +146,12 @@ def test_contact_group_bootstrap_uses_session_user_and_locale(
     assert response.get_json() == {
         "ok": True,
         "groups": [{"id": "friends", "name": "Friends", "sort_order": 0}],
+        "default_contact_group_id": "friends",
     }
     assert service.calls == [
         ("bootstrap", "user-a", "zh-TW"),
         ("list_groups", "user-a"),
+        ("get_default_group_id", "user-a"),
     ]
 
 
@@ -100,10 +178,12 @@ def test_contact_group_bootstrap_does_not_serialize_server_timestamp(
     assert response.get_json() == {
         "ok": True,
         "groups": [{"id": "new", "created_at": "2026-07-15T10:00:00Z"}],
+        "default_contact_group_id": "friends",
     }
     assert service.calls == [
         ("bootstrap", "user-a", "en-US"),
         ("list_groups", "user-a"),
+        ("get_default_group_id", "user-a"),
     ]
 
 
@@ -146,8 +226,9 @@ def test_all_contact_group_routes_require_authentication(client, path):
             {
                 "ok": True,
                 "groups": [{"id": "friends", "name": "Friends", "sort_order": 0}],
+                "default_contact_group_id": "friends",
             },
-            [("list_groups", "user-a")],
+            [("list_groups", "user-a"), ("get_default_group_id", "user-a")],
         ),
         (
             "/api/contact-groups/create",
@@ -155,8 +236,9 @@ def test_all_contact_group_routes_require_authentication(client, path):
             {
                 "ok": True,
                 "groups": [{"id": "friends", "name": "Friends", "sort_order": 0}],
+                "default_contact_group_id": "friends",
             },
-            [("create", "user-a", "Work"), ("list_groups", "user-a")],
+            [("create", "user-a", "Work"), ("list_groups", "user-a"), ("get_default_group_id", "user-a")],
         ),
         (
             "/api/contact-groups/update",
@@ -164,17 +246,19 @@ def test_all_contact_group_routes_require_authentication(client, path):
             {
                 "ok": True,
                 "groups": [{"id": "friends", "name": "Friends", "sort_order": 0}],
+                "default_contact_group_id": "friends",
             },
             [
                 ("rename", "user-a", "work", "Business"),
                 ("list_groups", "user-a"),
+                ("get_default_group_id", "user-a"),
             ],
         ),
         (
             "/api/contact-groups/reorder",
             {"ordered_group_ids": ["friends", "work"]},
-            {"ok": True, "groups": [{"id": "friends"}, {"id": "work"}]},
-            [("reorder", "user-a", ["friends", "work"])],
+            {"ok": True, "groups": [{"id": "friends"}, {"id": "work"}], "default_contact_group_id": "friends"},
+            [("reorder", "user-a", ["friends", "work"]), ("get_default_group_id", "user-a")],
         ),
         (
             "/api/contact-groups/assign",
@@ -182,8 +266,9 @@ def test_all_contact_group_routes_require_authentication(client, path):
             {
                 "ok": True,
                 "assignment": {"contact_id": "user-b", "group_id": "friends"},
+                "default_contact_group_id": "friends",
             },
-            [("assign", "user-a", "user-b", "friends")],
+            [("assign", "user-a", "user-b", "friends"), ("get_default_group_id", "user-a")],
         ),
         (
             "/api/contact-groups/delete",
@@ -194,8 +279,10 @@ def test_all_contact_group_routes_require_authentication(client, path):
                     "deleted_group_id": "work",
                     "move_to_group_id": "friends",
                 },
+                "groups": [{"id": "friends", "name": "Friends", "sort_order": 0}],
+                "default_contact_group_id": "friends",
             },
-            [("delete", "user-a", "work", "friends")],
+            [("delete", "user-a", "work", "friends"), ("list_groups", "user-a"), ("get_default_group_id", "user-a")],
         ),
     ],
 )

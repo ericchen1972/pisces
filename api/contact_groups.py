@@ -186,6 +186,13 @@ class ContactGroupService:
             key=lambda group: (_integer_sort_order(group.get("sort_order")), group["id"]),
         )
 
+    def get_default_group_id(self, user_id):
+        snapshot = self._user_ref(user_id).get()
+        if not snapshot.exists:
+            return ""
+        value = (snapshot.to_dict() or {}).get("default_contact_group_id")
+        return value.strip() if isinstance(value, str) else ""
+
     def bootstrap(self, user_id, locale):
         specs = seed_group_specs(locale)
         references = [self._groups(user_id).document() for _ in specs]

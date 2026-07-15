@@ -2366,6 +2366,13 @@ def _contact_group_id_list(body):
     return [value.strip() for value in values]
 
 
+def _contact_group_state(service, user_id, groups=None):
+    return {
+        "groups": service.list_groups(user_id) if groups is None else groups,
+        "default_contact_group_id": service.get_default_group_id(user_id),
+    }
+
+
 @app.route("/api/contact-groups/bootstrap", methods=["POST"])
 def bootstrap_contact_groups():
     user_id, auth_error = _contact_group_auth()
@@ -2376,7 +2383,7 @@ def bootstrap_contact_groups():
         locale = _contact_group_string(body, "locale", required=False)
         service = get_contact_group_service()
         service.bootstrap(user_id, locale)
-        return jsonify({"ok": True, "groups": service.list_groups(user_id)})
+        return jsonify({"ok": True, **_contact_group_state(service, user_id)})
     except ContactGroupError as exc:
         error, status = contact_group_error_response(exc)
         return jsonify(error), status
@@ -2389,8 +2396,8 @@ def list_contact_groups():
         return auth_error
     try:
         _contact_group_json_body()
-        groups = get_contact_group_service().list_groups(user_id)
-        return jsonify({"ok": True, "groups": groups})
+        service = get_contact_group_service()
+        return jsonify({"ok": True, **_contact_group_state(service, user_id)})
     except ContactGroupError as exc:
         error, status = contact_group_error_response(exc)
         return jsonify(error), status
@@ -2406,7 +2413,7 @@ def create_contact_group():
         name = _contact_group_string(body, "name")
         service = get_contact_group_service()
         service.create(user_id, name)
-        return jsonify({"ok": True, "groups": service.list_groups(user_id)})
+        return jsonify({"ok": True, **_contact_group_state(service, user_id)})
     except ContactGroupError as exc:
         error, status = contact_group_error_response(exc)
         return jsonify(error), status
@@ -2423,7 +2430,7 @@ def update_contact_group():
         name = _contact_group_string(body, "name")
         service = get_contact_group_service()
         service.rename(user_id, group_id, name)
-        return jsonify({"ok": True, "groups": service.list_groups(user_id)})
+        return jsonify({"ok": True, **_contact_group_state(service, user_id)})
     except ContactGroupError as exc:
         error, status = contact_group_error_response(exc)
         return jsonify(error), status
@@ -2437,10 +2444,11 @@ def reorder_contact_groups():
     try:
         body = _contact_group_json_body()
         ordered_group_ids = _contact_group_id_list(body)
-        groups = get_contact_group_service().reorder(
-            user_id, ordered_group_ids
+        service = get_contact_group_service()
+        groups = service.reorder(user_id, ordered_group_ids)
+        return jsonify(
+            {"ok": True, **_contact_group_state(service, user_id, groups)}
         )
-        return jsonify({"ok": True, "groups": groups})
     except ContactGroupError as exc:
         error, status = contact_group_error_response(exc)
         return jsonify(error), status
@@ -2455,10 +2463,15 @@ def assign_contact_group():
         body = _contact_group_json_body()
         contact_id = _contact_group_string(body, "contact_id")
         group_id = _contact_group_string(body, "group_id")
-        assignment = get_contact_group_service().assign(
-            user_id, contact_id, group_id
+        service = get_contact_group_service()
+        assignment = service.assign(user_id, contact_id, group_id)
+        return jsonify(
+            {
+                "ok": True,
+                "assignment": assignment,
+                "default_contact_group_id": service.get_default_group_id(user_id),
+            }
         )
-        return jsonify({"ok": True, "assignment": assignment})
     except ContactGroupError as exc:
         error, status = contact_group_error_response(exc)
         return jsonify(error), status
@@ -2473,10 +2486,15 @@ def delete_contact_group():
         body = _contact_group_json_body()
         group_id = _contact_group_string(body, "group_id")
         move_to_group_id = _contact_group_string(body, "move_to_group_id")
-        deletion = get_contact_group_service().delete(
-            user_id, group_id, move_to_group_id
+        service = get_contact_group_service()
+        deletion = service.delete(user_id, group_id, move_to_group_id)
+        return jsonify(
+            {
+                "ok": True,
+                "deletion": deletion,
+                **_contact_group_state(service, user_id),
+            }
         )
-        return jsonify({"ok": True, "deletion": deletion})
     except ContactGroupError as exc:
         error, status = contact_group_error_response(exc)
         return jsonify(error), status

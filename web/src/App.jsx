@@ -2,6 +2,24 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { GoogleGenAI, Modality } from '@google/genai'
 import * as Ably from 'ably'
 import { localeFromLanguage } from './lib/i18n.js'
+import {
+  applyContactGroupAssignment,
+  applyDeletedContactGroup,
+  applyLocalThenRefresh,
+  contactGroupStateFromResponse,
+} from './lib/chatState.js'
+import {
+  consumeGuardedRequest,
+  createAuthRequestGuard,
+  createAuthTransitionCoordinator,
+} from './lib/authRequestGuard.js'
+import { resetAccountScopedRefs, stopActiveRecordingResources } from './lib/accountScope.js'
+import { createAccountOperationScope } from './lib/operationScope.js'
+import ChatShell from './features/chat/ChatShell.jsx'
+import ContactSidebar from './features/chat/ContactSidebar.jsx'
+import GroupManagerDialog from './features/groups/GroupManagerDialog.jsx'
+import './styles/app-shell.css'
+import './styles/dialogs.css'
 
 const FALLBACK_API_BASE_URL = 'https://pisces-315346868518.asia-east1.run.app'
 const LOCAL_API_BASE_URL = 'http://127.0.0.1:8080'
@@ -644,6 +662,9 @@ function LoginHome() {
   const [showEmojiPicker, setShowEmojiPicker] = useState(false)
   const [messagesByContact, setMessagesByContact] = useState({})
   const [unreadByContact, setUnreadByContact] = useState({})
+  const [contactGroups, setContactGroups] = useState([])
+  const [defaultContactGroupId, setDefaultContactGroupId] = useState('')
+  const [groupManagerOpen, setGroupManagerOpen] = useState(false)
   const [isHistoryLoading, setIsHistoryLoading] = useState(false)
   const [micAllowed, setMicAllowed] = useState(false)
   const [isRecording, setIsRecording] = useState(false)
@@ -714,13 +735,33 @@ function LoginHome() {
   const phoneMicSourceRef = useRef(null)
   const phoneMicProcessorRef = useRef(null)
   const phoneLiveContextRef = useRef('')
+  const phoneLiveOperationContextRef = useRef(null)
   const liveAboutFriendInjectedRef = useRef(new Set())
   const liveAboutFriendPendingRef = useRef(new Set())
+  const recordingOperationRef = useRef(null)
   const lastCompositionEndAtRef = useRef(0)
   const avatarFileInputRef = useRef(null)
   const chatInputRef = useRef(null)
   const ablyRealtimeRef = useRef(null)
   const ablyChannelRef = useRef(null)
+  const authRequestGuardRef = useRef(null)
+  if (!authRequestGuardRef.current) authRequestGuardRef.current = createAuthRequestGuard()
+  const authRequestGuard = authRequestGuardRef.current
+  const authTransitionCoordinatorRef = useRef(null)
+  if (!authTransitionCoordinatorRef.current) {
+    authTransitionCoordinatorRef.current = createAuthTransitionCoordinator(authRequestGuard)
+  }
+  const authTransitionCoordinator = authTransitionCoordinatorRef.current
+  const accountOperationScopeRef = useRef(null)
+  if (!accountOperationScopeRef.current) {
+    accountOperationScopeRef.current = createAccountOperationScope(authRequestGuard)
+  }
+  const accountOperationScope = accountOperationScopeRef.current
+  const liveOperationScopeRef = useRef(null)
+  if (!liveOperationScopeRef.current) {
+    liveOperationScopeRef.current = createAccountOperationScope(authRequestGuard)
+  }
+  const liveOperationScope = liveOperationScopeRef.current
   const aiContactAvatar = contacts.find((c) => c.isAi)?.avatar || '/images/fish.png'
   const aiAvatarForCall = currentUser?.ai_avatar_url || aiContactAvatar || '/images/fish.png'
   const callPeerAvatarUrl = selectedContact
@@ -777,20 +818,23 @@ function LoginHome() {
     return view
   }
 
-  const clearSessionAndLogout = async () => {
-    try {
-      await fetch(`${apiBaseUrl}/api/auth/logout`, {
-        method: 'POST',
-        credentials: 'include',
-      })
-    } catch {
-      // ignore logout network errors
-    }
+  const resetAccountScopedData = () => {
+    accountOperationScope.invalidate()
+    liveOperationScope.invalidate()
+    recordingOperationRef.current = null
+    stopActiveRecordingResources({
+      mediaRecorderRef,
+      mediaStreamRef,
+      recordChunksRef,
+      clearTimers: clearRecordingTimers,
+    })
+    stopPhoneSounds()
+    void closePhoneLiveSession()
     if (ablyChannelRef.current) {
       try {
         ablyChannelRef.current.unsubscribe()
       } catch {
-        // ignore
+        // ignore stale realtime channel cleanup errors
       }
       ablyChannelRef.current = null
     }
@@ -798,19 +842,27 @@ function LoginHome() {
       try {
         ablyRealtimeRef.current.close()
       } catch {
-        // ignore
+        // ignore stale realtime connection cleanup errors
       }
       ablyRealtimeRef.current = null
     }
-    try {
-      localStorage.removeItem(UI_STORAGE_KEY)
-    } catch {
-      // ignore storage errors
-    }
-    setIsSignedIn(false)
-    setCurrentUser(null)
-    setUnreadByContact({})
+    setContacts([])
     setSelectedContact(null)
+    setMessagesByContact({})
+    setUnreadByContact({})
+    setContactGroups([])
+    setDefaultContactGroupId('')
+    setChatInput('')
+    setShowEmojiPicker(false)
+    setIsAiAssistMode(false)
+    setIsHistoryLoading(false)
+    setIsAwaitingReply(false)
+    setIsRecording(false)
+    setRecordElapsedMs(0)
+    setSettingsSaving(false)
+    setAddFriendSubmitting(false)
+    setIsUploadingAvatar(false)
+    setGroupManagerOpen(false)
     setOpenContactMenuId(null)
     setEditModalOpen(false)
     setSettingsModalOpen(false)
@@ -822,13 +874,41 @@ function LoginHome() {
     setIdentifyCodeInput('')
     setAddFriendError('')
     setAddFriendSuccess('')
-    setTesterModalOpen(false)
-    setTesterError('')
     setPendingAvatarBlob(null)
+    setImageViewerUrl('')
+    setShowPhoneOverlay(false)
+    resetAccountScopedRefs({
+      restoredSelectedContactIdRef,
+      phoneLiveContextRef,
+      liveAboutFriendInjectedRef,
+      liveAboutFriendPendingRef,
+    })
     if (pendingAvatarPreviewUrl) {
       URL.revokeObjectURL(pendingAvatarPreviewUrl)
       setPendingAvatarPreviewUrl('')
     }
+  }
+
+  const clearSessionAndLogout = async () => {
+    authTransitionCoordinator.cancel()
+    resetAccountScopedData()
+    setIsSignedIn(false)
+    setCurrentUser(null)
+    try {
+      await fetch(`${apiBaseUrl}/api/auth/logout`, {
+        method: 'POST',
+        credentials: 'include',
+      })
+    } catch {
+      // ignore logout network errors
+    }
+    try {
+      localStorage.removeItem(UI_STORAGE_KEY)
+    } catch {
+      // ignore storage errors
+    }
+    setTesterModalOpen(false)
+    setTesterError('')
   }
 
   const upsertFriendContact = (friend) => {
@@ -836,27 +916,47 @@ function LoginHome() {
     const nextContact = {
       id: friend.id,
       name: friend.name || friend.display_name || friend.email || 'Friend',
-      avatar: friend.avatar_url || '/images/fish.png',
-      snippet: '',
+      avatar: friend.avatar_url || friend.avatar || '',
+      avatar_url: friend.avatar_url || friend.avatar || '',
+      snippet: friend.last_message_preview || friend.snippet || '',
+      last_message_preview: friend.last_message_preview || friend.snippet || '',
+      last_message_at: friend.last_message_at || null,
+      group_id: friend.group_id || '',
       isAi: false,
     }
     setContacts((prev) => {
       const existingIndex = prev.findIndex((contact) => contact.id === nextContact.id)
       if (existingIndex >= 0) {
         const cloned = [...prev]
-        cloned[existingIndex] = { ...cloned[existingIndex], ...nextContact }
+        const existing = cloned[existingIndex]
+        cloned[existingIndex] = {
+          ...existing,
+          ...nextContact,
+          avatar: nextContact.avatar || existing.avatar || '',
+          avatar_url: nextContact.avatar_url || existing.avatar_url || '',
+          snippet: nextContact.snippet || existing.snippet || '',
+          last_message_preview: nextContact.last_message_preview || existing.last_message_preview || '',
+          last_message_at: nextContact.last_message_at || existing.last_message_at || null,
+          group_id: nextContact.group_id || existing.group_id || defaultContactGroupId || '',
+        }
         return cloned
       }
       const next = [...prev]
+      nextContact.group_id ||= defaultContactGroupId || ''
       next.splice(1, 0, nextContact)
       return next
     })
   }
 
-  const applySignedInUser = (user) => {
+  const applySignedInUser = (user, transition = null) => {
+    if (!user?.id) return null
+    const authContext = transition
+      ? authTransitionCoordinator.complete(transition, user.id)
+      : authRequestGuard.activate(user.id)
+    if (!authContext) return null
+    resetAccountScopedData()
     setCurrentUser(user || null)
     setIsSignedIn(true)
-    setSelectedContact(null)
 
     const fetchedAiSettings = user?.ai_settings || {}
     const nextGender = fetchedAiSettings.gender || 'female'
@@ -866,7 +966,7 @@ function LoginHome() {
     setContacts([
       {
         id: 'pisces-core',
-        name: '💜✨Pisces✨💜',
+        name: 'Convia AI',
         avatar: nextAvatar,
         snippet: '',
         isAi: true,
@@ -875,40 +975,110 @@ function LoginHome() {
         globalPrompt: nextGlobalPrompt,
       },
     ])
+    return authContext
   }
 
-  const loadFriendsList = async (signedInUser) => {
+  const requestContactGroups = async (endpoint, body = {}, authContext = authRequestGuard.snapshot()) => {
+    if (!authContext.userId || !authRequestGuard.isCurrent(authContext)) {
+      return { ok: false, stale: true, groups: [] }
+    }
+    const res = await fetch(`${apiBaseUrl}/api/contact-groups/${endpoint}`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    const data = await res.json()
+    if (!res.ok || !data.ok) throw new Error(data.error || `Contact group request failed (HTTP ${res.status})`)
+    if (!authRequestGuard.isCurrent(authContext)) return { ...data, stale: true }
+    if (Array.isArray(data.groups)) {
+      const state = contactGroupStateFromResponse(data)
+      authRequestGuard.runIfCurrent(authContext, () => setContactGroups(state.groups))
+      authRequestGuard.runIfCurrent(authContext, () => setDefaultContactGroupId(state.defaultContactGroupId))
+    } else if (typeof data.default_contact_group_id === 'string') {
+      authRequestGuard.runIfCurrent(authContext, () => setDefaultContactGroupId(data.default_contact_group_id.trim()))
+    }
+    return data
+  }
+
+  const loadContactGroups = async (signedInUser, { bootstrap = false, authContext = authRequestGuard.snapshot() } = {}) => {
+    if (!signedInUser?.id) return []
+    if (authContext.userId !== signedInUser.id || !authRequestGuard.isCurrent(authContext)) return []
+    const data = await requestContactGroups(bootstrap ? 'bootstrap' : 'list', bootstrap ? { locale: isZh ? 'zh-TW' : 'en' } : {}, authContext)
+    return data.groups || []
+  }
+
+  const loadFriendsList = async (signedInUser, authContext = authRequestGuard.snapshot()) => {
     if (!signedInUser?.id) return
+    if (authContext.userId !== signedInUser.id || !authRequestGuard.isCurrent(authContext)) return false
     try {
       const res = await fetch(`${apiBaseUrl}/api/friends/list`, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
+        body: JSON.stringify({ locale: isZh ? 'zh-TW' : 'en' }),
       })
       const data = await res.json()
       if (!res.ok || !data.ok) {
         throw new Error(data.error || t(`Failed to load friends (HTTP ${res.status})`, `載入好友失敗（HTTP ${res.status}）`))
       }
+      if (!authRequestGuard.isCurrent(authContext)) return false
       const friendContacts = (data.friends || []).map((friend) => ({
         id: friend.id,
         name: friend.name || friend.display_name || 'Friend',
-        avatar: friend.avatar_url || '/images/fish.png',
+        avatar: friend.avatar_url || '',
+        avatar_url: friend.avatar_url || '',
         specialPrompt: friend.special_prompt || '',
         relationship: friend.relationship || '',
         unreadCount: Number(friend.unread_count || 0),
-        snippet: '',
+        snippet: friend.last_message_preview || '',
+        last_message_preview: friend.last_message_preview || '',
+        last_message_at: friend.last_message_at || null,
+        group_id: friend.group_id || '',
         isAi: false,
       }))
-      setContacts((prev) => [prev[0], ...friendContacts])
+      authRequestGuard.runIfCurrent(authContext, () => setContacts((prev) => [prev[0], ...friendContacts]))
       const unreadMap = {}
       friendContacts.forEach((c) => {
         unreadMap[c.id] = Number.isFinite(c.unreadCount) ? Math.max(0, c.unreadCount) : 0
       })
-      setUnreadByContact(unreadMap)
-    } catch {
-      // ignore friend list load errors in UI bootstrap
+      authRequestGuard.runIfCurrent(authContext, () => setUnreadByContact(unreadMap))
+      return true
+    } catch (error) {
+      throw error
     }
+  }
+
+  const initializeContactData = async (signedInUser, { bootstrap = true, authContext = authRequestGuard.snapshot() } = {}) => {
+    if (!signedInUser?.id) return
+    if (authContext.userId !== signedInUser.id || !authRequestGuard.isCurrent(authContext)) return
+    try {
+      await loadContactGroups(signedInUser, { bootstrap, authContext })
+      await loadFriendsList(signedInUser, authContext)
+    } catch {
+      // Keep the signed-in shell usable when a refresh request is temporarily unavailable.
+    }
+  }
+
+  const mutateGroups = async (endpoint, body) => {
+    const authContext = authRequestGuard.snapshot()
+    const data = await requestContactGroups(endpoint, body, authContext)
+    return data.stale ? null : data.groups || []
+  }
+
+  const deleteGroup = async (groupId, moveToGroupId) => {
+    const authContext = authRequestGuard.snapshot()
+    const data = await requestContactGroups('delete', { group_id: groupId, move_to_group_id: moveToGroupId }, authContext)
+    if (data.stale) return null
+    const deletion = data.deletion || { deleted_group_id: groupId, move_to_group_id: moveToGroupId }
+    await applyLocalThenRefresh(
+      () => authRequestGuard.runIfCurrent(authContext, () => setContacts((previous) => applyDeletedContactGroup(previous, deletion.deleted_group_id, deletion.move_to_group_id))),
+      async () => {
+        const refreshed = await loadFriendsList(currentUser, authContext)
+        if (!refreshed) throw new Error('Friend refresh was superseded')
+      },
+    )
+    return data.groups || []
   }
 
   const markContactAsRead = async (contactId) => {
@@ -934,12 +1104,14 @@ function LoginHome() {
       setTesterError('Email is required.')
       return
     }
+    const authTransition = authTransitionCoordinator.begin()
     try {
       setTesterSubmitting(true)
       setTesterError('')
       const res = await fetch(`${apiBaseUrl}/api/auth/tester`, {
         method: 'POST',
         credentials: 'include',
+        signal: authTransition.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, avatar_url: avatarUrl }),
       })
@@ -947,15 +1119,17 @@ function LoginHome() {
       if (!res.ok || !data.ok) {
         throw new Error(data.error || t(`Tester login failed (HTTP ${res.status})`, `測試帳號登入失敗（HTTP ${res.status}）`))
       }
-      applySignedInUser(data.user || null)
-      loadFriendsList(data.user || null)
+      const authContext = applySignedInUser(data.user || null, authTransition)
+      if (!authContext) return
+      initializeContactData(data.user || null, { authContext })
       setTesterModalOpen(false)
       setTesterEmail('')
       setTesterAvatarUrl('')
     } catch (err) {
+      if (err?.name === 'AbortError') return
       setTesterError(err?.message || t('Tester login failed.', '測試帳號登入失敗。'))
     } finally {
-      setTesterSubmitting(false)
+      if (!authTransition.signal.aborted) setTesterSubmitting(false)
     }
   }
 
@@ -970,43 +1144,52 @@ function LoginHome() {
   const saveUserSettings = async (e) => {
     e.preventDefault()
     if (!isSignedIn || !currentUser?.id) return
+    const authContext = authRequestGuard.snapshot()
+    if (!authRequestGuard.isCurrent(authContext) || authContext.userId !== String(currentUser.id)) return
 
     let historyRange = Number.parseInt(historyRangeInput, 10)
     if (!Number.isFinite(historyRange)) historyRange = 30
     if (historyRange < 10) historyRange = 10
     if (historyRange > 60) historyRange = 60
 
-    try {
+    authRequestGuard.runIfCurrent(authContext, () => {
       setSettingsSaving(true)
       setSettingsError('')
-      const res = await fetch(`${apiBaseUrl}/api/user/settings`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          identify_code: identifyCodeInput,
-          history_range: historyRange,
-        }),
-      })
-      const data = await res.json()
-      if (!res.ok || !data.ok) {
-        throw new Error(data.error || `Save failed (HTTP ${res.status})`)
-      }
-      setCurrentUser((prev) =>
-        prev
-          ? {
-              ...prev,
-              identify_code: data?.user?.identify_code || '',
-              history_range: Number(data?.user?.history_range || historyRange),
-            }
-          : prev,
-      )
-      setSettingsModalOpen(false)
-    } catch (err) {
-      setSettingsError(err?.message || 'Failed to save settings.')
-    } finally {
-      setSettingsSaving(false)
-    }
+    })
+    await consumeGuardedRequest({
+      guard: authRequestGuard,
+      context: authContext,
+      request: async () => {
+        const res = await fetch(`${apiBaseUrl}/api/user/settings`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            identify_code: identifyCodeInput,
+            history_range: historyRange,
+          }),
+        })
+        const data = await res.json()
+        if (!res.ok || !data.ok) {
+          throw new Error(data.error || `Save failed (HTTP ${res.status})`)
+        }
+        return data
+      },
+      onSuccess: (data) => {
+        setCurrentUser((prev) =>
+          prev
+            ? {
+                ...prev,
+                identify_code: data?.user?.identify_code || '',
+                history_range: Number(data?.user?.history_range || historyRange),
+              }
+            : prev,
+        )
+        setSettingsModalOpen(false)
+      },
+      onError: (err) => setSettingsError(err?.message || 'Failed to save settings.'),
+      onSettled: () => setSettingsSaving(false),
+    })
   }
 
   const openAddFriendModal = () => {
@@ -1041,6 +1224,7 @@ function LoginHome() {
       return
     }
 
+    const authContext = authRequestGuard.snapshot()
     try {
       setAddFriendSubmitting(true)
       setAddFriendError('')
@@ -1059,16 +1243,18 @@ function LoginHome() {
       if (!res.ok || !data.ok) {
         throw new Error(data.error || t(`Add friend failed (HTTP ${res.status})`, `新增好友失敗（HTTP ${res.status}）`))
       }
+      if (!authRequestGuard.isCurrent(authContext) || authContext.userId !== currentUser.id) return
       const newFriend = data?.friend || {}
       const newContact = {
         id: newFriend.id,
         name: alias || newFriend.display_name || newFriend.email || 'Friend',
-        avatar: newFriend.avatar_url || '/images/fish.png',
+        avatar: newFriend.avatar_url || '',
         snippet: '',
         isAi: false,
       }
       upsertFriendContact(newContact)
-      await loadFriendsList(currentUser)
+      await initializeContactData(currentUser, { bootstrap: false, authContext })
+      if (!authRequestGuard.isCurrent(authContext)) return
       setAddFriendSuccess('')
       setAddFriendError('')
       setFriendEmailInput('')
@@ -1118,43 +1304,46 @@ function LoginHome() {
 
   const loadContactHistory = async (contactId) => {
     if (!isSignedIn || !currentUser?.id || !contactId) return
-    try {
-      setIsHistoryLoading(true)
-      const res = await fetch(`${apiBaseUrl}/api/chat/history`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contact_id: contactId,
-        }),
-      })
-      const data = await res.json()
-      if (!res.ok || !data.ok) {
-        throw new Error(data.error || t(`History load failed (HTTP ${res.status})`, `載入歷史訊息失敗（HTTP ${res.status}）`))
-      }
-      const nextMessages = buildViewMessages(data.messages || [])
-      setMessagesByContact((prev) => ({
-        ...prev,
-        [contactId]: nextMessages,
-      }))
-    } catch (err) {
-      setMessagesByContact((prev) => {
-        const current = prev[contactId] || []
-        return {
-          ...prev,
-          [contactId]: [
-            ...current,
-            {
-              id: `history-err-${Date.now()}`,
-              role: 'ai',
-              text: err?.message || t('Failed to load history.', '載入歷史訊息失敗。'),
-            },
-          ],
+    const authContext = authRequestGuard.snapshot()
+    if (!authRequestGuard.isCurrent(authContext) || authContext.userId !== String(currentUser.id)) return
+    authRequestGuard.runIfCurrent(authContext, () => setIsHistoryLoading(true))
+    await consumeGuardedRequest({
+      guard: authRequestGuard,
+      context: authContext,
+      request: async () => {
+        const res = await fetch(`${apiBaseUrl}/api/chat/history`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contact_id: contactId }),
+        })
+        const data = await res.json()
+        if (!res.ok || !data.ok) {
+          throw new Error(data.error || t(`History load failed (HTTP ${res.status})`, `載入歷史訊息失敗（HTTP ${res.status}）`))
         }
-      })
-    } finally {
-      setIsHistoryLoading(false)
-    }
+        return buildViewMessages(data.messages || [])
+      },
+      onSuccess: (nextMessages) => {
+        setMessagesByContact((prev) => ({ ...prev, [contactId]: nextMessages }))
+      },
+      onError: (err) => {
+        setMessagesByContact((prev) => {
+          const current = prev[contactId] || []
+          return {
+            ...prev,
+            [contactId]: [
+              ...current,
+              {
+                id: `history-err-${Date.now()}`,
+                role: 'ai',
+                text: err?.message || t('Failed to load history.', '載入歷史訊息失敗。'),
+              },
+            ],
+          }
+        })
+      },
+      onSettled: () => setIsHistoryLoading(false),
+    })
   }
 
   const onAliasBlur = () => {
@@ -1170,6 +1359,7 @@ function LoginHome() {
 
   const onSaveContactEdit = async () => {
     if (!editForm) return
+    const authContext = authRequestGuard.snapshot()
     const aliasTrimmed = (editForm.alias || '').trim()
     const nextAlias = aliasTrimmed.length >= 2 ? aliasTrimmed : editForm.aliasOriginal
     const aliasCollision = contacts.some(
@@ -1197,6 +1387,7 @@ function LoginHome() {
           avatarImageBase64 = await blobToBase64(pendingAvatarBlob)
           avatarMimeType = pendingAvatarBlob.type || 'image/webp'
         }
+        if (!authRequestGuard.isCurrent(authContext) || authContext.userId !== currentUser.id) return
 
         const saveRes = await fetch(`${apiBaseUrl}/api/user/ai-settings`, {
           method: 'POST',
@@ -1221,6 +1412,7 @@ function LoginHome() {
         if (!saveRes.ok || !saveData.ok) {
           throw new Error(saveData.error || `Save failed (HTTP ${saveRes.status})`)
         }
+        if (!authRequestGuard.isCurrent(authContext)) return
         nextAvatarUrl = saveData?.user?.ai_avatar_url || nextAvatarUrl
       } catch (err) {
         setAvatarUploadError(err?.message || t('Save failed.', '儲存失敗。'))
@@ -1237,6 +1429,7 @@ function LoginHome() {
 
       try {
         setAvatarUploadError('')
+        if (!authRequestGuard.isCurrent(authContext) || authContext.userId !== currentUser.id) return
         const saveRes = await fetch(`${apiBaseUrl}/api/friend/settings`, {
           method: 'POST',
           credentials: 'include',
@@ -1252,12 +1445,14 @@ function LoginHome() {
         if (!saveRes.ok || !saveData.ok) {
           throw new Error(saveData.error || `Save failed (HTTP ${saveRes.status})`)
         }
+        if (!authRequestGuard.isCurrent(authContext)) return
       } catch (err) {
         setAvatarUploadError(err?.message || t('Save failed.', '儲存失敗。'))
         return
       }
     }
 
+    if (!authRequestGuard.isCurrent(authContext)) return
     setContacts((prev) =>
       prev.map((contact) => {
         if (contact.id !== editForm.id) return contact
@@ -1346,17 +1541,24 @@ function LoginHome() {
 
   useEffect(() => {
     const restore = async () => {
+      const authTransition = authTransitionCoordinator.begin()
+      let activeRestoreContext = authTransition.context
       try {
         const res = await fetch(`${apiBaseUrl}/api/session/me`, {
           method: 'GET',
           credentials: 'include',
+          signal: authTransition.signal,
         })
         const data = await res.json()
         if (res.ok && data?.ok && data?.authenticated && data?.user?.id) {
-          applySignedInUser(data.user)
-          loadFriendsList(data.user)
+          const authContext = applySignedInUser(data.user, authTransition)
+          if (authContext) {
+            activeRestoreContext = authContext
+            initializeContactData(data.user, { authContext })
+          }
         }
-      } catch {
+      } catch (err) {
+        if (err?.name === 'AbortError') return
         // ignore restore errors and continue with defaults
       }
       try {
@@ -1364,7 +1566,9 @@ function LoginHome() {
         if (rawUi) {
           const uiState = JSON.parse(rawUi)
           if (uiState?.selectedContactId) {
-            restoredSelectedContactIdRef.current = uiState.selectedContactId
+            authRequestGuard.runIfCurrent(activeRestoreContext, () => {
+              restoredSelectedContactIdRef.current = uiState.selectedContactId
+            })
           }
         }
       } catch {
@@ -1387,6 +1591,7 @@ function LoginHome() {
         google.accounts.id.initialize({
           client_id: GOOGLE_CLIENT_ID,
           callback: async (response) => {
+            const authTransition = authTransitionCoordinator.begin()
             try {
               setIsLoggingIn(true)
               setGoogleError('')
@@ -1394,6 +1599,7 @@ function LoginHome() {
               const res = await fetch(`${apiBaseUrl}/api/auth/google`, {
                 method: 'POST',
                 credentials: 'include',
+                signal: authTransition.signal,
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ credential: response.credential }),
               })
@@ -1401,12 +1607,14 @@ function LoginHome() {
               if (!res.ok || !data.ok) {
                 throw new Error(data.error || `Google login failed (HTTP ${res.status})`)
               }
-              applySignedInUser(data.user || null)
-              loadFriendsList(data.user || null)
+              const authContext = applySignedInUser(data.user || null, authTransition)
+              if (!authContext) return
+              initializeContactData(data.user || null, { authContext })
             } catch (err) {
+              if (err?.name === 'AbortError') return
               setGoogleError(err?.message || 'Google login failed.')
             } finally {
-              setIsLoggingIn(false)
+              if (!authTransition.signal.aborted) setIsLoggingIn(false)
             }
           },
         })
@@ -1507,9 +1715,17 @@ function LoginHome() {
           },
         })
 
+        realtime.connection.on('connected', () => {
+          const authContext = authRequestGuard.snapshot()
+          if (!isCancelled && authContext.userId === currentUser.id) {
+            initializeContactData(currentUser, { bootstrap: false, authContext })
+          }
+        })
+
+        const subscriptionContext = authRequestGuard.snapshot()
         const channel = realtime.channels.get(`user_${currentUser.id}`)
         channel.subscribe('message.new', (message) => {
-          if (isCancelled) return
+          if (isCancelled || !authRequestGuard.isCurrent(subscriptionContext) || subscriptionContext.userId !== currentUser.id) return
           const payload = message?.data || {}
           const senderId = payload.sender_user_id || ''
           const text = payload.text || ''
@@ -1522,7 +1738,9 @@ function LoginHome() {
           upsertFriendContact({
             id: senderId,
             name: payload.sender_display_name || 'Friend',
-            avatar_url: payload.sender_avatar_url || '/images/fish.png',
+            avatar_url: payload.sender_avatar_url || '',
+            last_message_at: payload.created_at || new Date().toISOString(),
+            last_message_preview: text,
           })
 
           setMessagesByContact((prev) => {
@@ -1705,7 +1923,8 @@ function LoginHome() {
   const startPhoneMicStreaming = async () => {
     stopPhoneMicStreaming()
     const session = phoneLiveSessionRef.current
-    if (!session) return
+    const liveContext = phoneLiveOperationContextRef.current
+    if (!session || !liveOperationScope.isCurrent(liveContext)) return
 
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -1714,6 +1933,10 @@ function LoginHome() {
         autoGainControl: true,
       },
     })
+    if (!liveOperationScope.isCurrent(liveContext) || phoneLiveSessionRef.current !== session) {
+      stream.getTracks().forEach((track) => track.stop())
+      return
+    }
     phoneMicStreamRef.current = stream
 
     const AudioCtx = window.AudioContext || window.webkitAudioContext
@@ -1731,7 +1954,11 @@ function LoginHome() {
 
     processor.onaudioprocess = (event) => {
       const activeSession = phoneLiveSessionRef.current
-      if (!activeSession) return
+      if (
+        !activeSession
+        || activeSession !== session
+        || !liveOperationScope.isCurrent(liveContext)
+      ) return
       const input = event.inputBuffer.getChannelData(0)
       const downsampled = downsampleBuffer(input, ctx.sampleRate, 16000)
       const pcm16 = float32ToInt16(downsampled)
@@ -1795,6 +2022,10 @@ function LoginHome() {
 
   const closePhoneLiveSession = async () => {
     const existingSession = phoneLiveSessionRef.current
+    liveOperationScope.invalidate()
+    phoneLiveOperationContextRef.current = null
+    phoneLiveSessionRef.current = null
+    phoneLiveConnectPromiseRef.current = null
     if (existingSession) {
       try {
         existingSession.sendRealtimeInput({ audioStreamEnd: true })
@@ -1803,16 +2034,6 @@ function LoginHome() {
       }
     }
     stopPhoneMicStreaming()
-
-    try {
-      if (existingSession?.close) {
-        await existingSession.close()
-      }
-    } catch {
-      // ignore close errors
-    }
-    phoneLiveSessionRef.current = null
-    phoneLiveConnectPromiseRef.current = null
     liveAboutFriendInjectedRef.current.clear()
     liveAboutFriendPendingRef.current.clear()
     setPhoneLiveStatus('idle')
@@ -1823,20 +2044,34 @@ function LoginHome() {
     if (ctx && ctx.state !== 'closed') {
       ctx.close().catch(() => {})
     }
+
+    try {
+      if (existingSession?.close) {
+        await existingSession.close()
+      }
+    } catch {
+      // ignore close errors
+    }
   }
 
-  const maybeInjectAboutFriendLiveContext = async (transcriptText) => {
+  const maybeInjectAboutFriendLiveContext = async (
+    transcriptText,
+    liveContext = phoneLiveOperationContextRef.current,
+  ) => {
     const normalized = String(transcriptText || '').trim()
-    if (!normalized) return
+    if (!normalized || !liveOperationScope.isCurrent(liveContext)) return
     const contactId = selectedContact?.id || 'pisces-core'
     if (contactId !== 'pisces-core') return
     const key = normalized.toLowerCase()
     if (liveAboutFriendInjectedRef.current.has(key) || liveAboutFriendPendingRef.current.has(key)) return
+    const contextOperation = liveOperationScope.fork(liveContext)
+    if (!liveOperationScope.isCurrent(contextOperation)) return
     liveAboutFriendPendingRef.current.add(key)
     try {
       const res = await fetch(`${apiBaseUrl}/api/live/about-friend-context`, {
         method: 'POST',
         credentials: 'include',
+        signal: contextOperation.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           transcript: normalized,
@@ -1844,11 +2079,16 @@ function LoginHome() {
         }),
       })
       const data = await res.json().catch(() => ({}))
+      if (!liveOperationScope.isCurrent(contextOperation)) return
       if (!res.ok || !data?.ok || !data?.matched || !data?.context) return
       const contextText = String(data.context || '').trim()
       if (!contextText) return
       const activeSession = phoneLiveSessionRef.current
-      if (!activeSession) return
+      if (
+        !activeSession
+        || phoneLiveOperationContextRef.current !== liveContext
+        || !liveOperationScope.isCurrent(liveContext)
+      ) return
       activeSession.sendClientContent({
         turns: [
           {
@@ -1872,28 +2112,40 @@ function LoginHome() {
         contextLength: contextText.length,
       })
     } catch (err) {
+      if (!liveOperationScope.isCurrent(contextOperation) || err?.name === 'AbortError') return
       logPhoneLive('about_friend context request failed', err)
     } finally {
-      liveAboutFriendPendingRef.current.delete(key)
+      liveOperationScope.runIfCurrent(contextOperation, () => {
+        liveAboutFriendPendingRef.current.delete(key)
+      })
+      liveOperationScope.finish(contextOperation)
     }
   }
 
   const connectPhoneLive = async () => {
-    if (phoneLiveSessionRef.current) return true
+    if (
+      phoneLiveSessionRef.current
+      && liveOperationScope.isCurrent(phoneLiveOperationContextRef.current)
+    ) return true
+    if (phoneLiveSessionRef.current) await closePhoneLiveSession()
     if (phoneLiveConnectPromiseRef.current) return phoneLiveConnectPromiseRef.current
+    const liveContext = liveOperationScope.begin()
+    phoneLiveOperationContextRef.current = liveContext
 
     const connectPromise = (async () => {
-      setPhoneLiveStatus('connecting')
+      liveOperationScope.runIfCurrent(liveContext, () => setPhoneLiveStatus('connecting'))
       logPhoneLive('requesting /api/live/token')
       const tokenRes = await fetch(`${apiBaseUrl}/api/live/token`, {
         method: 'POST',
         credentials: 'include',
+        signal: liveContext.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contact_id: selectedContact?.id || 'pisces-core',
         }),
       })
       const tokenData = await tokenRes.json()
+      if (!liveOperationScope.isCurrent(liveContext)) return false
       logPhoneLive('live token response', { status: tokenRes.status, data: tokenData })
       if (!tokenRes.ok || !tokenData.ok || !tokenData.token) {
         throw new Error(tokenData.error || `Live token failed (${tokenRes.status})`)
@@ -1925,10 +2177,12 @@ function LoginHome() {
         },
         callbacks: {
           onopen: () => {
+            if (!liveOperationScope.isCurrent(liveContext)) return
             setPhoneLiveStatus('connected')
             logPhoneLive('live session opened')
           },
           onmessage: (message) => {
+            if (!liveOperationScope.isCurrent(liveContext)) return
             logPhoneLive('live message', message)
             const possibleInputText =
               message?.serverContent?.inputTranscription?.text ||
@@ -1937,7 +2191,7 @@ function LoginHome() {
               message?.inputTranscript?.text ||
               ''
             if (possibleInputText) {
-              maybeInjectAboutFriendLiveContext(possibleInputText)
+              maybeInjectAboutFriendLiveContext(possibleInputText, liveContext)
             }
             const serverContent = message?.serverContent
             const parts = serverContent?.modelTurn?.parts || []
@@ -1950,14 +2204,24 @@ function LoginHome() {
             })
           },
           onerror: (evt) => {
+            if (!liveOperationScope.isCurrent(liveContext)) return
             setPhoneLiveStatus('error')
             logPhoneLive('live session error', evt)
           },
           onclose: (evt) => {
-            if (phoneLiveSessionRef.current) {
-              setPhoneLiveStatus('closed')
-            }
+            if (
+              !liveOperationScope.isCurrent(liveContext)
+              || phoneLiveOperationContextRef.current !== liveContext
+            ) return
+            phoneLiveSessionRef.current = null
+            phoneLiveConnectPromiseRef.current = null
+            phoneLiveContextRef.current = ''
+            liveAboutFriendInjectedRef.current.clear()
+            liveAboutFriendPendingRef.current.clear()
+            setPhoneLiveStatus('closed')
             stopPhoneMicStreaming()
+            liveOperationScope.invalidate()
+            phoneLiveOperationContextRef.current = null
             logPhoneLive('live session closed', {
               code: evt?.code,
               reason: evt?.reason,
@@ -1968,11 +2232,21 @@ function LoginHome() {
         },
       })
 
+      if (!liveOperationScope.isCurrent(liveContext)) {
+        try {
+          await session?.close?.()
+        } catch {
+          // ignore stale late-session close errors
+        }
+        return false
+      }
+
       phoneLiveContextRef.current = String(tokenData.live_context || '')
       liveAboutFriendInjectedRef.current.clear()
       liveAboutFriendPendingRef.current.clear()
 
       phoneLiveSessionRef.current = session
+      phoneLiveOperationContextRef.current = liveContext
       setPhoneLiveStatus('connected')
       return true
     })()
@@ -1982,18 +2256,25 @@ function LoginHome() {
       const ok = await connectPromise
       return ok
     } catch (err) {
-      phoneLiveSessionRef.current = null
-      phoneLiveConnectPromiseRef.current = null
-      setPhoneLiveStatus('error')
+      liveOperationScope.runIfCurrent(liveContext, () => {
+        phoneLiveSessionRef.current = null
+        phoneLiveOperationContextRef.current = null
+        setPhoneLiveStatus('error')
+      })
+      if (!liveOperationScope.isCurrent(liveContext) || err?.name === 'AbortError') return false
       throw err
     } finally {
-      phoneLiveConnectPromiseRef.current = null
+      if (phoneLiveConnectPromiseRef.current === connectPromise) {
+        phoneLiveConnectPromiseRef.current = null
+      }
+      liveOperationScope.finish(liveContext)
     }
   }
 
   const startGeminiLiveGreeting = () => {
     const session = phoneLiveSessionRef.current
-    if (!session) return
+    const liveContext = phoneLiveOperationContextRef.current
+    if (!session || !liveOperationScope.isCurrent(liveContext)) return
     const contextText = (phoneLiveContextRef.current || '').trim()
     const greetingText = contextText
       ? (
@@ -2174,9 +2455,21 @@ function LoginHome() {
   const startRecording = async () => {
     if (isRecording || isAwaitingReply || !selectedContact || !micAllowed) return
     if (!window.MediaRecorder || !navigator.mediaDevices?.getUserMedia) return
+    const recordingOperation = accountOperationScope.beginExclusive(recordingOperationRef)
+    if (!recordingOperation) return
+    const runIfRecordingCurrent = (callback) => {
+      if (!accountOperationScope.isOwner(recordingOperation, recordingOperationRef)) return undefined
+      return callback()
+    }
+    let acquiredStream = null
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      acquiredStream = stream
+      if (!accountOperationScope.publishOwned(recordingOperation, recordingOperationRef, stream)) {
+        accountOperationScope.releaseOwner(recordingOperation, recordingOperationRef)
+        return
+      }
       const preferredMimeTypes = [
         'audio/webm;codecs=opus',
         'audio/webm',
@@ -2191,23 +2484,36 @@ function LoginHome() {
       mediaRecorderRef.current = recorder
 
       recorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) {
+        if (
+          accountOperationScope.isOwner(recordingOperation, recordingOperationRef)
+          && event.data
+          && event.data.size > 0
+        ) {
           recordChunksRef.current.push(event.data)
         }
       }
 
       recorder.onstop = async () => {
         const recordedDurationSeconds = Math.max(0, (Date.now() - startedAt) / 1000)
-        const chunks = recordChunksRef.current
-        if (mediaStreamRef.current) {
+        const ownsRecording = recordingOperationRef.current === recordingOperation
+        const chunks = ownsRecording ? recordChunksRef.current : []
+        if (ownsRecording && mediaStreamRef.current) {
           mediaStreamRef.current.getTracks().forEach((t) => t.stop())
         }
-        mediaStreamRef.current = null
-        mediaRecorderRef.current = null
-        recordChunksRef.current = []
-        clearRecordingTimers()
-        setIsRecording(false)
-        setRecordElapsedMs(0)
+        if (ownsRecording) {
+          mediaStreamRef.current = null
+          mediaRecorderRef.current = null
+          recordChunksRef.current = []
+          clearRecordingTimers()
+        }
+        if (!accountOperationScope.isOwner(recordingOperation, recordingOperationRef)) {
+          accountOperationScope.releaseOwner(recordingOperation, recordingOperationRef)
+          return
+        }
+        runIfRecordingCurrent(() => {
+          setIsRecording(false)
+          setRecordElapsedMs(0)
+        })
 
         if (chunks.length > 0) {
           const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' })
@@ -2217,35 +2523,38 @@ function LoginHome() {
           const isAssistVoiceFlow = isAiAssistMode && contactId !== 'pisces-core'
           const typingId = `vt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
           const assistTempId = `assist-v-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
-          setMessagesByContact((prev) => {
-            const current = prev[contactId] || []
-            return {
-              ...prev,
-              [contactId]: [
-                ...current,
-                { id: audioMessageId, role: 'user', audioUrl, audioDuration: recordedDurationSeconds },
-                ...(isAssistVoiceFlow
-                  ? [
-                      {
-                        id: assistTempId,
-                        role: 'assist_group',
-                        groupId: assistTempId,
-                        collapsed: false,
-                        userText: '',
-                        aiText: '...',
-                        aiAudioUrl: '',
-                      },
-                    ]
-                  : shouldUseAiVoiceFlow
-                    ? [{ id: typingId, role: 'ai-typing', text: '...' }]
-                    : []),
-              ],
-            }
+          runIfRecordingCurrent(() => {
+            setMessagesByContact((prev) => {
+              const current = prev[contactId] || []
+              return {
+                ...prev,
+                [contactId]: [
+                  ...current,
+                  { id: audioMessageId, role: 'user', audioUrl, audioDuration: recordedDurationSeconds },
+                  ...(isAssistVoiceFlow
+                    ? [
+                        {
+                          id: assistTempId,
+                          role: 'assist_group',
+                          groupId: assistTempId,
+                          collapsed: false,
+                          userText: '',
+                          aiText: '...',
+                          aiAudioUrl: '',
+                        },
+                      ]
+                    : shouldUseAiVoiceFlow
+                      ? [{ id: typingId, role: 'ai-typing', text: '...' }]
+                      : []),
+                ],
+              }
+            })
+            setIsAwaitingReply(true)
           })
-          setIsAwaitingReply(true)
 
           try {
             const arrayBuffer = await blob.arrayBuffer()
+            if (!accountOperationScope.isOwner(recordingOperation, recordingOperationRef)) return
             const bytes = new Uint8Array(arrayBuffer)
             let binary = ''
             for (let i = 0; i < bytes.length; i += 1) {
@@ -2257,6 +2566,7 @@ function LoginHome() {
               const res = await fetch(`${apiBaseUrl}/api/messages/send-voice`, {
                 method: 'POST',
                 credentials: 'include',
+                signal: recordingOperation.signal,
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                   recipient_user_id: contactId,
@@ -2266,10 +2576,11 @@ function LoginHome() {
                 }),
               })
               const data = await res.json()
+              if (!accountOperationScope.isOwner(recordingOperation, recordingOperationRef)) return
               if (!res.ok || !data.ok) {
                 throw new Error(data.error || `Send failed (${res.status})`)
               }
-              setMessagesByContact((prev) => {
+              runIfRecordingCurrent(() => setMessagesByContact((prev) => {
                 const current = prev[contactId] || []
                 return {
                   ...prev,
@@ -2284,11 +2595,12 @@ function LoginHome() {
                       : m,
                   ),
                 }
-              })
+              }))
             } else if (isAssistVoiceFlow) {
               const sttRes = await fetch(`${apiBaseUrl}/api/speech/transcribe`, {
                 method: 'POST',
                 credentials: 'include',
+                signal: recordingOperation.signal,
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                   audio_base64: audioBase64,
@@ -2296,6 +2608,7 @@ function LoginHome() {
                 }),
               })
               const sttData = await sttRes.json()
+              if (!accountOperationScope.isOwner(recordingOperation, recordingOperationRef)) return
               if (!sttRes.ok || !sttData.ok || !sttData.transcript) {
                 throw new Error(sttData.error || `Speech-to-text failed (${sttRes.status})`)
               }
@@ -2303,6 +2616,7 @@ function LoginHome() {
               const res = await fetch(`${apiBaseUrl}/api/assist/message`, {
                 method: 'POST',
                 credentials: 'include',
+                signal: recordingOperation.signal,
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                   contact_id: contactId,
@@ -2310,6 +2624,7 @@ function LoginHome() {
                 }),
               })
               const data = await res.json()
+              if (!accountOperationScope.isOwner(recordingOperation, recordingOperationRef)) return
               if (!res.ok || !data.ok) {
                 throw new Error(data.error || `Assist failed (${res.status})`)
               }
@@ -2319,7 +2634,7 @@ function LoginHome() {
                 : assist.audio_base64 && assist.audio_mime_type
                   ? `data:${assist.audio_mime_type};base64,${assist.audio_base64}`
                   : ''
-              setMessagesByContact((prev) => {
+              runIfRecordingCurrent(() => setMessagesByContact((prev) => {
                 const current = prev[contactId] || []
                 return {
                   ...prev,
@@ -2337,11 +2652,12 @@ function LoginHome() {
                       : m,
                   ),
                 }
-              })
+              }))
             } else {
               const res = await fetch(`${apiBaseUrl}/api/voice-chat`, {
                 method: 'POST',
                 credentials: 'include',
+                signal: recordingOperation.signal,
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                   audio_base64: audioBase64,
@@ -2350,6 +2666,7 @@ function LoginHome() {
                 }),
               })
               const data = await res.json()
+              if (!accountOperationScope.isOwner(recordingOperation, recordingOperationRef)) return
               const aiText = res.ok && data.reply ? data.reply : data.error || `Request failed (${res.status})`
               const aiAudioUrl =
                 res.ok && data.audio_base64
@@ -2358,7 +2675,7 @@ function LoginHome() {
               const aiImageUrl = res.ok ? (data.image_url || '') : ''
               const aiMusicUrl = res.ok ? (data.music_url || '') : ''
 
-              setMessagesByContact((prev) => {
+              runIfRecordingCurrent(() => setMessagesByContact((prev) => {
                 const current = prev[contactId] || []
                 return {
                   ...prev,
@@ -2375,11 +2692,11 @@ function LoginHome() {
                       : m,
                   ),
                 }
-              })
+              }))
             }
           } catch (err) {
             const errText = err?.message || 'Voice chat request failed.'
-            setMessagesByContact((prev) => {
+            runIfRecordingCurrent(() => setMessagesByContact((prev) => {
               const current = prev[contactId] || []
               if (isAssistVoiceFlow) {
                 return {
@@ -2408,30 +2725,59 @@ function LoginHome() {
                   { id: `e-${Date.now()}`, role: 'peer', text: errText },
                 ],
               }
-            })
+            }))
           } finally {
-            setIsAwaitingReply(false)
+            runIfRecordingCurrent(() => setIsAwaitingReply(false))
+            accountOperationScope.releaseOwner(recordingOperation, recordingOperationRef)
           }
+        } else {
+          accountOperationScope.releaseOwner(recordingOperation, recordingOperationRef)
         }
       }
 
+      if (!accountOperationScope.isOwner(recordingOperation, recordingOperationRef)) {
+        recorder.ondataavailable = null
+        recorder.onstop = null
+        stream.getTracks().forEach((track) => track.stop())
+        accountOperationScope.releaseOwner(recordingOperation, recordingOperationRef)
+        return
+      }
       recorder.start()
-      setChatInput('')
-      resetChatInputHeight()
-      setIsRecording(true)
-      setRecordElapsedMs(0)
-      setShowEmojiPicker(false)
+      runIfRecordingCurrent(() => {
+        setChatInput('')
+        resetChatInputHeight()
+        setIsRecording(true)
+        setRecordElapsedMs(0)
+        setShowEmojiPicker(false)
+      })
 
       recordIntervalRef.current = setInterval(() => {
-        setRecordElapsedMs(Math.min(Date.now() - startedAt, MAX_RECORD_MS))
+        runIfRecordingCurrent(() => {
+          setRecordElapsedMs(Math.min(Date.now() - startedAt, MAX_RECORD_MS))
+        })
       }, 100)
       recordTimeoutRef.current = setTimeout(() => {
-        stopRecording()
+        if (accountOperationScope.isOwner(recordingOperation, recordingOperationRef)) stopRecording()
       }, MAX_RECORD_MS)
     } catch {
-      setMicAllowed(false)
-      setIsRecording(false)
-      setRecordElapsedMs(0)
+      const ownsRecording = accountOperationScope.isOwner(recordingOperation, recordingOperationRef)
+      if (ownsRecording) {
+        stopActiveRecordingResources({
+          mediaRecorderRef,
+          mediaStreamRef,
+          recordChunksRef,
+          clearTimers: clearRecordingTimers,
+        })
+      }
+      if (acquiredStream && mediaStreamRef.current !== acquiredStream) {
+        acquiredStream.getTracks().forEach((track) => track.stop())
+      }
+      if (ownsRecording) {
+        setMicAllowed(false)
+        setIsRecording(false)
+        setRecordElapsedMs(0)
+      }
+      accountOperationScope.releaseOwner(recordingOperation, recordingOperationRef)
     }
   }
 
@@ -2447,49 +2793,91 @@ function LoginHome() {
 
   useEffect(() => {
     return () => {
-      clearRecordingTimers()
+      accountOperationScope.invalidate()
+      recordingOperationRef.current = null
+      stopActiveRecordingResources({
+        mediaRecorderRef,
+        mediaStreamRef,
+        recordChunksRef,
+        clearTimers: clearRecordingTimers,
+      })
       stopPhoneSounds()
       closePhoneLiveSession().catch(() => {})
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        mediaRecorderRef.current.stop()
-      }
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current.getTracks().forEach((t) => t.stop())
-      }
     }
   }, [])
+
+  const selectContactFromSidebar = (contact) => {
+    if (!contact?.id) return
+    setSelectedContact(contact)
+    markContactAsRead(contact.id)
+    loadContactHistory(contact.id)
+  }
+
+  const contactSidebar = (
+    <ContactSidebar
+      locale={isZh ? 'zh-TW' : 'en'}
+      groups={contactGroups}
+      contacts={contacts}
+      unreadByContact={unreadByContact}
+      defaultGroupId={defaultContactGroupId}
+      selectedContactId={selectedContact?.id || ''}
+      currentUser={currentUser}
+      onAddFriend={openAddFriendModal}
+      onSelectContact={selectContactFromSidebar}
+      onOpenSettings={openSettingsModal}
+      onManageGroups={() => setGroupManagerOpen(true)}
+      onMoveContact={async (contact, groupId) => {
+        const authContext = authRequestGuard.snapshot()
+        try {
+          const data = await requestContactGroups('assign', { contact_id: contact.id, group_id: groupId }, authContext)
+          if (data.stale) return
+          const assignment = data.assignment || { contact_id: contact.id, group_id: groupId }
+          await applyLocalThenRefresh(
+            () => authRequestGuard.runIfCurrent(authContext, () => setContacts((previous) => applyContactGroupAssignment(previous, assignment.contact_id, assignment.group_id))),
+            async () => {
+              const refreshed = await loadFriendsList(currentUser, authContext)
+              if (!refreshed) throw new Error('Friend refresh was superseded')
+            },
+          )
+        } catch {
+          // The assignment endpoint failed before an authoritative local update.
+        }
+      }}
+    />
+  )
 
   return (
     <main
       style={{
         height: '100dvh',
         display: 'grid',
-        placeItems: 'center',
+        placeItems: isSignedIn ? 'stretch' : 'center',
         boxSizing: 'border-box',
         overflow: 'hidden',
-        padding: 'max(8px, min(2vh, 18px)) 12px',
-        fontFamily: 'Avenir Next, Montserrat, Helvetica Neue, sans-serif',
+        padding: isSignedIn ? 0 : 'max(8px, min(2vh, 18px)) 12px',
+        background: isSignedIn ? '#212121' : undefined,
+        fontFamily: 'ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
       }}
     >
       <section
         style={{
-          width: 'min(92vw, 720px)',
-          height: 'min(96dvh, 980px)',
-          maxHeight: '96dvh',
-          borderRadius: 46,
-          border: '2px solid rgba(255,255,255,0.55)',
+          width: isSignedIn ? '100%' : 'min(92vw, 720px)',
+          height: isSignedIn ? '100dvh' : 'min(96dvh, 980px)',
+          maxHeight: isSignedIn ? '100dvh' : '96dvh',
+          borderRadius: isSignedIn ? 0 : 46,
+          border: isSignedIn ? 0 : '2px solid rgba(255,255,255,0.55)',
           display: 'grid',
-          gridTemplateRows: isSignedIn ? '56px 1fr 92px' : '56px 1fr auto 92px',
-          background: 'linear-gradient(165deg, rgba(255,255,255,0.24), rgba(255,255,255,0.1))',
-          backdropFilter: 'blur(18px) saturate(140%)',
-          WebkitBackdropFilter: 'blur(18px) saturate(140%)',
-          boxShadow: '0 22px 80px rgba(57, 6, 82, 0.4)',
+          gridTemplateRows: isSignedIn ? '1fr' : '56px 1fr auto 92px',
+          background: isSignedIn ? '#212121' : 'linear-gradient(165deg, rgba(255,255,255,0.24), rgba(255,255,255,0.1))',
+          backdropFilter: isSignedIn ? 'none' : 'blur(18px) saturate(140%)',
+          WebkitBackdropFilter: isSignedIn ? 'none' : 'blur(18px) saturate(140%)',
+          boxShadow: isSignedIn ? 'none' : '0 22px 80px rgba(57, 6, 82, 0.4)',
           overflow: 'hidden',
         }}
       >
         <div
           style={{
-            display: 'flex',
+            display: isSignedIn ? 'none' : 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
             padding: '14px 18px 0',
@@ -2542,7 +2930,8 @@ function LoginHome() {
         </div>
 
         {isSignedIn ? (
-          <div style={{ padding: '8px 10px 0', minHeight: 0 }}>
+          <ChatShell sidebar={contactSidebar} locale={isZh ? 'zh-TW' : 'en'}>
+          <div style={{ padding: isPadUp ? '8px 18px 0' : '50px 10px 0', minHeight: 0, height: '100%', boxSizing: 'border-box' }}>
             <style>{`
               .no-scrollbar::-webkit-scrollbar { display: none; }
               @keyframes typingDot {
@@ -2837,27 +3226,35 @@ function LoginHome() {
                     const contactId = selectedContact.id
                     const userMessageId = `u-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
                     const typingId = `t-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+                    const accountOperation = accountOperationScope.begin()
+                    if (!accountOperationScope.isCurrent(accountOperation)) {
+                      accountOperationScope.finish(accountOperation)
+                      return
+                    }
 
                     if (selectedContact.isAi) {
-                      setMessagesByContact((prev) => {
-                        const current = prev[contactId] || []
-                        return {
-                          ...prev,
-                          [contactId]: [
-                            ...current,
-                            { id: userMessageId, role: 'user', text: input },
-                            { id: typingId, role: 'ai-typing', text: '...' },
-                          ],
-                        }
+                      accountOperationScope.runIfCurrent(accountOperation, () => {
+                        setMessagesByContact((prev) => {
+                          const current = prev[contactId] || []
+                          return {
+                            ...prev,
+                            [contactId]: [
+                              ...current,
+                              { id: userMessageId, role: 'user', text: input },
+                              { id: typingId, role: 'ai-typing', text: '...' },
+                            ],
+                          }
+                        })
+                        setChatInput('')
+                        setShowEmojiPicker(false)
+                        setIsAwaitingReply(true)
                       })
-                      setChatInput('')
-                      setShowEmojiPicker(false)
-                      setIsAwaitingReply(true)
 
                       try {
                         const res = await fetch(`${apiBaseUrl}/api/chat`, {
                           method: 'POST',
                           credentials: 'include',
+                          signal: accountOperation.signal,
                           headers: { 'Content-Type': 'application/json' },
                           body: JSON.stringify({
                             message: input,
@@ -2873,70 +3270,78 @@ function LoginHome() {
                         const aiImageUrl = res.ok ? (data.image_url || '') : ''
                         const aiMusicUrl = res.ok ? (data.music_url || '') : ''
 
-                        setMessagesByContact((prev) => {
-                          const current = prev[contactId] || []
-                          return {
-                            ...prev,
-                            [contactId]: current.map((m) =>
-                              m.id === typingId
-                                ? {
-                                    id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-                                    role: 'ai',
-                                    text: aiText,
-                                    audioUrl: aiAudioUrl,
-                                    imageUrl: aiImageUrl,
-                                    musicUrl: aiMusicUrl,
-                                  }
-                                : m,
-                            ),
-                          }
+                        accountOperationScope.runIfCurrent(accountOperation, () => {
+                          setMessagesByContact((prev) => {
+                            const current = prev[contactId] || []
+                            return {
+                              ...prev,
+                              [contactId]: current.map((m) =>
+                                m.id === typingId
+                                  ? {
+                                      id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                                      role: 'ai',
+                                      text: aiText,
+                                      audioUrl: aiAudioUrl,
+                                      imageUrl: aiImageUrl,
+                                      musicUrl: aiMusicUrl,
+                                    }
+                                  : m,
+                              ),
+                            }
+                          })
                         })
                       } catch (err) {
                         const errText = err?.message || t('Unable to reach API.', '無法連線到 API。')
-                        setMessagesByContact((prev) => {
-                          const current = prev[contactId] || []
-                          return {
-                            ...prev,
-                            [contactId]: current.map((m) =>
-                              m.id === typingId
-                                ? { id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role: 'ai', text: errText }
-                                : m,
-                            ),
-                          }
+                        accountOperationScope.runIfCurrent(accountOperation, () => {
+                          setMessagesByContact((prev) => {
+                            const current = prev[contactId] || []
+                            return {
+                              ...prev,
+                              [contactId]: current.map((m) =>
+                                m.id === typingId
+                                  ? { id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role: 'ai', text: errText }
+                                  : m,
+                              ),
+                            }
+                          })
                         })
                       } finally {
-                        setIsAwaitingReply(false)
+                        accountOperationScope.runIfCurrent(accountOperation, () => setIsAwaitingReply(false))
+                        accountOperationScope.finish(accountOperation)
                       }
                       return
                     }
 
                     if (isAiAssistMode) {
                       const assistTempId = `assist-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
-                      setMessagesByContact((prev) => {
-                        const current = prev[contactId] || []
-                        return {
-                          ...prev,
-                          [contactId]: [
-                            ...current,
-                            {
-                              id: assistTempId,
-                              role: 'assist_group',
-                              groupId: assistTempId,
-                              collapsed: false,
-                              userText: input,
-                              aiText: '...',
-                              aiAudioUrl: '',
-                            },
-                          ],
-                        }
+                      accountOperationScope.runIfCurrent(accountOperation, () => {
+                        setMessagesByContact((prev) => {
+                          const current = prev[contactId] || []
+                          return {
+                            ...prev,
+                            [contactId]: [
+                              ...current,
+                              {
+                                id: assistTempId,
+                                role: 'assist_group',
+                                groupId: assistTempId,
+                                collapsed: false,
+                                userText: input,
+                                aiText: '...',
+                                aiAudioUrl: '',
+                              },
+                            ],
+                          }
+                        })
+                        setChatInput('')
+                        setShowEmojiPicker(false)
+                        setIsAwaitingReply(true)
                       })
-                      setChatInput('')
-                      setShowEmojiPicker(false)
-                      setIsAwaitingReply(true)
                       try {
                         const res = await fetch(`${apiBaseUrl}/api/assist/message`, {
                           method: 'POST',
                           credentials: 'include',
+                          signal: accountOperation.signal,
                           headers: { 'Content-Type': 'application/json' },
                           body: JSON.stringify({
                             contact_id: contactId,
@@ -2953,49 +3358,55 @@ function LoginHome() {
                           : assist.audio_base64 && assist.audio_mime_type
                             ? `data:${assist.audio_mime_type};base64,${assist.audio_base64}`
                             : ''
-                        setMessagesByContact((prev) => {
-                          const current = prev[contactId] || []
-                          return {
-                            ...prev,
-                            [contactId]: current.map((m) =>
-                              m.id === assistTempId
-                                ? {
-                                    id: assist.id || assistTempId,
-                                    role: 'assist_group',
-                                    groupId: assist.id || assistTempId,
-                                    collapsed: false,
-                                    userText: assist.user_text || input,
-                                    aiText: assist.ai_text || '',
-                                    aiAudioUrl: assistAudioUrl,
-                                  }
-                                : m,
-                            ),
-                          }
+                        accountOperationScope.runIfCurrent(accountOperation, () => {
+                          setMessagesByContact((prev) => {
+                            const current = prev[contactId] || []
+                            return {
+                              ...prev,
+                              [contactId]: current.map((m) =>
+                                m.id === assistTempId
+                                  ? {
+                                      id: assist.id || assistTempId,
+                                      role: 'assist_group',
+                                      groupId: assist.id || assistTempId,
+                                      collapsed: false,
+                                      userText: assist.user_text || input,
+                                      aiText: assist.ai_text || '',
+                                      aiAudioUrl: assistAudioUrl,
+                                    }
+                                  : m,
+                              ),
+                            }
+                          })
                         })
                       } catch (err) {
                         const errText = err?.message || 'Assist mode failed.'
-                        setMessagesByContact((prev) => {
-                          const current = prev[contactId] || []
-                          return {
-                            ...prev,
-                            [contactId]: current.map((m) =>
-                              m.id === assistTempId
-                                ? { ...m, aiText: errText, collapsed: false }
-                                : m,
-                            ),
-                          }
+                        accountOperationScope.runIfCurrent(accountOperation, () => {
+                          setMessagesByContact((prev) => {
+                            const current = prev[contactId] || []
+                            return {
+                              ...prev,
+                              [contactId]: current.map((m) =>
+                                m.id === assistTempId
+                                  ? { ...m, aiText: errText, collapsed: false }
+                                  : m,
+                              ),
+                            }
+                          })
                         })
                       } finally {
-                        setIsAwaitingReply(false)
+                        accountOperationScope.runIfCurrent(accountOperation, () => setIsAwaitingReply(false))
+                        accountOperationScope.finish(accountOperation)
                       }
                       return
                     }
 
-                    setIsAwaitingReply(true)
+                    accountOperationScope.runIfCurrent(accountOperation, () => setIsAwaitingReply(true))
                     try {
                       const res = await fetch(`${apiBaseUrl}/api/messages/send`, {
                         method: 'POST',
                         credentials: 'include',
+                        signal: accountOperation.signal,
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                           recipient_user_id: contactId,
@@ -3006,25 +3417,30 @@ function LoginHome() {
                       if (!res.ok || !data.ok) {
                         throw new Error(data.error || `Send failed (${res.status})`)
                       }
-                      setMessagesByContact((prev) => {
-                        const current = prev[contactId] || []
-                        return {
-                          ...prev,
-                          [contactId]: [...current, { id: data?.message?.message_id || userMessageId, role: 'user', text: input }],
-                        }
+                      accountOperationScope.runIfCurrent(accountOperation, () => {
+                        setMessagesByContact((prev) => {
+                          const current = prev[contactId] || []
+                          return {
+                            ...prev,
+                            [contactId]: [...current, { id: data?.message?.message_id || userMessageId, role: 'user', text: input }],
+                          }
+                        })
+                        setChatInput('')
+                        setShowEmojiPicker(false)
                       })
-                      setChatInput('')
-                      setShowEmojiPicker(false)
                     } catch (err) {
-                      setMessagesByContact((prev) => {
-                        const current = prev[contactId] || []
-                        return {
-                          ...prev,
-                          [contactId]: [...current, { id: `e-${Date.now()}`, role: 'peer', text: err?.message || 'Unable to send message.' }],
-                        }
+                      accountOperationScope.runIfCurrent(accountOperation, () => {
+                        setMessagesByContact((prev) => {
+                          const current = prev[contactId] || []
+                          return {
+                            ...prev,
+                            [contactId]: [...current, { id: `e-${Date.now()}`, role: 'peer', text: err?.message || 'Unable to send message.' }],
+                          }
+                        })
                       })
                     } finally {
-                      setIsAwaitingReply(false)
+                      accountOperationScope.runIfCurrent(accountOperation, () => setIsAwaitingReply(false))
+                      accountOperationScope.finish(accountOperation)
                     }
                   }}
                   style={{ padding: isPadUp ? '8px 24px 12px' : '8px 8px 12px' }}
@@ -3486,6 +3902,7 @@ function LoginHome() {
               </div>
             )}
           </div>
+          </ChatShell>
         ) : (
           <>
             <div style={{ display: 'grid', placeItems: 'center', padding: '0 20px' }}>
@@ -3552,7 +3969,7 @@ function LoginHome() {
           style={{
             borderTop: '1px solid rgba(255,255,255,0.36)',
             background: 'linear-gradient(180deg, rgba(255,255,255,0.25), rgba(255,255,255,0.15))',
-            display: 'grid',
+            display: isSignedIn ? 'none' : 'grid',
             gridTemplateColumns: 'repeat(4, 1fr)',
             placeItems: 'center',
           color: '#2f2454',
@@ -3646,6 +4063,20 @@ function LoginHome() {
           </button>
         </nav>
       </section>
+      <GroupManagerDialog
+        open={groupManagerOpen}
+        locale={isZh ? 'zh-TW' : 'en'}
+        groups={contactGroups}
+        onClose={() => setGroupManagerOpen(false)}
+        onCreate={(name) => mutateGroups('create', { name })}
+        onRename={(groupId, name) => mutateGroups('update', { group_id: groupId, name })}
+        onReorder={(orderedGroupIds) => mutateGroups('reorder', { ordered_group_ids: orderedGroupIds })}
+        onDelete={deleteGroup}
+        onRefresh={(groups) => {
+          setContactGroups(groups)
+          setDefaultContactGroupId((current) => (groups.some((group) => group.id === current) ? current : ''))
+        }}
+      />
       {settingsModalOpen ? (
         <div
           onClick={() => {
