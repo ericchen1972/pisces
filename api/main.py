@@ -22,6 +22,8 @@ from google.oauth2 import id_token
 from google.oauth2 import service_account
 from ably import AblyRest
 
+from contact_groups import ContactGroupError, ContactGroupService
+
 app = Flask(__name__)
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 FIRESTORE_SA_PATH = os.path.join(os.path.dirname(__file__), "keys", "firestore-sa.json")
@@ -1260,22 +1262,90 @@ def save_chat_message(user_id, contact_id, role, text, extras=None):
     coll.add(payload)
 
 
-def upsert_chat_meta(user_id, contact_id, unread_increment=0, force_unread_zero=False, preview_text=""):
+def upsert_chat_meta(
+    user_id,
+    contact_id,
+    unread_increment=0,
+    force_unread_zero=False,
+    preview_text="",
+    touch_last_message=True,
+):
     if not user_id or not contact_id:
         return
     client = get_firestore_client()
     ref = client.collection("users").document(user_id).collection("chat_meta").document(contact_id)
-    payload = {
-        "updated_at": firestore.SERVER_TIMESTAMP,
-        "last_message_at": firestore.SERVER_TIMESTAMP,
-    }
-    if preview_text:
+    payload = {"updated_at": firestore.SERVER_TIMESTAMP}
+    if touch_last_message:
+        payload["last_message_at"] = firestore.SERVER_TIMESTAMP
+    if touch_last_message and preview_text:
         payload["last_message_preview"] = (preview_text or "").strip()[:280]
     if force_unread_zero:
         payload["unread_count"] = 0
+        payload["last_read_at"] = firestore.SERVER_TIMESTAMP
     elif unread_increment:
         payload["unread_count"] = firestore.Increment(int(unread_increment))
     ref.set(payload, merge=True)
+
+
+def ensure_default_chat_group(
+    client, user_id, contact_id, default_group_id, metadata=None
+):
+    # Caller values are advisory; authoritative state is re-read transactionally.
+    user_ref = client.collection("users").document(user_id)
+    meta_ref = user_ref.collection("chat_meta").document(contact_id)
+
+    def operation(transaction):
+        meta_snapshot = next(iter(transaction.get(meta_ref)))
+        values = meta_snapshot.to_dict() if meta_snapshot.exists else {}
+        values = values or {}
+        if values.get("group_id"):
+            return values
+
+        user_snapshot = next(iter(transaction.get(user_ref)))
+        user_values = user_snapshot.to_dict() if user_snapshot.exists else {}
+        group_id = (user_values or {}).get("default_contact_group_id")
+        if not group_id:
+            return values
+
+        group_ref = user_ref.collection("contact_groups").document(group_id)
+        group_snapshot = next(iter(transaction.get(group_ref)))
+        if not group_snapshot.exists:
+            return values
+        group_values = group_snapshot.to_dict() or {}
+        if group_values.get("deletion_state") == "deleting":
+            destination_id = group_values.get("move_to_group_id")
+            if not destination_id:
+                return values
+            destination_ref = user_ref.collection("contact_groups").document(
+                destination_id
+            )
+            destination_snapshot = next(iter(transaction.get(destination_ref)))
+            if not destination_snapshot.exists:
+                return values
+            destination_values = destination_snapshot.to_dict() or {}
+            if destination_values.get("deletion_state") == "deleting":
+                return values
+            group_id = destination_id
+
+        transaction.set(
+            meta_ref,
+            {
+                "group_id": group_id,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        return {**values, "group_id": group_id}
+
+    transactional_operation = firestore.transactional(operation)
+    return transactional_operation(client.transaction())
+
+
+def chat_meta_unread_count(metadata):
+    try:
+        return max(0, int((metadata or {}).get("unread_count") or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def log_tool_error(user_id, contact_id, tool_name, stage, error_message, request_id="", input_snapshot=None):
@@ -1453,6 +1523,168 @@ def get_session_auth(required=True):
     if required and not user_id:
         return None, ({"ok": False, "error": "unauthorized"}, 401)
     return {"user_id": user_id, "provider": provider, "email": email}, None
+
+
+def get_contact_group_service():
+    return ContactGroupService(get_firestore_client(), firestore.SERVER_TIMESTAMP)
+
+
+def contact_group_error_response(exc):
+    return {
+        "ok": False,
+        "error": str(exc),
+    }, getattr(exc, "status_code", 400)
+
+
+def _contact_group_auth():
+    auth, auth_error = get_session_auth(required=True)
+    if auth_error:
+        error, status = auth_error
+        return None, (jsonify(error), status)
+    return auth["user_id"], None
+
+
+def _contact_group_json_body():
+    body = flask_request.get_json(silent=True)
+    if not isinstance(body, dict):
+        raise ContactGroupError("JSON object body is required")
+    return body
+
+
+def _contact_group_string(body, key, required=True):
+    value = body.get(key)
+    if value is None and not required:
+        return ""
+    if not isinstance(value, str) or not value.strip():
+        raise ContactGroupError(f"{key} must be a non-empty string")
+    return value.strip()
+
+
+def _contact_group_id_list(body):
+    values = body.get("ordered_group_ids")
+    if not isinstance(values, list) or any(
+        not isinstance(value, str) or not value.strip() for value in values
+    ):
+        raise ContactGroupError(
+            "ordered_group_ids must be a list of non-empty strings"
+        )
+    return [value.strip() for value in values]
+
+
+@app.route("/api/contact-groups/bootstrap", methods=["POST"])
+def bootstrap_contact_groups():
+    user_id, auth_error = _contact_group_auth()
+    if auth_error:
+        return auth_error
+    try:
+        body = _contact_group_json_body()
+        locale = _contact_group_string(body, "locale", required=False)
+        service = get_contact_group_service()
+        service.bootstrap(user_id, locale)
+        return jsonify({"ok": True, "groups": service.list_groups(user_id)})
+    except ContactGroupError as exc:
+        error, status = contact_group_error_response(exc)
+        return jsonify(error), status
+
+
+@app.route("/api/contact-groups/list", methods=["POST"])
+def list_contact_groups():
+    user_id, auth_error = _contact_group_auth()
+    if auth_error:
+        return auth_error
+    try:
+        _contact_group_json_body()
+        groups = get_contact_group_service().list_groups(user_id)
+        return jsonify({"ok": True, "groups": groups})
+    except ContactGroupError as exc:
+        error, status = contact_group_error_response(exc)
+        return jsonify(error), status
+
+
+@app.route("/api/contact-groups/create", methods=["POST"])
+def create_contact_group():
+    user_id, auth_error = _contact_group_auth()
+    if auth_error:
+        return auth_error
+    try:
+        body = _contact_group_json_body()
+        name = _contact_group_string(body, "name")
+        service = get_contact_group_service()
+        service.create(user_id, name)
+        return jsonify({"ok": True, "groups": service.list_groups(user_id)})
+    except ContactGroupError as exc:
+        error, status = contact_group_error_response(exc)
+        return jsonify(error), status
+
+
+@app.route("/api/contact-groups/update", methods=["POST"])
+def update_contact_group():
+    user_id, auth_error = _contact_group_auth()
+    if auth_error:
+        return auth_error
+    try:
+        body = _contact_group_json_body()
+        group_id = _contact_group_string(body, "group_id")
+        name = _contact_group_string(body, "name")
+        service = get_contact_group_service()
+        service.rename(user_id, group_id, name)
+        return jsonify({"ok": True, "groups": service.list_groups(user_id)})
+    except ContactGroupError as exc:
+        error, status = contact_group_error_response(exc)
+        return jsonify(error), status
+
+
+@app.route("/api/contact-groups/reorder", methods=["POST"])
+def reorder_contact_groups():
+    user_id, auth_error = _contact_group_auth()
+    if auth_error:
+        return auth_error
+    try:
+        body = _contact_group_json_body()
+        ordered_group_ids = _contact_group_id_list(body)
+        groups = get_contact_group_service().reorder(
+            user_id, ordered_group_ids
+        )
+        return jsonify({"ok": True, "groups": groups})
+    except ContactGroupError as exc:
+        error, status = contact_group_error_response(exc)
+        return jsonify(error), status
+
+
+@app.route("/api/contact-groups/assign", methods=["POST"])
+def assign_contact_group():
+    user_id, auth_error = _contact_group_auth()
+    if auth_error:
+        return auth_error
+    try:
+        body = _contact_group_json_body()
+        contact_id = _contact_group_string(body, "contact_id")
+        group_id = _contact_group_string(body, "group_id")
+        assignment = get_contact_group_service().assign(
+            user_id, contact_id, group_id
+        )
+        return jsonify({"ok": True, "assignment": assignment})
+    except ContactGroupError as exc:
+        error, status = contact_group_error_response(exc)
+        return jsonify(error), status
+
+
+@app.route("/api/contact-groups/delete", methods=["POST"])
+def delete_contact_group():
+    user_id, auth_error = _contact_group_auth()
+    if auth_error:
+        return auth_error
+    try:
+        body = _contact_group_json_body()
+        group_id = _contact_group_string(body, "group_id")
+        move_to_group_id = _contact_group_string(body, "move_to_group_id")
+        deletion = get_contact_group_service().delete(
+            user_id, group_id, move_to_group_id
+        )
+        return jsonify({"ok": True, "deletion": deletion})
+    except ContactGroupError as exc:
+        error, status = contact_group_error_response(exc)
+        return jsonify(error), status
 
 
 def generate_gemini_reply(user_message, ai_settings, history_messages, extra_context_text=""):
@@ -2548,6 +2780,7 @@ def add_friend():
 
     user_a_id, user_b_id = sorted([requester_user_id, friend_user_id])
     pair_key = f"{user_a_id}_{user_b_id}"
+    friend_metadata = {}
 
     try:
         client = get_firestore_client()
@@ -2600,10 +2833,22 @@ def add_friend():
             "created_at": firestore.SERVER_TIMESTAMP,
         }
         client.collection("friendships").document(pair_key).set(payload, merge=True)
+        friend_metadata = ensure_default_chat_group(
+            client,
+            requester_user_id,
+            friend_user_id,
+            requester_data.get("default_contact_group_id"),
+        )
     except Exception as exc:
         return jsonify({"ok": False, "error": f"failed to add friend: {exc}"}), 500
 
     friend["display_name"] = friend_alias
+    friend.update(
+        group_id=friend_metadata.get("group_id") or "",
+        last_message_at=friend_metadata.get("last_message_at"),
+        last_message_preview=friend_metadata.get("last_message_preview") or "",
+        unread_count=chat_meta_unread_count(friend_metadata),
+    )
     return jsonify({"ok": True, "friend": friend, "pair_key": pair_key})
 
 
@@ -2620,19 +2865,22 @@ def list_friends():
 
     try:
         client = get_firestore_client()
-        unread_docs = list(
+        body = flask_request.get_json(silent=True) or {}
+        get_contact_group_service().bootstrap(requester_user_id, body.get("locale"))
+        user_snapshot = client.collection("users").document(requester_user_id).get()
+        user_values = (user_snapshot.to_dict() or {}) if user_snapshot.exists else {}
+        default_group_id = user_values.get("default_contact_group_id")
+
+        metadata_docs = list(
             client.collection("users")
             .document(requester_user_id)
             .collection("chat_meta")
             .stream()
         )
-        unread_map = {}
-        for unread_doc in unread_docs:
-            unread_data = unread_doc.to_dict() or {}
-            try:
-                unread_map[unread_doc.id] = max(0, int(unread_data.get("unread_count") or 0))
-            except Exception:
-                unread_map[unread_doc.id] = 0
+        metadata_map = {
+            metadata_doc.id: metadata_doc.to_dict() or {}
+            for metadata_doc in metadata_docs
+        }
 
         docs = list(
             client.collection("friendships")
@@ -2656,6 +2904,13 @@ def list_friends():
             special_prompt = (data.get("special_prompt_for_a") or "").strip() if is_a else (data.get("special_prompt_for_b") or "").strip()
             relationship = (data.get("relationship_for_a") or "").strip() if is_a else (data.get("relationship_for_b") or "").strip()
             display_name = alias or friend_display_name or "Friend"
+            metadata = ensure_default_chat_group(
+                client,
+                requester_user_id,
+                friend_id,
+                default_group_id,
+                metadata=metadata_map.get(friend_id, {}),
+            )
 
             friends.append(
                 {
@@ -2665,7 +2920,10 @@ def list_friends():
                     "avatar_url": friend_avatar_url,
                     "special_prompt": special_prompt,
                     "relationship": relationship,
-                    "unread_count": unread_map.get(friend_id, 0),
+                    "group_id": metadata.get("group_id") or "",
+                    "last_message_at": metadata.get("last_message_at"),
+                    "last_message_preview": metadata.get("last_message_preview") or "",
+                    "unread_count": chat_meta_unread_count(metadata),
                     "pair_key": data.get("pair_key") or doc.id,
                 }
             )
@@ -2690,15 +2948,11 @@ def mark_chat_read():
     if not contact_id:
         return jsonify({"ok": False, "error": "contact_id is required"}), 400
     try:
-        client = get_firestore_client()
-        ref = client.collection("users").document(user_id).collection("chat_meta").document(contact_id)
-        ref.set(
-            {
-                "unread_count": 0,
-                "last_read_at": firestore.SERVER_TIMESTAMP,
-                "updated_at": firestore.SERVER_TIMESTAMP,
-            },
-            merge=True,
+        upsert_chat_meta(
+            user_id,
+            contact_id,
+            force_unread_zero=True,
+            touch_last_message=False,
         )
         return jsonify({"ok": True, "contact_id": contact_id, "unread_count": 0})
     except Exception as exc:
