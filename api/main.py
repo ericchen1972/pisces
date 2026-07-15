@@ -387,13 +387,23 @@ def normalize_friend_outbound_text(user_message, friend_name):
     return cleaned or text
 
 
+def query_user_friendship_docs(client, user_id):
+    docs = []
+    seen_ids = set()
+    for field in ("user_a_id", "user_b_id"):
+        for doc in client.collection("friendships").where(field, "==", user_id).stream():
+            if doc.id in seen_ids:
+                continue
+            seen_ids.add(doc.id)
+            data = doc.to_dict() or {}
+            if data.get("status") == "accepted":
+                docs.append(doc)
+    return docs
+
+
 def list_user_friends(user_id):
     client = get_firestore_client()
-    docs = list(
-        client.collection("friendships")
-        .where("status", "==", "accepted")
-        .stream()
-    )
+    docs = query_user_friendship_docs(client, user_id)
     friends = []
     for doc in docs:
         data = doc.to_dict() or {}
@@ -3661,9 +3671,15 @@ def chat_history():
         return jsonify(err), status
     user_id = auth["user_id"]
     contact_id = (body.get("contact_id") or "pisces-core").strip() or "pisces-core"
+    history_limit = None
+    if "limit" in body:
+        raw_limit = body.get("limit")
+        if isinstance(raw_limit, bool) or not isinstance(raw_limit, int):
+            return jsonify({"ok": False, "error": "limit must be an integer"}), 400
+        history_limit = max(1, min(100, raw_limit))
 
     try:
-        messages = get_chat_messages(user_id, contact_id, history_range=None)
+        messages = get_chat_messages(user_id, contact_id, history_range=history_limit)
     except Exception as exc:
         return jsonify({"ok": False, "error": f"failed to load history: {exc}"}), 500
 
@@ -4137,11 +4153,7 @@ def add_friend():
         friend_doc = client.collection("users").document(friend_user_id).get()
         friend_data = friend_doc.to_dict() if friend_doc.exists else {}
 
-        existing_friendships = list(
-            client.collection("friendships")
-            .where("status", "==", "accepted")
-            .stream()
-        )
+        existing_friendships = query_user_friendship_docs(client, requester_user_id)
         alias_lower = friend_alias.strip().lower()
         for existing_doc in existing_friendships:
             existing_data = existing_doc.to_dict() or {}
@@ -4230,11 +4242,7 @@ def list_friends():
             for metadata_doc in metadata_docs
         }
 
-        docs = list(
-            client.collection("friendships")
-            .where("status", "==", "accepted")
-            .stream()
-        )
+        docs = query_user_friendship_docs(client, requester_user_id)
 
         friends = []
         for doc in docs:
@@ -4252,13 +4260,15 @@ def list_friends():
             special_prompt = (data.get("special_prompt_for_a") or "").strip() if is_a else (data.get("special_prompt_for_b") or "").strip()
             relationship = (data.get("relationship_for_a") or "").strip() if is_a else (data.get("relationship_for_b") or "").strip()
             display_name = alias or friend_display_name or "Friend"
-            metadata = ensure_default_chat_group(
-                client,
-                requester_user_id,
-                friend_id,
-                default_group_id,
-                metadata=metadata_map.get(friend_id, {}),
-            )
+            metadata = metadata_map.get(friend_id, {})
+            if not metadata.get("group_id"):
+                metadata = ensure_default_chat_group(
+                    client,
+                    requester_user_id,
+                    friend_id,
+                    default_group_id,
+                    metadata=metadata,
+                )
 
             friends.append(
                 {
@@ -4412,11 +4422,7 @@ def save_friend_settings():
         field_alias = "alias_for_a" if requester_user_id == user_a_id else "alias_for_b"
         field_prompt = "special_prompt_for_a" if requester_user_id == user_a_id else "special_prompt_for_b"
         field_relationship = "relationship_for_a" if requester_user_id == user_a_id else "relationship_for_b"
-        docs = list(
-            client.collection("friendships")
-            .where("status", "==", "accepted")
-            .stream()
-        )
+        docs = query_user_friendship_docs(client, requester_user_id)
         alias_lower = alias.strip().lower()
         for entry in docs:
             if entry.id == pair_key:

@@ -17,7 +17,7 @@ import { createAccountOperationScope } from './lib/operationScope.js'
 import { avatarProcessingErrorMessage, createAvatarPreviewOwner, prepareAvatarPreview } from './lib/avatarMedia.js'
 import { createOwnedObjectUrlRegistry, discardRecordedMessage } from './lib/ownedObjectUrls.js'
 import { authorizeIncomingFriend } from './lib/realtimeFriendGate.js'
-import { createRecipientReconciler, reconcileRecipientSnapshot } from './lib/recipientReconciliation.js'
+import { createReconnectGate, createRecipientReconciler, mergeCanonicalHistoryTail, reconcileRecipientSnapshot } from './lib/recipientReconciliation.js'
 import { requireSuccessfulVoiceResponse } from './lib/voiceResponse.js'
 import { mergeStreamMessage, streamAiTurn } from './lib/stream.js'
 import {
@@ -990,7 +990,7 @@ function LoginHome() {
     return send.started ? send.completion : false
   }
 
-  const loadContactHistory = async (contactId) => {
+  const loadContactHistory = async (contactId, { limit = null, merge = false, silent = false } = {}) => {
     if (!isSignedIn || !currentUser?.id || !contactId) return
     const authContext = authRequestGuard.snapshot()
     if (!authRequestGuard.isCurrent(authContext) || authContext.userId !== String(currentUser.id)) return
@@ -999,11 +999,13 @@ function LoginHome() {
       guard: authRequestGuard,
       context: authContext,
       request: async () => {
+        const body = { contact_id: contactId }
+        if (Number.isInteger(limit)) body.limit = limit
         const res = await fetch(`${apiBaseUrl}/api/chat/history`, {
           method: 'POST',
           credentials: 'include',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contact_id: contactId }),
+          body: JSON.stringify(body),
         })
         const data = await res.json()
         if (!res.ok || !data.ok) {
@@ -1012,10 +1014,17 @@ function LoginHome() {
         return buildViewMessages(data.messages || [])
       },
       onSuccess: (nextMessages) => {
-        recordedObjectUrlsRef.current.reconcileContact(contactId, nextMessages)
-        setMessagesByContact((prev) => ({ ...prev, [contactId]: nextMessages }))
+        if (!merge) recordedObjectUrlsRef.current.reconcileContact(contactId, nextMessages)
+        setMessagesByContact((prev) => {
+          const current = prev[contactId] || []
+          return {
+            ...prev,
+            [contactId]: merge ? mergeCanonicalHistoryTail(current, nextMessages) : nextMessages,
+          }
+        })
       },
       onError: (err) => {
+        if (silent) return
         setMessagesByContact((prev) => {
           const current = prev[contactId] || []
           return {
@@ -1361,8 +1370,8 @@ function LoginHome() {
             && candidate.contactId === selectedContactIdRef.current
           ),
           refreshSidebar: () => initializeContactData(currentUser, { bootstrap: false, authContext }),
-          // loadContactHistory replaces the keyed conversation with canonical server message ids.
-          refreshHistory: (selectedId) => loadContactHistory(selectedId),
+          // Polling merges a bounded tail using canonical server message ids.
+          refreshHistory: (selectedId) => loadContactHistory(selectedId, { limit: 100, merge: true, silent: true }),
         })
       },
     })
@@ -1418,7 +1427,9 @@ function LoginHome() {
           },
         })
 
+        const reconnectGate = createReconnectGate()
         realtime.connection.on('connected', () => {
+          if (!reconnectGate.shouldReconcile()) return
           const authContext = authRequestGuard.snapshot()
           if (!isCancelled && authContext.userId === currentUser.id) {
             if (recipientReconcilerRef.current) {
@@ -1473,7 +1484,7 @@ function LoginHome() {
             }
           })
 
-          if (selectedContact?.id === senderId) {
+          if (selectedContactIdRef.current === senderId) {
             markContactAsRead(senderId)
           } else if (!authorization.refreshed) {
             setUnreadByContact((prev) => ({ ...prev, [senderId]: (prev[senderId] || 0) + 1 }))
@@ -1507,7 +1518,7 @@ function LoginHome() {
         ablyRealtimeRef.current = null
       }
     }
-  }, [isSignedIn, currentUser?.id, currentUser?.provider, apiBaseUrl, selectedContact?.id])
+  }, [isSignedIn, currentUser?.id, currentUser?.provider, apiBaseUrl])
 
   useEffect(() => () => {
     avatarPreviewOwnerRef.current.invalidate()

@@ -1,4 +1,5 @@
 import base64
+import inspect
 
 import pytest
 
@@ -645,6 +646,115 @@ def test_friend_list_bootstraps_and_returns_authoritative_metadata(
     assert friends["user-c"]["group_id"] == "family"
     assert firestore.read("users/user-a/chat_meta/user-b")["group_id"] == "others"
     assert firestore.read("users/user-a/chat_meta/user-c")["group_id"] == "family"
+
+
+def test_friends_list_uses_two_user_scoped_friendship_queries_and_deduplicates(
+    signed_in_client, monkeypatch
+):
+    class QueryRecordingFirestore(FakeFirestoreClient):
+        def __init__(self):
+            super().__init__()
+            self.friendship_query_fields = []
+
+        def collection(self, name):
+            collection = super().collection(name)
+            if name != "friendships":
+                return collection
+            original_where = collection.where
+
+            def where(field, op, value):
+                self.friendship_query_fields.append((field, op, value))
+                if field == "status":
+                    raise AssertionError("global accepted-friendship scan is forbidden")
+                return original_where(field, op, value)
+
+            collection.where = where
+            return collection
+
+    firestore = QueryRecordingFirestore()
+    firestore.seed("users/user-a", default_contact_group_id="")
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        user_b_display_name="Bee",
+        status="accepted",
+    )
+    firestore.seed(
+        "friendships/user-a_self",
+        user_a_id="user-a",
+        user_b_id="user-a",
+        user_b_display_name="Duplicate",
+        status="accepted",
+    )
+    firestore.seed(
+        "friendships/user-a_rejected",
+        user_a_id="user-a",
+        user_b_id="rejected-user",
+        status="rejected",
+    )
+    firestore.seed(
+        "friendships/unrelated",
+        user_a_id="user-c",
+        user_b_id="user-d",
+        status="accepted",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(main, "get_contact_group_service", lambda: StubContactGroupService())
+
+    response = signed_in_client.post("/api/friends/list", json={"locale": "en"})
+
+    assert response.status_code == 200
+    assert firestore.friendship_query_fields == [
+        ("user_a_id", "==", "user-a"),
+        ("user_b_id", "==", "user-a"),
+    ]
+    assert [friend["id"] for friend in response.get_json()["friends"]] == [
+        "user-b",
+        "user-a",
+    ]
+
+
+def test_alias_validation_endpoints_use_user_scoped_friendship_queries():
+    for endpoint in (main.add_friend, main.save_friend_settings):
+        source = inspect.getsource(endpoint)
+        assert "query_user_friendship_docs" in source
+        assert '.where("status", "==", "accepted")' not in source
+
+
+def test_chat_history_clamps_optional_poll_limit(signed_in_client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        main,
+        "get_chat_messages",
+        lambda user_id, contact_id, history_range=None: calls.append(
+            (user_id, contact_id, history_range)
+        )
+        or [],
+    )
+
+    response = signed_in_client.post(
+        "/api/chat/history", json={"contact_id": "user-b", "limit": 1000}
+    )
+
+    assert response.status_code == 200
+    assert calls == [("user-a", "user-b", 100)]
+
+
+def test_chat_history_rejects_non_integer_poll_limit(signed_in_client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        main,
+        "get_chat_messages",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or [],
+    )
+
+    response = signed_in_client.post(
+        "/api/chat/history", json={"contact_id": "user-b", "limit": "many"}
+    )
+
+    assert response.status_code == 400
+    assert calls == []
 
 
 def test_add_friend_applies_requesters_default_group_when_metadata_is_unassigned(

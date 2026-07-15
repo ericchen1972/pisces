@@ -23,4 +23,18 @@ describe('remaining visible interface policy', () => {
     expect(source).not.toContain("setTesterError('Email is required.')")
     expect(source).not.toContain("setGoogleError('Google Sign-In failed to load.')")
   })
+
+  it('wires recipient polling to bounded canonical-tail history reconciliation', () => {
+    const source = readFileSync(`${process.cwd()}/src/App.jsx`, 'utf8')
+    expect(source).toContain('loadContactHistory(selectedId, { limit: 100, merge: true, silent: true })')
+    expect(source).toContain('mergeCanonicalHistoryTail(current, nextMessages)')
+  })
+
+  it('keeps one Ably client across contact switches and reconciles reconnects only', () => {
+    const source = readFileSync(`${process.cwd()}/src/App.jsx`, 'utf8')
+    expect(source).toContain('const reconnectGate = createReconnectGate()')
+    expect(source).toContain('if (!reconnectGate.shouldReconcile()) return')
+    expect(source).toContain('selectedContactIdRef.current === senderId')
+    expect(source).not.toContain('apiBaseUrl, selectedContact?.id]')
+  })
 })
