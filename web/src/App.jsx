@@ -58,6 +58,22 @@ const MAX_RECORD_MS = 30000
 const AI_DEFAULT_GLOBAL_PROMPT = 'You are a polite, warm, and thoughtful AI communication partner.'
 const UI_STORAGE_KEY = 'pisces_ui_v1'
 const AVATAR_SIZE = 256
+const initializedGoogleIdentityClients = new WeakMap()
+
+function initializeGoogleIdentityClient(identityClient, options) {
+  const existing = initializedGoogleIdentityClients.get(identityClient)
+  if (existing) {
+    existing.callback = options.callback
+    return
+  }
+
+  const state = { callback: options.callback }
+  initializedGoogleIdentityClients.set(identityClient, state)
+  identityClient.initialize({
+    ...options,
+    callback: (response) => state.callback(response),
+  })
+}
 
 function detectIsZhLocale() {
   if (typeof navigator === 'undefined') return false
@@ -1230,7 +1246,7 @@ function LoginHome() {
 
       const google = window.google
       if (google?.accounts?.id && googleButtonRef.current) {
-        google.accounts.id.initialize({
+        initializeGoogleIdentityClient(google.accounts.id, {
           client_id: GOOGLE_CLIENT_ID,
           callback: async (response) => {
             const authTransition = authTransitionCoordinator.begin()
