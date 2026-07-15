@@ -4,6 +4,7 @@ import io
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -845,6 +846,90 @@ def test_private_audio_artifact_replay_authenticates_and_is_user_scoped(monkeypa
         main.load_private_audio_artifact("user-a", artifact_id)
 
 
+def test_delete_private_audio_artifact_removes_firestore_record_and_ciphertext(monkeypatch):
+    firestore = FakeFirestoreClient()
+    firestore.seed(
+        "users/user-a/audio_artifacts/artifact-1",
+        blob_url="https://opaque.public.blob.vercel-storage.com/artifact-1.bin",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    deleted = []
+    monkeypatch.setattr(main, "delete_vercel_blob", deleted.append)
+
+    assert main.delete_private_audio_artifact("user-a", "artifact-1") is True
+    assert firestore.read("users/user-a/audio_artifacts/artifact-1") is None
+    assert deleted == ["https://opaque.public.blob.vercel-storage.com/artifact-1.bin"]
+
+
+def test_private_audio_artifact_cleans_ciphertext_when_metadata_save_fails(monkeypatch):
+    monkeypatch.setattr(main, "get_audio_artifact_key", lambda: b"k" * 32)
+    monkeypatch.setattr(
+        main,
+        "upload_private_audio_ciphertext",
+        lambda *_args: "https://opaque.public.blob.vercel-storage.com/orphan.bin",
+    )
+    monkeypatch.setattr(
+        main,
+        "save_private_audio_artifact",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("firestore unavailable")),
+    )
+    deleted = []
+    monkeypatch.setattr(main, "delete_vercel_blob", deleted.append)
+
+    with pytest.raises(RuntimeError, match="firestore unavailable"):
+        main.create_private_audio_artifact("user-a", b"RIFF-secret", "audio/wav")
+    assert deleted == ["https://opaque.public.blob.vercel-storage.com/orphan.bin"]
+
+
+@pytest.mark.parametrize(
+    ("uploader", "payload", "mime_type"),
+    [
+        ("upload_audio_to_vercel_blob", b"audio", "audio/wav"),
+        ("upload_image_to_vercel_blob", b"image", "image/png"),
+    ],
+)
+def test_outbound_blob_pathnames_are_collision_resistant(
+    monkeypatch, uploader, payload, mime_type
+):
+    requests = []
+
+    class Response:
+        def __init__(self, index):
+            self.index = index
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {"url": f"https://store.public.blob.vercel-storage.com/blob-{self.index}"}
+            ).encode()
+
+    def urlopen(req, timeout):
+        del timeout
+        requests.append(req)
+        return Response(len(requests))
+
+    monkeypatch.setattr(main, "get_blob_rw_token", lambda: "test-token")
+    monkeypatch.setattr(main.request, "urlopen", urlopen)
+    upload = getattr(main, uploader)
+
+    first = upload("user-a", payload, mime_type)
+    second = upload("user-a", payload, mime_type)
+
+    assert first != second
+    pathnames = [
+        parse_qs(urlparse(req.full_url).query)["pathname"][0]
+        for req in requests
+    ]
+    assert pathnames[0] != pathnames[1]
+    assert all(len(path.rsplit("_", 1)[-1].split(".", 1)[0]) >= 16 for path in pathnames)
+    assert all(req.headers.get("X-add-random-suffix") != "0" for req in requests)
+
+
 def test_transcribe_audio_bytes_uses_named_seeked_openai_file(monkeypatch):
     seen = {}
 
@@ -1430,6 +1515,28 @@ def route_stubs(monkeypatch):
         if receipt.get("owner_token") == owner_token:
             receipt["lease_expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
 
+    def claim_publish(user_id, route_name, request_id, payload_hash, _recipient_user_id):
+        receipt = receipts.get((user_id, route_name, request_id)) or {}
+        if receipt.get("payload_hash") != payload_hash:
+            raise ValueError("request_id was already used for a different delivery")
+        if receipt.get("published"):
+            return receipt, "", "published"
+        owner = f"publish-owner-{request_id}"
+        receipt["publish_owner_token"] = owner
+        return receipt, owner, "claimed"
+
+    def finalize_publish(user_id, route_name, request_id, owner_token):
+        receipt = receipts.get((user_id, route_name, request_id)) or {}
+        if receipt.get("publish_owner_token") != owner_token:
+            return False
+        receipt["published"] = True
+        receipt["publish_owner_token"] = ""
+        return True
+
+    def release_publish(user_id, route_name, request_id, owner_token):
+        receipt = receipts.get((user_id, route_name, request_id)) or {}
+        return receipt.get("publish_owner_token") == owner_token
+
     def reserve_stream(**kwargs):
         key = (kwargs["user_id"], "chat_stream", kwargs["request_id"])
         existing = receipts.get(key)
@@ -1506,6 +1613,9 @@ def route_stubs(monkeypatch):
     )
     monkeypatch.setattr(main, "reserve_delivery_request", reserve_delivery)
     monkeypatch.setattr(main, "release_delivery_request", release_delivery)
+    monkeypatch.setattr(main, "claim_friend_delivery_publish", claim_publish)
+    monkeypatch.setattr(main, "finalize_friend_delivery_publish", finalize_publish)
+    monkeypatch.setattr(main, "release_friend_delivery_publish", release_publish)
     monkeypatch.setattr(main, "reserve_stream_request", reserve_stream)
     monkeypatch.setattr(main, "release_stream_request", release_stream)
     monkeypatch.setattr(main, "complete_stream_request", complete_stream)
@@ -2391,7 +2501,12 @@ def test_ai_room_forwarding_ably_failure_does_not_fail_or_repeat_durable_deliver
     second = signed_in_client.post("/api/chat", json=payload)
 
     assert first.status_code == second.status_code == 200
-    assert first.get_json() == second.get_json()
+    first_body = first.get_json()
+    second_body = second.get_json()
+    assert first_body.pop("realtime_delivered") is False
+    assert second_body.get("realtime_delivered") is not False
+    second_body.pop("realtime_delivered", None)
+    assert first_body == second_body
     assert len(saved) == saved_count
     assert len(attempts) == 2
     assert attempts[0][1]["message_id"] == attempts[1][1]["message_id"]
@@ -2595,6 +2710,11 @@ def test_ai_outbound_unpublished_replay_does_not_cross_friendship_generation(
     monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
     published = []
     monkeypatch.setattr(main, "publish_user_channel_message", lambda *args: published.append(args))
+    monkeypatch.setattr(
+        main,
+        "claim_friend_delivery_publish",
+        lambda *_args: (service.receipts[("user-a", route_name, request_id)], "", "stale"),
+    )
 
     response = signed_in_client.post(path, json=payload)
 
@@ -2659,6 +2779,11 @@ def test_ai_outbound_concurrent_winner_receipt_uses_generation_guard_and_cleans_
     published = []
     monkeypatch.setattr(main, "delete_vercel_blob", deleted.append)
     monkeypatch.setattr(main, "publish_user_channel_message", lambda *args: published.append(args))
+    monkeypatch.setattr(
+        main,
+        "claim_friend_delivery_publish",
+        lambda *_args: (winner_receipt, "", "stale"),
+    )
 
     response = signed_in_client.post(path, json=payload)
 
@@ -2666,6 +2791,85 @@ def test_ai_outbound_concurrent_winner_receipt_uses_generation_guard_and_cleans_
     assert response.get_json()["realtime_delivered"] is False
     assert published == []
     assert deleted == ["https://blob/loser.png"]
+
+
+@pytest.mark.parametrize("outcome", ["loser", "revoked"])
+def test_forward_private_confirmation_artifact_is_cleaned_when_delivery_is_not_durable(
+    signed_in_client, forwarding_stubs, monkeypatch, outcome
+):
+    service, _saved, _published = forwarding_stubs
+    service.assist_decision = {"send_to_friend": True, "voice": True, "reason": "send"}
+    service.composed = {"as_user": False, "message_to_friend": "Hello Amy"}
+    service.text = "Delivery confirmed."
+    monkeypatch.setattr(main, "has_explicit_voice_request", lambda _text: True)
+    monkeypatch.setattr(main, "upload_audio_to_vercel_blob", lambda *_args: "https://blob/outbound.wav")
+    monkeypatch.setattr(main, "create_private_audio_artifact", lambda *_args: "private-attempt")
+    deleted_artifacts = []
+    monkeypatch.setattr(
+        main,
+        "delete_private_audio_artifact",
+        lambda user_id, artifact_id: deleted_artifacts.append((user_id, artifact_id)),
+    )
+    if outcome == "loser":
+        winner = {
+            "state": "completed",
+            "payload_hash": main.delivery_payload_hash("user-b", "Send Amy a voice message"),
+            "published": True,
+            "response": {"reply": "winner"},
+        }
+        monkeypatch.setattr(main, "persist_delivery_once", lambda **_kwargs: (winner, False))
+    else:
+        monkeypatch.setattr(main, "confirm_friend_delivery_before_publish", lambda *_args: False)
+
+    response = signed_in_client.post(
+        "/api/chat",
+        json={"message": "Send Amy a voice message", "request_id": f"private-{outcome}"},
+    )
+
+    assert response.status_code == (200 if outcome == "loser" else 403)
+    assert deleted_artifacts == [("user-a", "private-attempt")]
+
+
+@pytest.mark.parametrize("route_kind", ["forward", "assist"])
+def test_ai_outbound_transient_confirm_failure_keeps_durable_media_for_retry(
+    signed_in_client, route_stubs, monkeypatch, route_kind
+):
+    service, _saved = route_stubs
+    service.assist_decision = {"send_to_friend": True, "voice": False, "reason": "send"}
+    service.media_decision = {"draw_image": True, "create_music": False}
+    service.composed = {"as_user": False, "message_to_friend": "Hello Amy"}
+    service.text = "Delivery confirmed."
+    monkeypatch.setattr(
+        main,
+        "get_friend_context",
+        lambda *_args: {"friend_name": "Amy", "special_prompt": "", "relationship": "friends"},
+    )
+    if route_kind == "forward":
+        monkeypatch.setattr(main, "has_forward_intent_in_ai_room", lambda _text: True)
+        monkeypatch.setattr(main, "find_friend_from_message", lambda *_args: {"id": "user-b"})
+        path = "/api/chat"
+        payload = {"contact_id": "pisces-core", "message": "Tell Amy hello", "request_id": "confirm-transient-forward"}
+    else:
+        path = "/api/assist/message"
+        payload = {"contact_id": "user-b", "message": "Tell Amy hello", "request_id": "confirm-transient-assist"}
+    user_doc = SimpleNamespace(exists=True, to_dict=lambda: {"display_name": "Bo"})
+    users = SimpleNamespace(document=lambda _uid: SimpleNamespace(get=lambda: user_doc))
+    monkeypatch.setattr(main, "get_firestore_client", lambda: SimpleNamespace(collection=lambda _name: users))
+    monkeypatch.setattr(main, "upsert_chat_meta", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "generate_image_with_gemini", lambda *_args: (b"image", "image/png"))
+    monkeypatch.setattr(main, "upload_image_to_vercel_blob", lambda *_args: "https://blob/durable.png")
+    deleted = []
+    monkeypatch.setattr(main, "delete_vercel_blob", deleted.append)
+    monkeypatch.setattr(
+        main,
+        "confirm_friend_delivery_before_publish",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("transient firestore")),
+    )
+
+    response = signed_in_client.post(path, json=payload)
+
+    assert response.status_code == 500
+    assert deleted == []
 
 
 def test_chat_media_generators_run_only_after_openai_media_decision(

@@ -778,7 +778,7 @@ def upload_avatar_to_vercel_blob(user_id, image_bytes, mime_type="image/webp"):
     if not image_bytes:
         raise RuntimeError("avatar image payload is empty")
 
-    pathname = f"avatars/{user_id}/avatar_{int(datetime.now(timezone.utc).timestamp() * 1000)}.webp"
+    pathname = f"avatars/{user_id}/avatar_{uuid.uuid4().hex}.webp"
     endpoint = f"https://vercel.com/api/blob/?{urlencode({'pathname': pathname})}"
     req = request.Request(
         endpoint,
@@ -787,7 +787,6 @@ def upload_avatar_to_vercel_blob(user_id, image_bytes, mime_type="image/webp"):
             "Authorization": f"Bearer {token}",
             "x-vercel-blob-access": "public",
             "x-content-type": mime_type or "image/webp",
-            "x-add-random-suffix": "0",
             "x-api-version": "12",
             "Content-Type": mime_type or "image/webp",
         },
@@ -830,7 +829,7 @@ def upload_audio_to_vercel_blob(user_id, audio_bytes, mime_type="audio/wav"):
 
     ext = _audio_ext_from_mime(mime_type)
     content_type = mime_type or "audio/wav"
-    pathname = f"audios/{user_id}/voice_{int(datetime.now(timezone.utc).timestamp() * 1000)}.{ext}"
+    pathname = f"audios/{user_id}/voice_{uuid.uuid4().hex}.{ext}"
     endpoint = f"https://vercel.com/api/blob/?{urlencode({'pathname': pathname})}"
     req = request.Request(
         endpoint,
@@ -839,7 +838,6 @@ def upload_audio_to_vercel_blob(user_id, audio_bytes, mime_type="audio/wav"):
             "Authorization": f"Bearer {token}",
             "x-vercel-blob-access": "public",
             "x-content-type": content_type,
-            "x-add-random-suffix": "0",
             "x-api-version": "12",
             "Content-Type": content_type,
         },
@@ -981,6 +979,27 @@ def get_private_audio_artifact(user_id, artifact_id):
     return snapshot.to_dict() if snapshot.exists else None
 
 
+def delete_private_audio_artifact(user_id, artifact_id):
+    if not user_id or not artifact_id:
+        return False
+    ref = (
+        get_firestore_client()
+        .collection("users")
+        .document(user_id)
+        .collection("audio_artifacts")
+        .document(artifact_id)
+    )
+    snapshot = ref.get()
+    if not snapshot.exists:
+        return False
+    artifact = snapshot.to_dict() or {}
+    blob_url = (artifact.get("blob_url") or "").strip()
+    ref.delete()
+    if blob_url:
+        delete_vercel_blob(blob_url)
+    return True
+
+
 def create_private_audio_artifact(user_id, audio_bytes, mime_type="audio/wav"):
     if not audio_bytes or len(audio_bytes) > MAX_AUDIO_BYTES:
         raise ValueError("invalid private audio artifact")
@@ -989,17 +1008,24 @@ def create_private_audio_artifact(user_id, audio_bytes, mime_type="audio/wav"):
     aad = f"{user_id}:{artifact_id}".encode("utf-8")
     ciphertext = AESGCM(get_audio_artifact_key()).encrypt(nonce, audio_bytes, aad)
     audio_url = upload_private_audio_ciphertext(artifact_id, ciphertext)
-    save_private_audio_artifact(
-        user_id,
-        artifact_id,
-        {
-            "blob_url": audio_url,
-            "nonce": base64.b64encode(nonce).decode("ascii"),
-            "audio_mime_type": mime_type or "audio/wav",
-            "plaintext_size": len(audio_bytes),
-            "ciphertext_size": len(ciphertext),
-        },
-    )
+    try:
+        save_private_audio_artifact(
+            user_id,
+            artifact_id,
+            {
+                "blob_url": audio_url,
+                "nonce": base64.b64encode(nonce).decode("ascii"),
+                "audio_mime_type": mime_type or "audio/wav",
+                "plaintext_size": len(audio_bytes),
+                "ciphertext_size": len(ciphertext),
+            },
+        )
+    except Exception:
+        try:
+            delete_vercel_blob(audio_url)
+        except Exception:
+            pass
+        raise
     return artifact_id
 
 
@@ -1041,7 +1067,7 @@ def upload_image_to_vercel_blob(user_id, image_bytes, mime_type="image/png"):
 
     ext = "png" if "png" in (mime_type or "").lower() else "jpg"
     content_type = mime_type or "image/png"
-    pathname = f"images/{user_id}/image_{int(datetime.now(timezone.utc).timestamp() * 1000)}.{ext}"
+    pathname = f"images/{user_id}/image_{uuid.uuid4().hex}.{ext}"
     endpoint = f"https://vercel.com/api/blob/?{urlencode({'pathname': pathname})}"
     req = request.Request(
         endpoint,
@@ -1050,7 +1076,6 @@ def upload_image_to_vercel_blob(user_id, image_bytes, mime_type="image/png"):
             "Authorization": f"Bearer {token}",
             "x-vercel-blob-access": "public",
             "x-content-type": content_type,
-            "x-add-random-suffix": "0",
             "x-api-version": "12",
             "Content-Type": content_type,
         },
@@ -1519,6 +1544,13 @@ def persist_delivery_once(
                 **receipt_data,
                 "payload_hash": payload_hash,
                 "rollback_meta": rollback_meta,
+                "rollback_meta_expected": {
+                    f'{write["user_id"]}:{write["contact_id"]}': {
+                        "preview_text": (write.get("preview_text") or "")[:280],
+                        "unread_increment": int(write.get("unread_increment") or 0),
+                    }
+                    for write in meta_writes
+                },
                 "rollback_message_refs": [
                     {
                         "user_id": write["user_id"],
@@ -2674,6 +2706,7 @@ def confirm_friend_delivery_before_publish(
             tx.delete(sender_message_ref)
             tx.delete(recipient_message_ref)
         effective_rollback_meta = receipt.get("rollback_meta") or rollback_meta or {}
+        rollback_meta_expected = receipt.get("rollback_meta_expected") or {}
         for user_id, contact_id, ref, snapshot in (
             (sender_user_id, recipient_user_id, sender_meta_ref, sender_meta_snapshot),
             (recipient_user_id, sender_user_id, recipient_meta_ref, recipient_meta_snapshot),
@@ -2681,16 +2714,174 @@ def confirm_friend_delivery_before_publish(
             current = snapshot.to_dict() if snapshot.exists else {}
             if current.get("direct_delivery_guard") != message_id:
                 continue
-            prior = effective_rollback_meta.get(f"{user_id}:{contact_id}")
-            if prior is None:
+            meta_key = f"{user_id}:{contact_id}"
+            prior = effective_rollback_meta.get(meta_key)
+            if meta_key not in rollback_meta_expected:
+                if prior is None:
+                    tx.delete(ref)
+                else:
+                    tx.set(ref, prior)
+                continue
+            prior_values = dict(prior or {})
+            expected = rollback_meta_expected.get(meta_key) or {}
+            restored = dict(current)
+            if current.get("last_message_preview") == expected.get("preview_text"):
+                for field in ("last_message_preview", "last_message_at"):
+                    if field in prior_values:
+                        restored[field] = prior_values[field]
+                    else:
+                        restored.pop(field, None)
+            if "direct_delivery_guard" in prior_values:
+                restored["direct_delivery_guard"] = prior_values["direct_delivery_guard"]
+            else:
+                restored.pop("direct_delivery_guard", None)
+            unread_increment = int(expected.get("unread_increment") or 0)
+            prior_read_at = prior_values.get("last_read_at")
+            read_state_unchanged = current.get("last_read_at") == prior_read_at
+            current_unread = current.get("unread_count")
+            prior_unread = int(prior_values.get("unread_count") or 0)
+            increment_value = getattr(current_unread, "value", None)
+            unread_matches_delivery = (
+                current_unread == prior_unread + unread_increment
+                or increment_value == unread_increment
+            )
+            if unread_increment and read_state_unchanged and unread_matches_delivery:
+                if "unread_count" in prior_values:
+                    restored["unread_count"] = prior_values["unread_count"]
+                else:
+                    restored.pop("unread_count", None)
+            if read_state_unchanged:
+                if "updated_at" in prior_values:
+                    restored["updated_at"] = prior_values["updated_at"]
+                else:
+                    restored.pop("updated_at", None)
+            if not restored:
                 tx.delete(ref)
             else:
-                tx.set(ref, prior)
+                tx.set(ref, restored)
         if receipt_ref is not None:
             tx.delete(receipt_ref)
         return False
 
     return commit(transaction)
+
+
+PUBLISH_LEASE_SECONDS = 30
+
+
+def claim_friend_delivery_publish(
+    user_id, route_name, request_id, payload_hash, recipient_user_id
+):
+    client = get_firestore_client()
+    receipt_ref = _delivery_receipt_ref(user_id, route_name, request_id)
+    friendship_ref, _pair_key, user_a_id, user_b_id = _friendship_reference(
+        client, user_id, recipient_user_id
+    )
+    owner_token = secrets.token_urlsafe(24)
+    now = datetime.now(timezone.utc)
+    lease_expires_at = now + timedelta(seconds=PUBLISH_LEASE_SECONDS)
+    transaction = client.transaction()
+
+    @firestore.transactional
+    def commit(tx):
+        receipt_snapshot = next(iter(tx.get(receipt_ref)))
+        receipt = receipt_snapshot.to_dict() if receipt_snapshot.exists else {}
+        if not receipt or not _delivery_receipt_is_completed(receipt):
+            return receipt, "", "missing"
+        if receipt.get("payload_hash") != payload_hash:
+            raise ValueError("request_id was already used for a different delivery")
+        if receipt.get("published"):
+            return receipt, "", "published"
+        expected_generation = receipt.get("friendship_generation") or ""
+        if not expected_generation:
+            return receipt, "", "legacy"
+        friendship_snapshot = next(iter(tx.get(friendship_ref)))
+        friendship_values = friendship_snapshot.to_dict() if friendship_snapshot.exists else {}
+        current_generation = friendship_generation_token(friendship_values)
+        if not _is_accepted_friendship_snapshot(
+            friendship_snapshot, user_a_id, user_b_id
+        ) or current_generation != expected_generation:
+            return receipt, "", "stale"
+        active_owner = (receipt.get("publish_owner_token") or "").strip()
+        active_until = receipt.get("publish_lease_expires_at")
+        if active_owner and isinstance(active_until, datetime) and active_until > now:
+            return receipt, "", "busy"
+        tx.set(
+            receipt_ref,
+            {
+                "publish_owner_token": owner_token,
+                "publish_lease_expires_at": lease_expires_at,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        return {
+            **receipt,
+            "publish_owner_token": owner_token,
+            "publish_lease_expires_at": lease_expires_at,
+        }, owner_token, "claimed"
+
+    return commit(transaction)
+
+
+def finalize_friend_delivery_publish(user_id, route_name, request_id, owner_token):
+    client = get_firestore_client()
+    receipt_ref = _delivery_receipt_ref(user_id, route_name, request_id)
+    transaction = client.transaction()
+
+    @firestore.transactional
+    def commit(tx):
+        snapshot = next(iter(tx.get(receipt_ref)))
+        receipt = snapshot.to_dict() if snapshot.exists else {}
+        if not receipt or receipt.get("publish_owner_token") != owner_token:
+            return False
+        tx.set(
+            receipt_ref,
+            {
+                "published": True,
+                "publish_owner_token": "",
+                "publish_lease_expires_at": datetime.now(timezone.utc),
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        return True
+
+    return commit(transaction)
+
+
+def release_friend_delivery_publish(user_id, route_name, request_id, owner_token):
+    client = get_firestore_client()
+    receipt_ref = _delivery_receipt_ref(user_id, route_name, request_id)
+    transaction = client.transaction()
+
+    @firestore.transactional
+    def commit(tx):
+        snapshot = next(iter(tx.get(receipt_ref)))
+        receipt = snapshot.to_dict() if snapshot.exists else {}
+        if not receipt or receipt.get("publish_owner_token") != owner_token:
+            return False
+        tx.set(
+            receipt_ref,
+            {"publish_lease_expires_at": datetime.now(timezone.utc)},
+            merge=True,
+        )
+        return True
+
+    return commit(transaction)
+
+
+def cleanup_delivery_owned_media(user_id, receipt):
+    for item in (receipt or {}).get("owned_media_refs") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            if item.get("kind") == "public_blob" and item.get("url"):
+                delete_vercel_blob(item["url"])
+            elif item.get("kind") == "private_audio" and item.get("artifact_id"):
+                delete_private_audio_artifact(user_id, item["artifact_id"])
+        except Exception:
+            pass
 
 
 def replay_friend_delivery_receipt(
@@ -2703,24 +2894,37 @@ def replay_friend_delivery_receipt(
     response = replay_delivery_response(receipt, user_id)
     stored_payload = receipt.get("ably_payload") or {}
     if stored_payload and not receipt.get("published"):
-        client = get_firestore_client()
-        friendship_ref, _pair_key, user_a_id, user_b_id = _friendship_reference(
-            client, user_id, recipient_user_id
+        claimed_receipt, publish_owner, claim_status = claim_friend_delivery_publish(
+            user_id, route_name, request_id, payload_hash, recipient_user_id
         )
-        friendship_snapshot = friendship_ref.get()
-        current_generation = friendship_generation_token(
-            friendship_snapshot.to_dict() if friendship_snapshot.exists else {}
-        )
-        expected_generation = receipt.get("friendship_generation") or ""
-        if not _is_accepted_friendship_snapshot(
-            friendship_snapshot, user_a_id, user_b_id
-        ) or (expected_generation and current_generation != expected_generation):
+        if claim_status == "stale":
+            still_valid = confirm_friend_delivery_before_publish(
+                get_firestore_client(),
+                user_id,
+                recipient_user_id,
+                (claimed_receipt.get("message_id") or stored_payload.get("message_id") or ""),
+                route_name,
+                request_id,
+            )
+            if not still_valid:
+                cleanup_delivery_owned_media(user_id, claimed_receipt)
             response["realtime_delivered"] = False
-        else:
+        elif claim_status in {"legacy", "busy", "missing"}:
+            response["realtime_delivered"] = False
+        elif claim_status == "claimed":
             try:
                 publish_user_channel_message(recipient_user_id, stored_payload)
-                save_delivery_receipt(user_id, route_name, request_id, {"published": True})
+                if not finalize_friend_delivery_publish(
+                    user_id, route_name, request_id, publish_owner
+                ):
+                    response["realtime_delivered"] = False
             except Exception:
+                try:
+                    release_friend_delivery_publish(
+                        user_id, route_name, request_id, publish_owner
+                    )
+                except Exception:
+                    pass
                 response["realtime_delivered"] = False
     return response
 
@@ -3114,6 +3318,7 @@ def chat():
         outbound_image_url = ""
         outbound_music_url = ""
         outbound_blob_urls = []
+        private_audio_artifact_ids = []
 
         def cleanup_outbound_blobs():
             for blob_url in dict.fromkeys(outbound_blob_urls):
@@ -3128,6 +3333,11 @@ def chat():
                         "blob_cleanup_failed",
                         request_id=request_id,
                     )
+            for artifact_id in dict.fromkeys(private_audio_artifact_ids):
+                try:
+                    delete_private_audio_artifact(user_id, artifact_id)
+                except Exception:
+                    pass
 
         if media_tools.get("draw_image"):
             try:
@@ -3243,6 +3453,7 @@ def chat():
                         base64.b64decode(audio_b64, validate=True),
                         audio_mime or "audio/wav",
                     )
+                    private_audio_artifact_ids.append(confirmation_audio_artifact_id)
             except Exception:
                 audio_b64 = ""
                 audio_mime = ""
@@ -3271,6 +3482,13 @@ def chat():
                     "ably_payload": payload,
                     "published": False,
                     "response": receipt_response_without_audio(response_payload),
+                    "owned_media_refs": [
+                        *({"kind": "public_blob", "url": url} for url in outbound_blob_urls),
+                        *(
+                            {"kind": "private_audio", "artifact_id": artifact_id}
+                            for artifact_id in private_audio_artifact_ids
+                        ),
+                    ],
                     **({"audio_artifact_id": confirmation_audio_artifact_id} if confirmation_audio_artifact_id else {}),
                 },
                 owner_token=delivery_owner,
@@ -3297,31 +3515,30 @@ def chat():
                     target_id,
                 )
             )
-        if not confirm_friend_delivery_before_publish(
-            get_firestore_client(),
-            user_id,
-            target_id,
-            canonical_message_id,
-            "chat_forward",
-            request_id,
-        ):
-            cleanup_outbound_blobs()
-            return jsonify({"error": "accepted friendship required"}), 403
         try:
-            publish_user_channel_message(target_id, payload)
-            save_delivery_receipt(
-                user_id, "chat_forward", request_id, {"published": True}
-            )
-        except Exception:
-            log_tool_error(
+            confirmed = confirm_friend_delivery_before_publish(
+                get_firestore_client(),
                 user_id,
                 target_id,
-                "ably_publish",
-                "chat_ai_room_forward",
-                "publish_failed",
-                request_id=request_id,
+                canonical_message_id,
+                "chat_forward",
+                request_id,
             )
-        return jsonify(response_payload)
+        except Exception:
+            return jsonify({"error": "Message delivery is currently unavailable."}), 500
+        if not confirmed:
+            cleanup_outbound_blobs()
+            return jsonify({"error": "accepted friendship required"}), 403
+        return jsonify(
+            replay_friend_delivery_receipt(
+                stored_receipt,
+                user_id,
+                "chat_forward",
+                request_id,
+                payload_hash,
+                target_id,
+            )
+        )
 
     ai_settings = get_user_ai_settings(user_id)
     history_range = get_user_history_range(user_id)
@@ -5128,6 +5345,7 @@ def assist_message():
         return jsonify({"ok": False, "error": str(exc)}), 400
     delivery_owner = ""
     outbound_blob_urls = []
+    private_audio_artifact_ids = []
     outbound_blobs_durable = False
 
     def cleanup_outbound_blobs():
@@ -5143,6 +5361,11 @@ def assist_message():
                     "blob_cleanup_failed",
                     request_id=request_id,
                 )
+        for artifact_id in dict.fromkeys(private_audio_artifact_ids):
+            try:
+                delete_private_audio_artifact(user_id, artifact_id)
+            except Exception:
+                pass
 
     try:
         friend_ctx = get_friend_context(user_id, contact_id)
@@ -5409,6 +5632,7 @@ def assist_message():
                         base64.b64decode(audio_b64, validate=True),
                         audio_mime_type or "audio/wav",
                     )
+                    private_audio_artifact_ids.append(private_audio_artifact_id)
                 except Exception:
                     audio_b64 = ""
                     audio_mime_type = ""
@@ -5457,6 +5681,13 @@ def assist_message():
                     "ably_payload": ably_payload or {},
                     "published": False,
                     "response": receipt_response_without_audio(response_payload, "assist_group"),
+                    "owned_media_refs": [
+                        *({"kind": "public_blob", "url": url} for url in outbound_blob_urls),
+                        *(
+                            {"kind": "private_audio", "artifact_id": artifact_id}
+                            for artifact_id in private_audio_artifact_ids
+                        ),
+                    ],
                     **({"audio_artifact_id": private_audio_artifact_id} if private_audio_artifact_id else {}),
                 },
                 owner_token=delivery_owner,
@@ -5474,35 +5705,31 @@ def assist_message():
                         contact_id,
                     )
                 )
-            if not confirm_friend_delivery_before_publish(
-                get_firestore_client(),
-                user_id,
-                contact_id,
-                canonical_message_id,
-                "assist_message",
-                request_id,
-            ):
+            outbound_blobs_durable = True
+            try:
+                confirmed = confirm_friend_delivery_before_publish(
+                    get_firestore_client(),
+                    user_id,
+                    contact_id,
+                    canonical_message_id,
+                    "assist_message",
+                    request_id,
+                )
+            except Exception:
+                return jsonify({"ok": False, "error": "Sorry, assist mode is currently unavailable."}), 500
+            if not confirmed:
                 cleanup_outbound_blobs()
                 return jsonify({"ok": False, "error": "accepted friendship required"}), 403
-            outbound_blobs_durable = True
-            if ably_payload:
-                try:
-                    publish_user_channel_message(contact_id, ably_payload)
-                    save_delivery_receipt(
-                        user_id,
-                        "assist_message",
-                        request_id,
-                        {"published": True},
-                    )
-                except Exception:
-                    log_tool_error(
-                        user_id,
-                        contact_id,
-                        "ably_publish",
-                        "assist_message",
-                        "publish_failed",
-                        request_id=request_id,
-                    )
+            return jsonify(
+                replay_friend_delivery_receipt(
+                    stored_receipt,
+                    user_id,
+                    "assist_message",
+                    request_id,
+                    payload_hash,
+                    contact_id,
+                )
+            )
         else:
             stored_receipt, created = persist_delivery_once(
                 user_id=user_id,

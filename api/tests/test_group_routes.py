@@ -1504,7 +1504,7 @@ def test_unpublished_direct_replay_does_not_cross_friendship_generation(
     assert response.status_code == 200
     assert response.get_json()["realtime_delivered"] is False
     assert published == []
-    assert firestore.read(receipt_path)["published"] is False
+    assert firestore.read(receipt_path) is None
 
 
 @pytest.mark.parametrize("publish_succeeds", [True, False])
@@ -1514,13 +1514,13 @@ def test_unpublished_text_replay_reports_and_records_republish_outcome(
     firestore = FakeFirestoreClient()
     firestore.seed("users/user-a", display_name="Alice")
     firestore.seed("users/user-b", display_name="Bob")
-    firestore.seed("friendships/user-a_user-b", user_a_id="user-a", user_b_id="user-b", status="accepted")
+    firestore.seed("friendships/user-a_user-b", user_a_id="user-a", user_b_id="user-b", status="accepted", accepted_at="generation-1")
     request_id = f"republish-{publish_succeeds}"
     payload = {"message_id": "message-1", "sender_user_id": "user-a", "recipient_user_id": "user-b", "text": "stored"}
     payload_hash = main.delivery_payload_hash("user-b", {"text": "stored", "image_url": "", "music_url": ""})
     receipt_id = main.hashlib.sha256(f"direct_text:{request_id}".encode()).hexdigest()
     receipt_path = f"users/user-a/delivery_receipts/{receipt_id}"
-    firestore.seed(receipt_path, state="completed", payload_hash=payload_hash, published=False, ably_payload=payload, response={"ok": True, "message": payload})
+    firestore.seed(receipt_path, state="completed", payload_hash=payload_hash, friendship_generation="accepted_at:generation-1", published=False, ably_payload=payload, response={"ok": True, "message": payload})
     monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
     def publish(*_args):
         if not publish_succeeds:
@@ -1651,3 +1651,257 @@ def test_pre_publish_rollback_preserves_metadata_from_a_newer_friendship_generat
     assert firestore.read("users/user-b/chat_meta/user-a") == {
         "last_message_preview": "new relationship message"
     }
+
+
+def test_publish_claim_is_atomic_owner_scoped_and_stale_lease_recovers(monkeypatch):
+    firestore = FakeFirestoreClient()
+    request_id = "claim-1"
+    receipt_id = main.hashlib.sha256(f"chat_forward:{request_id}".encode()).hexdigest()
+    receipt_path = f"users/user-a/delivery_receipts/{receipt_id}"
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+        accepted_at="generation-1",
+    )
+    firestore.seed(
+        receipt_path,
+        state="completed",
+        payload_hash="hash-1",
+        friendship_generation="accepted_at:generation-1",
+        published=False,
+        response={"ok": True},
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+
+    first = main.claim_friend_delivery_publish(
+        "user-a", "chat_forward", request_id, "hash-1", "user-b"
+    )
+    second = main.claim_friend_delivery_publish(
+        "user-a", "chat_forward", request_id, "hash-1", "user-b"
+    )
+
+    assert first[1]
+    assert first[2] == "claimed"
+    assert second[1] == ""
+    assert second[2] == "busy"
+    assert main.finalize_friend_delivery_publish(
+        "user-a", "chat_forward", request_id, "wrong-owner"
+    ) is False
+    firestore.data[tuple(receipt_path.split("/"))]["publish_lease_expires_at"] = (
+        main.datetime.now(main.timezone.utc) - main.timedelta(seconds=1)
+    )
+    recovered = main.claim_friend_delivery_publish(
+        "user-a", "chat_forward", request_id, "hash-1", "user-b"
+    )
+    assert recovered[1] and recovered[1] != first[1]
+    assert main.finalize_friend_delivery_publish(
+        "user-a", "chat_forward", request_id, recovered[1]
+    ) is True
+    assert firestore.read(receipt_path)["published"] is True
+
+
+def test_legacy_unpublished_receipt_fails_closed_without_publication(
+    signed_in_client, monkeypatch
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+        accepted_at="generation-new",
+    )
+    request_id = "legacy-no-generation"
+    payload = {"message_id": "legacy-message", "text": "stored"}
+    payload_hash = main.delivery_payload_hash(
+        "user-b", {"text": "stored", "image_url": "", "music_url": ""}
+    )
+    receipt_id = main.hashlib.sha256(f"direct_text:{request_id}".encode()).hexdigest()
+    firestore.seed(
+        f"users/user-a/delivery_receipts/{receipt_id}",
+        state="completed",
+        payload_hash=payload_hash,
+        published=False,
+        ably_payload=payload,
+        response={"ok": True, "message": payload},
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    published = []
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *args: published.append(args))
+
+    response = signed_in_client.post(
+        "/api/messages/send",
+        json={"recipient_user_id": "user-b", "text": "stored", "request_id": request_id},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["realtime_delivered"] is False
+    assert published == []
+
+
+def test_generation_mismatch_replay_rolls_back_receipt_messages_meta_and_owned_media(monkeypatch):
+    firestore = FakeFirestoreClient()
+    request_id = "stale-owned-media"
+    message_id = "stale-message"
+    receipt_id = main.hashlib.sha256(f"chat_forward:{request_id}".encode()).hexdigest()
+    receipt_path = f"users/user-a/delivery_receipts/{receipt_id}"
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+        accepted_at="generation-new",
+    )
+    for user_id, contact_id in (("user-a", "user-b"), ("user-b", "user-a")):
+        firestore.seed(f"users/{user_id}/chats/{contact_id}/messages/{message_id}", text="stale")
+        metadata = {
+            "last_message_preview": "stale",
+            "direct_delivery_guard": message_id,
+        }
+        if user_id == "user-b":
+            metadata["unread_count"] = 1
+        firestore.seed(f"users/{user_id}/chat_meta/{contact_id}", **metadata)
+    receipt = {
+        "state": "completed",
+        "payload_hash": "hash-1",
+        "friendship_generation": "accepted_at:generation-old",
+        "published": False,
+        "ably_payload": {"message_id": message_id},
+        "response": {"ok": True},
+        "message_id": message_id,
+        "rollback_message_refs": [
+            {"user_id": "user-a", "contact_id": "user-b", "message_id": message_id},
+            {"user_id": "user-b", "contact_id": "user-a", "message_id": message_id},
+        ],
+        "rollback_meta": {
+            "user-a:user-b": {"last_message_preview": "before"},
+            "user-b:user-a": {"last_message_preview": "before", "unread_count": 0},
+        },
+        "rollback_meta_expected": {
+            "user-a:user-b": {"preview_text": "stale", "unread_increment": 0},
+            "user-b:user-a": {"preview_text": "stale", "unread_increment": 1},
+        },
+        "owned_media_refs": [
+            {"kind": "public_blob", "url": "https://blob/stale.png"},
+            {"kind": "private_audio", "artifact_id": "private-stale"},
+        ],
+    }
+    firestore.seed(receipt_path, **receipt)
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    deleted_blobs = []
+    deleted_artifacts = []
+    monkeypatch.setattr(main, "delete_vercel_blob", deleted_blobs.append)
+    monkeypatch.setattr(
+        main,
+        "delete_private_audio_artifact",
+        lambda user_id, artifact_id: deleted_artifacts.append((user_id, artifact_id)),
+    )
+    published = []
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *args: published.append(args))
+
+    response = main.replay_friend_delivery_receipt(
+        receipt, "user-a", "chat_forward", request_id, "hash-1", "user-b"
+    )
+
+    assert response["realtime_delivered"] is False
+    assert published == []
+    assert firestore.read(receipt_path) is None
+    assert not any("messages" in key for key in firestore.data)
+    assert firestore.read("users/user-a/chat_meta/user-b") == {"last_message_preview": "before"}
+    assert firestore.read("users/user-b/chat_meta/user-a") == {
+        "last_message_preview": "before",
+        "unread_count": 0,
+    }
+    assert deleted_blobs == ["https://blob/stale.png"]
+    assert deleted_artifacts == [("user-a", "private-stale")]
+
+
+def test_stale_claim_does_not_cleanup_media_when_rollback_reread_confirms_generation(monkeypatch):
+    receipt = {
+        "state": "completed",
+        "payload_hash": "hash-1",
+        "published": False,
+        "ably_payload": {"message_id": "message-1"},
+        "response": {"ok": True},
+        "owned_media_refs": [
+            {"kind": "public_blob", "url": "https://blob/keep.png"}
+        ],
+    }
+    monkeypatch.setattr(
+        main, "claim_friend_delivery_publish", lambda *_args: (receipt, "", "stale")
+    )
+    monkeypatch.setattr(main, "confirm_friend_delivery_before_publish", lambda *_args: True)
+    deleted = []
+    monkeypatch.setattr(main, "delete_vercel_blob", deleted.append)
+
+    response = main.replay_friend_delivery_receipt(
+        receipt, "user-a", "chat_forward", "request-1", "hash-1", "user-b"
+    )
+
+    assert response["realtime_delivered"] is False
+    assert deleted == []
+
+
+def test_revoke_rollback_preserves_concurrent_mark_read_state(monkeypatch):
+    firestore = FakeFirestoreClient()
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+        accepted_at="generation-1",
+    )
+    firestore.seed("users/user-a/chat_meta/user-b", last_message_preview="sender before")
+    firestore.seed(
+        "users/user-b/chat_meta/user-a",
+        last_message_preview="recipient before",
+        unread_count=4,
+        last_read_at="read-before",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    receipt, created = main.persist_delivery_once(
+        user_id="user-a",
+        route_name="assist_message",
+        request_id="mark-read-race",
+        payload_hash="hash-1",
+        owner_token="owner-1",
+        friendship_user_ids=("user-a", "user-b"),
+        message_writes=[
+            {"user_id": "user-a", "contact_id": "user-b", "role": "ai_proxy", "text": "sent", "message_id": "message-1"},
+            {"user_id": "user-b", "contact_id": "user-a", "role": "peer", "text": "sent", "message_id": "message-1"},
+        ],
+        meta_writes=[
+            {"user_id": "user-a", "contact_id": "user-b", "preview_text": "sent"},
+            {"user_id": "user-b", "contact_id": "user-a", "preview_text": "sent", "unread_increment": 1},
+        ],
+        receipt_data={"message_id": "message-1", "response": {"ok": True}},
+    )
+    assert created and receipt["friendship_generation"] == "accepted_at:generation-1"
+    firestore.seed(
+        "users/user-b/chat_meta/user-a",
+        last_message_preview="sent",
+        direct_delivery_guard="message-1",
+        unread_count=0,
+        last_read_at="read-after",
+        updated_at="read-update",
+    )
+    firestore.data.pop(("friendships", "user-a_user-b"), None)
+
+    assert main.confirm_friend_delivery_before_publish(
+        firestore,
+        "user-a",
+        "user-b",
+        "message-1",
+        "assist_message",
+        "mark-read-race",
+    ) is False
+    recipient_meta = firestore.read("users/user-b/chat_meta/user-a")
+    assert recipient_meta["unread_count"] == 0
+    assert recipient_meta["last_read_at"] == "read-after"
+    assert recipient_meta["updated_at"] == "read-update"
+    assert recipient_meta["last_message_preview"] == "recipient before"
+    assert "direct_delivery_guard" not in recipient_meta
