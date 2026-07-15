@@ -861,6 +861,25 @@ def test_delete_private_audio_artifact_removes_firestore_record_and_ciphertext(m
     assert deleted == ["https://opaque.public.blob.vercel-storage.com/artifact-1.bin"]
 
 
+def test_delete_private_audio_artifact_keeps_record_when_blob_delete_fails(monkeypatch):
+    firestore = FakeFirestoreClient()
+    artifact_path = "users/user-a/audio_artifacts/artifact-retry"
+    firestore.seed(
+        artifact_path,
+        blob_url="https://opaque.public.blob.vercel-storage.com/artifact-retry.bin",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(
+        main,
+        "delete_vercel_blob",
+        lambda _url: (_ for _ in ()).throw(RuntimeError("transient delete")),
+    )
+
+    with pytest.raises(RuntimeError, match="transient delete"):
+        main.delete_private_audio_artifact("user-a", "artifact-retry")
+    assert firestore.read(artifact_path) is not None
+
+
 def test_private_audio_artifact_cleans_ciphertext_when_metadata_save_fails(monkeypatch):
     monkeypatch.setattr(main, "get_audio_artifact_key", lambda: b"k" * 32)
     monkeypatch.setattr(

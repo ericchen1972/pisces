@@ -1010,9 +1010,9 @@ def delete_private_audio_artifact(user_id, artifact_id):
         return False
     artifact = snapshot.to_dict() or {}
     blob_url = (artifact.get("blob_url") or "").strip()
-    ref.delete()
     if blob_url:
         delete_vercel_blob(blob_url)
+    ref.delete()
     return True
 
 
@@ -1385,6 +1385,17 @@ def _delivery_receipt_ref(user_id, route_name, request_id):
         .document(user_id)
         .collection("delivery_receipts")
         .document(receipt_id)
+    )
+
+
+def _delivery_cleanup_ref(user_id, route_name, request_id):
+    cleanup_id = hashlib.sha256(f"{route_name}:{request_id}".encode("utf-8")).hexdigest()
+    return (
+        get_firestore_client()
+        .collection("users")
+        .document(user_id)
+        .collection("delivery_cleanup_jobs")
+        .document(cleanup_id)
     )
 
 
@@ -2674,6 +2685,11 @@ def confirm_friend_delivery_before_publish(
         if receipt_route_name and receipt_request_id
         else None
     )
+    cleanup_ref = (
+        _delivery_cleanup_ref(sender_user_id, receipt_route_name, receipt_request_id)
+        if receipt_route_name and receipt_request_id
+        else None
+    )
 
     @firestore.transactional
     def commit(tx):
@@ -2775,6 +2791,26 @@ def confirm_friend_delivery_before_publish(
                 tx.delete(ref)
             else:
                 tx.set(ref, restored)
+        owned_media_refs = []
+        for item in receipt.get("owned_media_refs") or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("kind") == "public_blob" and item.get("url"):
+                owned_media_refs.append({"kind": "public_blob", "url": item["url"]})
+            elif item.get("kind") == "private_audio" and item.get("artifact_id"):
+                owned_media_refs.append(
+                    {"kind": "private_audio", "artifact_id": item["artifact_id"]}
+                )
+        if cleanup_ref is not None and owned_media_refs:
+            tx.set(
+                cleanup_ref,
+                {
+                    "route_name": receipt_route_name,
+                    "request_id": receipt_request_id,
+                    "owned_media_refs": owned_media_refs,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
         if receipt_ref is not None:
             tx.delete(receipt_ref)
         return False
@@ -2808,6 +2844,13 @@ def claim_friend_delivery_publish(
             raise ValueError("request_id was already used for a different delivery")
         if receipt.get("published"):
             return receipt, "", "published"
+        # This lease is the authorization linearization point. Ably publication
+        # cannot share a transaction with Firestore, so a live owner remains
+        # authorized even if the friendship changes after this claim.
+        active_owner = (receipt.get("publish_owner_token") or "").strip()
+        active_until = receipt.get("publish_lease_expires_at")
+        if active_owner and isinstance(active_until, datetime) and active_until > now:
+            return receipt, "", "busy"
         expected_generation = receipt.get("friendship_generation") or ""
         if not expected_generation:
             return receipt, "", "legacy"
@@ -2818,10 +2861,6 @@ def claim_friend_delivery_publish(
             friendship_snapshot, user_a_id, user_b_id
         ) or current_generation != expected_generation:
             return receipt, "", "stale"
-        active_owner = (receipt.get("publish_owner_token") or "").strip()
-        active_until = receipt.get("publish_lease_expires_at")
-        if active_owner and isinstance(active_until, datetime) and active_until > now:
-            return receipt, "", "busy"
         tx.set(
             receipt_ref,
             {
@@ -2900,6 +2939,42 @@ def cleanup_delivery_owned_media(user_id, receipt):
             pass
 
 
+def drain_delivery_cleanup_job(user_id, route_name, request_id):
+    cleanup_ref = _delivery_cleanup_ref(user_id, route_name, request_id)
+    snapshot = cleanup_ref.get()
+    if not snapshot.exists:
+        return None
+    job = snapshot.to_dict() or {}
+    remaining = [
+        dict(item)
+        for item in (job.get("owned_media_refs") or [])
+        if isinstance(item, dict)
+    ]
+    for item in list(remaining):
+        try:
+            if item.get("kind") == "public_blob" and item.get("url"):
+                delete_vercel_blob(item["url"])
+            elif item.get("kind") == "private_audio" and item.get("artifact_id"):
+                delete_private_audio_artifact(user_id, item["artifact_id"])
+            else:
+                remaining.remove(item)
+                continue
+        except Exception:
+            continue
+        remaining.remove(item)
+        if remaining:
+            cleanup_ref.set(
+                {
+                    **job,
+                    "owned_media_refs": remaining,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                }
+            )
+        else:
+            cleanup_ref.delete()
+    return not remaining
+
+
 def replay_friend_delivery_receipt(
     receipt, user_id, route_name, request_id, payload_hash, recipient_user_id
 ):
@@ -2923,9 +2998,13 @@ def replay_friend_delivery_receipt(
                 request_id,
             )
             if not still_valid:
-                cleanup_delivery_owned_media(user_id, claimed_receipt)
+                drained = drain_delivery_cleanup_job(user_id, route_name, request_id)
+                if drained is None:
+                    cleanup_delivery_owned_media(user_id, claimed_receipt)
             response["realtime_delivered"] = False
         elif claim_status in {"legacy", "busy", "missing"}:
+            if claim_status == "missing":
+                drain_delivery_cleanup_job(user_id, route_name, request_id)
             response["realtime_delivered"] = False
         elif claim_status == "claimed":
             try:
@@ -3546,7 +3625,11 @@ def chat():
         except Exception:
             return jsonify({"error": "Message delivery is currently unavailable."}), 500
         if not confirmed:
-            cleanup_outbound_blobs()
+            drained = drain_delivery_cleanup_job(
+                user_id, "chat_forward", request_id
+            )
+            if drained is None:
+                cleanup_outbound_blobs()
             return jsonify({"error": "accepted friendship required"}), 403
         return jsonify(
             replay_friend_delivery_receipt(
@@ -5749,7 +5832,11 @@ def assist_message():
             except Exception:
                 return jsonify({"ok": False, "error": "Sorry, assist mode is currently unavailable."}), 500
             if not confirmed:
-                cleanup_outbound_blobs()
+                drained = drain_delivery_cleanup_job(
+                    user_id, "assist_message", request_id
+                )
+                if drained is None:
+                    cleanup_outbound_blobs()
                 return jsonify({"ok": False, "error": "accepted friendship required"}), 403
             return jsonify(
                 replay_friend_delivery_receipt(

@@ -1702,6 +1702,45 @@ def test_publish_claim_is_atomic_owner_scoped_and_stale_lease_recovers(monkeypat
     assert firestore.read(receipt_path)["published"] is True
 
 
+def test_active_publish_lease_remains_authorized_after_friendship_revoke(monkeypatch):
+    firestore = FakeFirestoreClient()
+    request_id = "active-owner-revoke"
+    receipt_id = main.hashlib.sha256(f"chat_forward:{request_id}".encode()).hexdigest()
+    receipt_path = f"users/user-a/delivery_receipts/{receipt_id}"
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+        accepted_at="generation-1",
+    )
+    firestore.seed(
+        receipt_path,
+        state="completed",
+        payload_hash="hash-1",
+        friendship_generation="accepted_at:generation-1",
+        published=False,
+        response={"ok": True},
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    first = main.claim_friend_delivery_publish(
+        "user-a", "chat_forward", request_id, "hash-1", "user-b"
+    )
+    firestore.data.pop(("friendships", "user-a_user-b"), None)
+
+    second = main.claim_friend_delivery_publish(
+        "user-a", "chat_forward", request_id, "hash-1", "user-b"
+    )
+
+    assert first[2] == "claimed"
+    assert second[2] == "busy"
+    assert firestore.read(receipt_path) is not None
+    assert main.finalize_friend_delivery_publish(
+        "user-a", "chat_forward", request_id, first[1]
+    ) is True
+    assert firestore.read(receipt_path)["published"] is True
+
+
 def test_legacy_unpublished_receipt_fails_closed_without_publication(
     signed_in_client, monkeypatch
 ):
@@ -1769,6 +1808,8 @@ def test_generation_mismatch_replay_rolls_back_receipt_messages_meta_and_owned_m
         "state": "completed",
         "payload_hash": "hash-1",
         "friendship_generation": "accepted_at:generation-old",
+        "publish_owner_token": "expired-owner",
+        "publish_lease_expires_at": main.datetime.now(main.timezone.utc) - main.timedelta(seconds=1),
         "published": False,
         "ably_payload": {"message_id": message_id},
         "response": {"ok": True},
@@ -1818,6 +1859,64 @@ def test_generation_mismatch_replay_rolls_back_receipt_messages_meta_and_owned_m
     }
     assert deleted_blobs == ["https://blob/stale.png"]
     assert deleted_artifacts == [("user-a", "private-stale")]
+
+
+def test_generation_rollback_cleanup_job_retries_transient_public_and_private_failures(monkeypatch):
+    firestore = FakeFirestoreClient()
+    request_id = "cleanup-retry"
+    message_id = "message-cleanup"
+    receipt_id = main.hashlib.sha256(f"assist_message:{request_id}".encode()).hexdigest()
+    receipt_path = f"users/user-a/delivery_receipts/{receipt_id}"
+    cleanup_path = f"users/user-a/delivery_cleanup_jobs/{receipt_id}"
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+        accepted_at="generation-new",
+    )
+    receipt = {
+        "state": "completed",
+        "payload_hash": "hash-1",
+        "friendship_generation": "accepted_at:generation-old",
+        "published": False,
+        "ably_payload": {"message_id": message_id},
+        "response": {"ok": True},
+        "message_id": message_id,
+        "owned_media_refs": [
+            {"kind": "public_blob", "url": "https://blob/retry.png"},
+            {"kind": "private_audio", "artifact_id": "artifact-retry"},
+        ],
+    }
+    firestore.seed(receipt_path, **receipt)
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    failures = {"public": True, "private": True}
+
+    def delete_public(_url):
+        if failures["public"]:
+            raise RuntimeError("blob transient")
+
+    def delete_private(_user_id, _artifact_id):
+        if failures["private"]:
+            raise RuntimeError("artifact transient")
+        return True
+
+    monkeypatch.setattr(main, "delete_vercel_blob", delete_public)
+    monkeypatch.setattr(main, "delete_private_audio_artifact", delete_private)
+
+    response = main.replay_friend_delivery_receipt(
+        receipt, "user-a", "assist_message", request_id, "hash-1", "user-b"
+    )
+
+    assert response["realtime_delivered"] is False
+    assert firestore.read(receipt_path) is None
+    job = firestore.read(cleanup_path)
+    assert job and job["owned_media_refs"] == receipt["owned_media_refs"]
+    failures.update(public=False, private=False)
+    assert main.drain_delivery_cleanup_job(
+        "user-a", "assist_message", request_id
+    ) is True
+    assert firestore.read(cleanup_path) is None
 
 
 def test_stale_claim_does_not_cleanup_media_when_rollback_reread_confirms_generation(monkeypatch):
