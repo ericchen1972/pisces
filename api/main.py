@@ -1008,11 +1008,24 @@ def _private_audio_artifact_ref(user_id, artifact_id):
     )
 
 
+def _firestore_call_with_timeout(method, *args, timeout, **kwargs):
+    try:
+        return method(*args, timeout=timeout, **kwargs)
+    except TypeError as exc:
+        if "timeout" not in str(exc):
+            raise
+        return method(*args, **kwargs)
+
+
 def delete_private_audio_artifact(user_id, artifact_id, blob_timeout=30):
     if not user_id or not artifact_id:
         return False
     ref = _private_audio_artifact_ref(user_id, artifact_id)
-    snapshot = ref.get()
+    snapshot = (
+        _firestore_call_with_timeout(ref.get, timeout=blob_timeout)
+        if blob_timeout <= 1
+        else ref.get()
+    )
     if not snapshot.exists:
         return False
     artifact = snapshot.to_dict() or {}
@@ -1022,7 +1035,10 @@ def delete_private_audio_artifact(user_id, artifact_id, blob_timeout=30):
             delete_vercel_blob(blob_url)
         else:
             delete_vercel_blob(blob_url, timeout=blob_timeout)
-    ref.delete()
+    if blob_timeout <= 1:
+        _firestore_call_with_timeout(ref.delete, timeout=blob_timeout)
+    else:
+        ref.delete()
     return True
 
 
@@ -3014,29 +3030,90 @@ def release_friend_delivery_publish(user_id, route_name, request_id, owner_token
     return commit(transaction)
 
 
-def cleanup_delivery_owned_media(user_id, receipt):
-    for item in (receipt or {}).get("owned_media_refs") or []:
+def enqueue_delivery_cleanup_job(
+    user_id, route_name, request_id, receipt, *, firestore_timeout=1
+):
+    cleanup_ref = _delivery_cleanup_ref(user_id, route_name, request_id)
+    snapshot = _firestore_call_with_timeout(
+        cleanup_ref.get, timeout=firestore_timeout
+    )
+    existing = (snapshot.to_dict() or {}) if snapshot.exists else {}
+    merged = []
+    seen = set()
+    for item in list(existing.get("owned_media_refs") or []) + list(
+        (receipt or {}).get("owned_media_refs") or []
+    ):
         if not isinstance(item, dict):
             continue
-        try:
-            if item.get("kind") == "public_blob" and item.get("url"):
-                delete_vercel_blob(item["url"])
-            elif item.get("kind") == "private_audio" and item.get("artifact_id"):
-                delete_private_audio_artifact(user_id, item["artifact_id"])
-        except Exception:
-            pass
+        if item.get("kind") == "public_blob" and item.get("url"):
+            sanitized = {"kind": "public_blob", "url": item["url"]}
+            key = ("public_blob", item["url"])
+        elif item.get("kind") == "private_audio" and item.get("artifact_id"):
+            sanitized = {
+                "kind": "private_audio",
+                "artifact_id": item["artifact_id"],
+            }
+            key = ("private_audio", item["artifact_id"])
+        else:
+            continue
+        if key not in seen:
+            seen.add(key)
+            merged.append(sanitized)
+    if not merged:
+        return False
+    _firestore_call_with_timeout(
+        cleanup_ref.set,
+        {
+            "owner_user_id": user_id,
+            "route_name": route_name,
+            "request_id": request_id,
+            "status": "pending",
+            "owned_media_refs": merged,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        },
+        timeout=firestore_timeout,
+    )
+    return True
+
+
+def bounded_delivery_cleanup(user_id, route_name, request_id, receipt=None):
+    try:
+        drained = drain_delivery_cleanup_job(
+            user_id, route_name, request_id, max_refs=1, blob_timeout=1
+        )
+    except Exception:
+        return False
+    if drained is not None:
+        return drained
+    try:
+        enqueued = enqueue_delivery_cleanup_job(
+            user_id,
+            route_name,
+            request_id,
+            receipt,
+            firestore_timeout=1,
+        )
+    except Exception:
+        return False
+    if not enqueued:
+        return None
+    try:
+        return drain_delivery_cleanup_job(
+            user_id, route_name, request_id, max_refs=1, blob_timeout=1
+        )
+    except Exception:
+        return False
 
 
 def drain_delivery_cleanup_job(
     user_id, route_name, request_id, *, max_refs=None, blob_timeout=30
 ):
     cleanup_ref = _delivery_cleanup_ref(user_id, route_name, request_id)
-    try:
-        snapshot = (
-            cleanup_ref.get(timeout=1) if blob_timeout <= 1 else cleanup_ref.get()
-        )
-    except TypeError:
-        snapshot = cleanup_ref.get()
+    snapshot = (
+        _firestore_call_with_timeout(cleanup_ref.get, timeout=blob_timeout)
+        if blob_timeout <= 1
+        else cleanup_ref.get()
+    )
     if not snapshot.exists:
         return None
     job = snapshot.to_dict() or {}
@@ -3073,15 +3150,33 @@ def drain_delivery_cleanup_job(
             continue
         remaining.remove(item)
         if remaining:
-            cleanup_ref.set(
-                {
-                    **job,
-                    "owned_media_refs": remaining,
-                    "updated_at": firestore.SERVER_TIMESTAMP,
-                }
-            )
+            if blob_timeout <= 1:
+                _firestore_call_with_timeout(
+                    cleanup_ref.set,
+                    {
+                        **job,
+                        "status": "pending",
+                        "owned_media_refs": remaining,
+                        "updated_at": firestore.SERVER_TIMESTAMP,
+                    },
+                    timeout=blob_timeout,
+                )
+            else:
+                cleanup_ref.set(
+                    {
+                        **job,
+                        "status": "pending",
+                        "owned_media_refs": remaining,
+                        "updated_at": firestore.SERVER_TIMESTAMP,
+                    }
+                )
         else:
-            cleanup_ref.delete()
+            if blob_timeout <= 1:
+                _firestore_call_with_timeout(
+                    cleanup_ref.delete, timeout=blob_timeout
+                )
+            else:
+                cleanup_ref.delete()
     return not remaining
 
 
@@ -3133,9 +3228,11 @@ def drain_pending_delivery_cleanup_jobs(user_id, limit=5):
             or not request_id
             or not refs_valid
         ):
-            snapshot.reference.set(
+            _firestore_call_with_timeout(
+                snapshot.reference.set,
                 {"status": "invalid", "updated_at": firestore.SERVER_TIMESTAMP},
                 merge=True,
+                timeout=1,
             )
             continue
         attempted += 1
@@ -3168,9 +3265,7 @@ def replay_friend_delivery_receipt(
         raise ValueError("request_id was already used for a different delivery")
     response = replay_delivery_response(receipt, user_id)
     if receipt.get("state") == "revoked":
-        drain_delivery_cleanup_job(
-            user_id, route_name, request_id, max_refs=1, blob_timeout=1
-        )
+        bounded_delivery_cleanup(user_id, route_name, request_id, receipt)
         return response
     stored_payload = receipt.get("ably_payload") or {}
     if stored_payload and not receipt.get("published"):
@@ -3187,13 +3282,15 @@ def replay_friend_delivery_receipt(
                 request_id,
             )
             if not still_valid:
-                drained = drain_delivery_cleanup_job(user_id, route_name, request_id)
-                if drained is None:
-                    cleanup_delivery_owned_media(user_id, claimed_receipt)
+                bounded_delivery_cleanup(
+                    user_id, route_name, request_id, claimed_receipt
+                )
             response["realtime_delivered"] = False
         elif claim_status in {"legacy", "busy", "missing"}:
             if claim_status == "missing":
-                drain_delivery_cleanup_job(user_id, route_name, request_id)
+                bounded_delivery_cleanup(
+                    user_id, route_name, request_id, claimed_receipt
+                )
             response["realtime_delivered"] = False
         elif claim_status == "claimed":
             try:
@@ -3815,11 +3912,9 @@ def chat():
         except Exception:
             return jsonify({"error": "Message delivery is currently unavailable."}), 500
         if not confirmed:
-            drained = drain_delivery_cleanup_job(
-                user_id, "chat_forward", request_id
+            bounded_delivery_cleanup(
+                user_id, "chat_forward", request_id, stored_receipt
             )
-            if drained is None:
-                cleanup_outbound_blobs()
             return jsonify({"error": "accepted friendship required"}), 403
         return jsonify(
             replay_friend_delivery_receipt(
@@ -6023,11 +6118,9 @@ def assist_message():
             except Exception:
                 return jsonify({"ok": False, "error": "Sorry, assist mode is currently unavailable."}), 500
             if not confirmed:
-                drained = drain_delivery_cleanup_job(
-                    user_id, "assist_message", request_id
+                bounded_delivery_cleanup(
+                    user_id, "assist_message", request_id, stored_receipt
                 )
-                if drained is None:
-                    cleanup_outbound_blobs()
                 return jsonify({"ok": False, "error": "accepted friendship required"}), 403
             return jsonify(
                 replay_friend_delivery_receipt(

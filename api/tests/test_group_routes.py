@@ -1,5 +1,6 @@
 import base64
 import inspect
+from types import SimpleNamespace
 
 import pytest
 
@@ -1336,7 +1337,11 @@ def test_voice_delivery_succeeds_after_durable_write_when_realtime_publish_fails
     logged = []
     deleted_blobs = []
     monkeypatch.setattr(main, "publish_user_channel_message", fail_publish)
-    monkeypatch.setattr(main, "delete_vercel_blob", deleted_blobs.append)
+    monkeypatch.setattr(
+        main,
+        "delete_vercel_blob",
+        lambda url, timeout=30: deleted_blobs.append(url),
+    )
     monkeypatch.setattr(
         main,
         "log_tool_error",
@@ -1835,11 +1840,17 @@ def test_generation_mismatch_replay_rolls_back_receipt_messages_meta_and_owned_m
     monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
     deleted_blobs = []
     deleted_artifacts = []
-    monkeypatch.setattr(main, "delete_vercel_blob", deleted_blobs.append)
+    monkeypatch.setattr(
+        main,
+        "delete_vercel_blob",
+        lambda url, timeout=30: deleted_blobs.append(url),
+    )
     monkeypatch.setattr(
         main,
         "delete_private_audio_artifact",
-        lambda user_id, artifact_id: deleted_artifacts.append((user_id, artifact_id)),
+        lambda user_id, artifact_id, blob_timeout=30: deleted_artifacts.append(
+            (user_id, artifact_id)
+        ),
     )
     published = []
     monkeypatch.setattr(main, "publish_user_channel_message", lambda *args: published.append(args))
@@ -1858,7 +1869,11 @@ def test_generation_mismatch_replay_rolls_back_receipt_messages_meta_and_owned_m
         "unread_count": 0,
     }
     assert deleted_blobs == ["https://blob/stale.png"]
-    assert deleted_artifacts == [("user-a", "private-stale")]
+    assert deleted_artifacts == []
+    cleanup_path = f"users/user-a/delivery_cleanup_jobs/{receipt_id}"
+    assert firestore.read(cleanup_path)["owned_media_refs"] == [
+        {"kind": "private_audio", "artifact_id": "private-stale"}
+    ]
 
 
 def test_generation_rollback_cleanup_job_retries_transient_public_and_private_failures(monkeypatch):
@@ -2278,6 +2293,148 @@ def test_pending_query_skips_legacy_and_quarantines_malformed_without_permanent_
     assert firestore.read("users/user-a/delivery_cleanup_jobs/malformed")["status"] == "invalid"
     assert firestore.read(valid_path) is None
     assert deleted == [("https://blob/valid.png", 1)]
+
+
+def test_stale_replay_multi_ref_cleanup_attempts_one_and_keeps_pending(monkeypatch):
+    firestore = FakeFirestoreClient()
+    request_id = "stale-bounded-multi"
+    record_id = main.hashlib.sha256(f"chat_forward:{request_id}".encode()).hexdigest()
+    receipt_path = f"users/user-a/delivery_receipts/{record_id}"
+    cleanup_path = f"users/user-a/delivery_cleanup_jobs/{record_id}"
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+        accepted_at="new",
+    )
+    receipt = {
+        "state": "completed",
+        "payload_hash": "hash-1",
+        "friendship_generation": "accepted_at:old",
+        "published": False,
+        "ably_payload": {"message_id": "bounded-message"},
+        "response": {"ok": True},
+        "owned_media_refs": [
+            {"kind": "public_blob", "url": f"https://blob/bounded-{index}.png"}
+            for index in range(3)
+        ],
+    }
+    firestore.seed(receipt_path, **receipt)
+    calls = []
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(
+        main,
+        "delete_vercel_blob",
+        lambda url, timeout=30: calls.append((url, timeout)),
+    )
+
+    main.replay_friend_delivery_receipt(
+        receipt, "user-a", "chat_forward", request_id, "hash-1", "user-b"
+    )
+
+    assert calls == [("https://blob/bounded-0.png", 1)]
+    job = firestore.read(cleanup_path)
+    assert job["status"] == "pending"
+    assert len(job["owned_media_refs"]) == 2
+
+
+def test_cleanup_job_firestore_get_set_delete_and_quarantine_use_timeout(monkeypatch):
+    calls = []
+
+    class TimedRef:
+        def __init__(self, refs):
+            self.refs = refs
+
+        def get(self, timeout=None):
+            calls.append(("get", timeout))
+            return SimpleNamespace(
+                exists=True,
+                to_dict=lambda: {
+                    "owner_user_id": "user-a",
+                    "status": "pending",
+                    "owned_media_refs": list(self.refs),
+                },
+            )
+
+        def set(self, _data, merge=False, timeout=None):
+            calls.append(("set", merge, timeout))
+
+        def delete(self, timeout=None):
+            calls.append(("delete", timeout))
+
+    set_ref = TimedRef(
+        [
+            {"kind": "public_blob", "url": "https://blob/one.png"},
+            {"kind": "public_blob", "url": "https://blob/two.png"},
+        ]
+    )
+    monkeypatch.setattr(main, "_delivery_cleanup_ref", lambda *_args: set_ref)
+    monkeypatch.setattr(main, "delete_vercel_blob", lambda _url, timeout=30: None)
+    main.drain_delivery_cleanup_job(
+        "user-a", "chat_forward", "set-timeout", max_refs=1, blob_timeout=1
+    )
+
+    delete_ref = TimedRef(
+        [{"kind": "public_blob", "url": "https://blob/last.png"}]
+    )
+    monkeypatch.setattr(main, "_delivery_cleanup_ref", lambda *_args: delete_ref)
+    main.drain_delivery_cleanup_job(
+        "user-a", "chat_forward", "delete-timeout", max_refs=1, blob_timeout=1
+    )
+
+    assert calls == [
+        ("get", 1),
+        ("set", False, 1),
+        ("get", 1),
+        ("delete", 1),
+    ]
+
+
+def test_malformed_cleanup_quarantine_and_rpc_timeout_are_bounded(monkeypatch):
+    calls = []
+
+    class TimedInvalidRef:
+        def set(self, _data, merge=False, timeout=None):
+            calls.append(("quarantine", merge, timeout))
+
+    invalid_ref = TimedInvalidRef()
+    invalid_snapshot = SimpleNamespace(
+        reference=invalid_ref,
+        to_dict=lambda: {
+            "owner_user_id": "user-a",
+            "status": "pending",
+            "route_name": "assist_message",
+            "request_id": "bad",
+            "owned_media_refs": [{"kind": "unknown"}],
+        },
+    )
+
+    class TimedQuery:
+        def stream(self, timeout=None):
+            calls.append(("stream", timeout))
+            return [invalid_snapshot]
+
+    query = TimedQuery()
+    collection = SimpleNamespace(where=lambda **_kwargs: query)
+    user_ref = SimpleNamespace(collection=lambda _name: collection)
+    users = SimpleNamespace(document=lambda _user_id: user_ref)
+    client = SimpleNamespace(collection=lambda _name: users)
+    monkeypatch.setattr(main, "get_firestore_client", lambda: client)
+
+    assert main.drain_pending_delivery_cleanup_jobs("user-a", limit=1) == 0
+    assert calls == [("stream", 1), ("quarantine", True, 1)]
+
+    class TimeoutRef:
+        def get(self, timeout=None):
+            calls.append(("get-timeout", timeout))
+            raise TimeoutError("firestore deadline")
+
+    monkeypatch.setattr(main, "_delivery_cleanup_ref", lambda *_args: TimeoutRef())
+    assert main.bounded_delivery_cleanup(
+        "user-a", "assist_message", "rpc-timeout", {"owned_media_refs": []}
+    ) is False
+    assert calls[-1] == ("get-timeout", 1)
 
 
 def test_stale_claim_does_not_cleanup_media_when_rollback_reread_confirms_generation(monkeypatch):

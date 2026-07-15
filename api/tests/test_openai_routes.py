@@ -854,7 +854,9 @@ def test_delete_private_audio_artifact_removes_firestore_record_and_ciphertext(m
     )
     monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
     deleted = []
-    monkeypatch.setattr(main, "delete_vercel_blob", deleted.append)
+    monkeypatch.setattr(
+        main, "delete_vercel_blob", lambda url, timeout=30: deleted.append(url)
+    )
 
     assert main.delete_private_audio_artifact("user-a", "artifact-1") is True
     assert firestore.read("users/user-a/audio_artifacts/artifact-1") is None
@@ -922,6 +924,30 @@ def test_private_audio_cleanup_retries_document_delete_after_blob_is_already_abs
     assert firestore.read(artifact_path) is not None
     assert main.delete_private_audio_artifact("user-a", "artifact-doc-retry") is True
     assert firestore.read(artifact_path) is None
+
+
+def test_private_audio_bounded_cleanup_passes_timeout_to_firestore_get_and_delete(monkeypatch):
+    calls = []
+    snapshot = SimpleNamespace(
+        exists=True,
+        to_dict=lambda: {"blob_url": "https://blob/private-timeout.bin"},
+    )
+
+    class TimedRef:
+        def get(self, timeout=None):
+            calls.append(("get", timeout))
+            return snapshot
+
+        def delete(self, timeout=None):
+            calls.append(("delete", timeout))
+
+    monkeypatch.setattr(main, "_private_audio_artifact_ref", lambda *_args: TimedRef())
+    monkeypatch.setattr(main, "delete_vercel_blob", lambda _url, timeout=30: calls.append(("blob", timeout)))
+
+    assert main.delete_private_audio_artifact(
+        "user-a", "artifact-timeout", blob_timeout=1
+    ) is True
+    assert calls == [("get", 1), ("blob", 1), ("delete", 1)]
 
 
 def test_private_audio_artifact_cleans_ciphertext_when_metadata_save_fails(monkeypatch):
@@ -2707,7 +2733,9 @@ def test_ai_outbound_revoked_after_persistence_rolls_back_before_publish_and_cle
     monkeypatch.setattr(main, "upload_image_to_vercel_blob", lambda *_args: "https://blob/revoked.png")
     deleted = []
     published = []
-    monkeypatch.setattr(main, "delete_vercel_blob", deleted.append)
+    monkeypatch.setattr(
+        main, "delete_vercel_blob", lambda url, timeout=30: deleted.append(url)
+    )
     monkeypatch.setattr(main, "publish_user_channel_message", lambda *args: published.append(args))
     monkeypatch.setattr(main, "confirm_friend_delivery_before_publish", REAL_CONFIRM_FRIEND_DELIVERY)
 
@@ -2877,7 +2905,9 @@ def test_forward_private_confirmation_artifact_is_cleaned_when_delivery_is_not_d
     monkeypatch.setattr(
         main,
         "delete_private_audio_artifact",
-        lambda user_id, artifact_id: deleted_artifacts.append((user_id, artifact_id)),
+        lambda user_id, artifact_id, blob_timeout=30: deleted_artifacts.append(
+            (user_id, artifact_id)
+        ),
     )
     if outcome == "loser":
         winner = {
@@ -2896,7 +2926,21 @@ def test_forward_private_confirmation_artifact_is_cleaned_when_delivery_is_not_d
     )
 
     assert response.status_code == (200 if outcome == "loser" else 403)
-    assert deleted_artifacts == [("user-a", "private-attempt")]
+    if outcome == "loser":
+        assert deleted_artifacts == [("user-a", "private-attempt")]
+    else:
+        assert deleted_artifacts == []
+        request_id = f"private-{outcome}"
+        cleanup_id = main.hashlib.sha256(
+            f"chat_forward:{request_id}".encode()
+        ).hexdigest()
+        job = main.get_firestore_client().read(
+            f"users/user-a/delivery_cleanup_jobs/{cleanup_id}"
+        )
+        assert job["status"] == "pending"
+        assert {"kind": "private_audio", "artifact_id": "private-attempt"} in job[
+            "owned_media_refs"
+        ]
 
 
 @pytest.mark.parametrize("route_kind", ["forward", "assist"])
