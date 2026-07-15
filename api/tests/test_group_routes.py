@@ -1912,6 +1912,7 @@ def test_generation_rollback_cleanup_job_retries_transient_public_and_private_fa
     assert firestore.read(receipt_path) is None
     job = firestore.read(cleanup_path)
     assert job and job["owned_media_refs"] == receipt["owned_media_refs"]
+    assert job["status"] == "pending"
     failures.update(public=False, private=False)
     assert main.drain_delivery_cleanup_job(
         "user-a", "assist_message", request_id
@@ -1989,6 +1990,7 @@ def test_pending_cleanup_drain_is_bounded_and_user_scoped(monkeypatch):
             owner_user_id="user-a",
             route_name="assist_message",
             request_id=request_id,
+            status="pending",
             owned_media_refs=[
                 {"kind": "public_blob", "url": f"https://blob/a-{index}.png"}
             ],
@@ -1998,11 +2000,14 @@ def test_pending_cleanup_drain_is_bounded_and_user_scoped(monkeypatch):
         owner_user_id="user-b",
         route_name="assist_message",
         request_id="request-b",
+        status="pending",
         owned_media_refs=[{"kind": "public_blob", "url": "https://blob/b.png"}],
     )
     deleted = []
     monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
-    monkeypatch.setattr(main, "delete_vercel_blob", deleted.append)
+    monkeypatch.setattr(
+        main, "delete_vercel_blob", lambda url, timeout=30: deleted.append(url)
+    )
 
     assert main.drain_pending_delivery_cleanup_jobs("user-a", limit=5) == 5
 
@@ -2081,15 +2086,26 @@ def test_unrelated_outbound_route_opportunistically_retries_pending_cleanup(
         owner_user_id="user-a",
         route_name="assist_message",
         request_id=request_id,
-        owned_media_refs=[{"kind": "public_blob", "url": "https://blob/retry-later.png"}],
+        status="pending",
+        owned_media_refs=[
+            {"kind": "public_blob", "url": f"https://blob/retry-{index}.png"}
+            for index in range(20)
+        ],
     )
+    calls = []
     monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
-    monkeypatch.setattr(main, "delete_vercel_blob", lambda _url: None)
+    monkeypatch.setattr(
+        main,
+        "delete_vercel_blob",
+        lambda url, timeout=30: calls.append((url, timeout))
+        or (_ for _ in ()).throw(TimeoutError("cleanup timeout")),
+    )
 
     response = signed_in_client.post("/api/assist/message", json={})
 
     assert response.status_code == 400
-    assert firestore.read(cleanup_path) is None
+    assert calls == [("https://blob/retry-0.png", 1)]
+    assert len(firestore.read(cleanup_path)["owned_media_refs"]) == 20
 
 
 def test_stale_rollback_merges_cleanup_refs_without_deleting_terminal(monkeypatch):
@@ -2111,6 +2127,7 @@ def test_stale_rollback_merges_cleanup_refs_without_deleting_terminal(monkeypatc
         owner_user_id="user-a",
         route_name="chat_forward",
         request_id=request_id,
+        status="pending",
         owned_media_refs=[{"kind": "public_blob", "url": "https://blob/old.png"}],
     )
     receipt = {
@@ -2137,7 +2154,130 @@ def test_stale_rollback_merges_cleanup_refs_without_deleting_terminal(monkeypatc
         {"kind": "public_blob", "url": "https://blob/old.png"},
         {"kind": "public_blob", "url": "https://blob/new.png"},
     ]
+    assert firestore.read(cleanup_path)["status"] == "pending"
     assert firestore.read(terminal_path)["state"] == "revoked"
+
+
+def test_existing_terminal_is_authoritative_across_repeated_stale_confirms(monkeypatch):
+    firestore = FakeFirestoreClient()
+    request_id = "terminal-authoritative"
+    record_id = main.hashlib.sha256(f"chat_forward:{request_id}".encode()).hexdigest()
+    terminal_path = f"users/user-a/delivery_terminals/{record_id}"
+    first_terminal = {
+        "route_name": "chat_forward",
+        "request_id": request_id,
+        "payload_hash": "first-hash",
+        "state": "revoked",
+        "response": {"reply": "first", "realtime_delivered": False},
+        "sender_user_id": "user-a",
+        "recipient_user_id": "user-b",
+        "friendship_generation": "accepted_at:first",
+    }
+    firestore.seed(terminal_path, **first_terminal)
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+
+    assert main.confirm_friend_delivery_before_publish(
+        firestore,
+        "user-a",
+        "user-b",
+        "second-message",
+        "chat_forward",
+        request_id,
+        {"__friendship_generation__": "accepted_at:second"},
+    ) is False
+
+    terminal = firestore.read(terminal_path)
+    for key in ("payload_hash", "response", "friendship_generation"):
+        assert terminal[key] == first_terminal[key]
+
+
+def test_missing_receipt_and_terminal_does_not_create_empty_terminal(monkeypatch):
+    firestore = FakeFirestoreClient()
+    request_id = "missing-both"
+    record_id = main.hashlib.sha256(f"assist_message:{request_id}".encode()).hexdigest()
+    terminal_path = f"users/user-a/delivery_terminals/{record_id}"
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+
+    assert main.confirm_friend_delivery_before_publish(
+        firestore,
+        "user-a",
+        "user-b",
+        "missing-message",
+        "assist_message",
+        request_id,
+    ) is False
+    assert firestore.read(terminal_path) is None
+
+
+def test_pending_cleanup_budget_attempts_one_ref_and_timeout_keeps_job(monkeypatch):
+    firestore = FakeFirestoreClient()
+    request_id = "bounded-timeout"
+    cleanup_id = main.hashlib.sha256(f"assist_message:{request_id}".encode()).hexdigest()
+    cleanup_path = f"users/user-a/delivery_cleanup_jobs/{cleanup_id}"
+    firestore.seed(
+        cleanup_path,
+        owner_user_id="user-a",
+        route_name="assist_message",
+        request_id=request_id,
+        status="pending",
+        owned_media_refs=[
+            {"kind": "public_blob", "url": f"https://blob/ref-{index}.png"}
+            for index in range(20)
+        ],
+    )
+    calls = []
+
+    def timeout_delete(url, timeout=30):
+        calls.append((url, timeout))
+        raise TimeoutError("bounded timeout")
+
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(main, "delete_vercel_blob", timeout_delete)
+
+    assert main.drain_pending_delivery_cleanup_jobs("user-a", limit=5) == 1
+    assert calls == [("https://blob/ref-0.png", 1)]
+    assert len(firestore.read(cleanup_path)["owned_media_refs"]) == 20
+
+
+def test_pending_query_skips_legacy_and_quarantines_malformed_without_permanent_starvation(monkeypatch):
+    firestore = FakeFirestoreClient()
+    firestore.seed(
+        "users/user-a/delivery_cleanup_jobs/legacy",
+        owner_user_id="user-a",
+        route_name="assist_message",
+        request_id="legacy",
+        owned_media_refs=[{"kind": "public_blob", "url": "https://blob/legacy.png"}],
+    )
+    firestore.seed(
+        "users/user-a/delivery_cleanup_jobs/malformed",
+        owner_user_id="user-a",
+        route_name="assist_message",
+        request_id="malformed",
+        status="pending",
+        owned_media_refs=[{"kind": "unknown", "secret": "must-not-run"}],
+    )
+    valid_request_id = "valid-pending"
+    valid_id = main.hashlib.sha256(f"assist_message:{valid_request_id}".encode()).hexdigest()
+    valid_path = f"users/user-a/delivery_cleanup_jobs/{valid_id}"
+    firestore.seed(
+        valid_path,
+        owner_user_id="user-a",
+        route_name="assist_message",
+        request_id=valid_request_id,
+        status="pending",
+        owned_media_refs=[{"kind": "public_blob", "url": "https://blob/valid.png"}],
+    )
+    deleted = []
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(main, "delete_vercel_blob", lambda url, timeout=30: deleted.append((url, timeout)))
+
+    main.drain_pending_delivery_cleanup_jobs("user-a", limit=1)
+    main.drain_pending_delivery_cleanup_jobs("user-a", limit=1)
+
+    assert firestore.read("users/user-a/delivery_cleanup_jobs/legacy") is not None
+    assert firestore.read("users/user-a/delivery_cleanup_jobs/malformed")["status"] == "invalid"
+    assert firestore.read(valid_path) is None
+    assert deleted == [("https://blob/valid.png", 1)]
 
 
 def test_stale_claim_does_not_cleanup_media_when_rollback_reread_confirms_generation(monkeypatch):

@@ -89,7 +89,11 @@ class FakeCollectionReference:
                 snapshots.append(FakeSnapshot(FakeDocumentReference(self.client, path), data))
         return snapshots
 
-    def where(self, field, op, value):
+    def where(self, field=None, op=None, value=None, filter=None):
+        if filter is not None:
+            field = filter.field_path
+            op = filter.op_string
+            value = filter.value
         return FakeQuery(self, field, op, value)
 
     def order_by(self, field):

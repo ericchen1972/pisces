@@ -17,6 +17,7 @@ from flask import Flask, Response, jsonify, request as flask_request, session
 from werkzeug.exceptions import RequestEntityTooLarge
 from google.auth.transport import requests as google_requests
 from google.cloud import firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
 from google.oauth2 import id_token
 from google.oauth2 import service_account
 from ably import AblyRest
@@ -874,7 +875,7 @@ def upload_audio_to_vercel_blob(user_id, audio_bytes, mime_type="audio/wav"):
     return blob_url
 
 
-def delete_vercel_blob(blob_url):
+def delete_vercel_blob(blob_url, timeout=30):
     token = get_blob_rw_token()
     if not token:
         raise RuntimeError("BLOB_READ_WRITE_TOKEN is not configured")
@@ -890,7 +891,7 @@ def delete_vercel_blob(blob_url):
         method="POST",
     )
     try:
-        with request.urlopen(req, timeout=30):
+        with request.urlopen(req, timeout=timeout):
             return None
     except error.HTTPError as exc:
         if exc.code == 404:
@@ -1007,7 +1008,7 @@ def _private_audio_artifact_ref(user_id, artifact_id):
     )
 
 
-def delete_private_audio_artifact(user_id, artifact_id):
+def delete_private_audio_artifact(user_id, artifact_id, blob_timeout=30):
     if not user_id or not artifact_id:
         return False
     ref = _private_audio_artifact_ref(user_id, artifact_id)
@@ -1017,7 +1018,10 @@ def delete_private_audio_artifact(user_id, artifact_id):
     artifact = snapshot.to_dict() or {}
     blob_url = (artifact.get("blob_url") or "").strip()
     if blob_url:
-        delete_vercel_blob(blob_url)
+        if blob_timeout == 30:
+            delete_vercel_blob(blob_url)
+        else:
+            delete_vercel_blob(blob_url, timeout=blob_timeout)
     ref.delete()
     return True
 
@@ -2732,9 +2736,18 @@ def confirm_friend_delivery_before_publish(
 
     @firestore.transactional
     def commit(tx):
+        receipt = {}
+        if terminal_ref is not None:
+            terminal_snapshot = next(iter(tx.get(terminal_ref)))
+            if terminal_snapshot.exists:
+                return False
+        if receipt_ref is not None:
+            receipt_snapshot = next(iter(tx.get(receipt_ref)))
+            if not receipt_snapshot.exists:
+                return False
+            receipt = receipt_snapshot.to_dict() or {}
         friendship_snapshot = next(iter(tx.get(friendship_ref)))
         friendship_values = friendship_snapshot.to_dict() if friendship_snapshot.exists else {}
-        receipt = {}
         sender_meta_ref = (
             client.collection("users").document(sender_user_id)
             .collection("chat_meta").document(recipient_user_id)
@@ -2745,9 +2758,6 @@ def confirm_friend_delivery_before_publish(
         )
         sender_meta_snapshot = next(iter(tx.get(sender_meta_ref)))
         recipient_meta_snapshot = next(iter(tx.get(recipient_meta_ref)))
-        if receipt_ref is not None:
-            receipt_snapshot = next(iter(tx.get(receipt_ref)))
-            receipt = receipt_snapshot.to_dict() if receipt_snapshot.exists else {}
         cleanup_job = {}
         if cleanup_ref is not None:
             cleanup_snapshot = next(iter(tx.get(cleanup_ref)))
@@ -2867,6 +2877,7 @@ def confirm_friend_delivery_before_publish(
                     "owner_user_id": sender_user_id,
                     "route_name": receipt_route_name,
                     "request_id": receipt_request_id,
+                    "status": "pending",
                     "owned_media_refs": merged_refs,
                     "updated_at": firestore.SERVER_TIMESTAMP,
                 },
@@ -3016,9 +3027,16 @@ def cleanup_delivery_owned_media(user_id, receipt):
             pass
 
 
-def drain_delivery_cleanup_job(user_id, route_name, request_id):
+def drain_delivery_cleanup_job(
+    user_id, route_name, request_id, *, max_refs=None, blob_timeout=30
+):
     cleanup_ref = _delivery_cleanup_ref(user_id, route_name, request_id)
-    snapshot = cleanup_ref.get()
+    try:
+        snapshot = (
+            cleanup_ref.get(timeout=1) if blob_timeout <= 1 else cleanup_ref.get()
+        )
+    except TypeError:
+        snapshot = cleanup_ref.get()
     if not snapshot.exists:
         return None
     job = snapshot.to_dict() or {}
@@ -3030,12 +3048,24 @@ def drain_delivery_cleanup_job(user_id, route_name, request_id):
         for item in (job.get("owned_media_refs") or [])
         if isinstance(item, dict)
     ]
+    attempted = 0
     for item in list(remaining):
+        if max_refs is not None and attempted >= max(0, int(max_refs)):
+            break
+        attempted += 1
         try:
             if item.get("kind") == "public_blob" and item.get("url"):
-                delete_vercel_blob(item["url"])
+                if blob_timeout == 30:
+                    delete_vercel_blob(item["url"])
+                else:
+                    delete_vercel_blob(item["url"], timeout=blob_timeout)
             elif item.get("kind") == "private_audio" and item.get("artifact_id"):
-                delete_private_audio_artifact(user_id, item["artifact_id"])
+                if blob_timeout == 30:
+                    delete_private_audio_artifact(user_id, item["artifact_id"])
+                else:
+                    delete_private_audio_artifact(
+                        user_id, item["artifact_id"], blob_timeout=blob_timeout
+                    )
             else:
                 remaining.remove(item)
                 continue
@@ -3065,21 +3095,58 @@ def drain_pending_delivery_cleanup_jobs(user_id, limit=5):
         .document(user_id)
         .collection("delivery_cleanup_jobs")
     )
-    query = collection.limit(bounded_limit) if hasattr(collection, "limit") else collection
+    query = collection.where(filter=FieldFilter("status", "==", "pending"))
+    query = query.limit(bounded_limit) if hasattr(query, "limit") else query
     attempted = 0
-    for snapshot in query.stream():
-        if attempted >= bounded_limit:
+    examined = 0
+    try:
+        snapshots = query.stream(timeout=1)
+    except TypeError:
+        snapshots = query.stream()
+    for snapshot in snapshots:
+        if examined >= bounded_limit:
             break
+        examined += 1
         job = snapshot.to_dict() or {}
-        if job.get("owner_user_id") != user_id:
-            continue
         route_name = (job.get("route_name") or "").strip()
         request_id = (job.get("request_id") or "").strip()
-        if not route_name or not request_id:
+        refs = job.get("owned_media_refs") or []
+        refs_valid = bool(refs) and all(
+            isinstance(item, dict)
+            and (
+                (
+                    item.get("kind") == "public_blob"
+                    and bool(item.get("url"))
+                    and set(item) <= {"kind", "url"}
+                )
+                or (
+                    item.get("kind") == "private_audio"
+                    and bool(item.get("artifact_id"))
+                    and set(item) <= {"kind", "artifact_id"}
+                )
+            )
+            for item in refs
+        )
+        if (
+            job.get("owner_user_id") != user_id
+            or not route_name
+            or not request_id
+            or not refs_valid
+        ):
+            snapshot.reference.set(
+                {"status": "invalid", "updated_at": firestore.SERVER_TIMESTAMP},
+                merge=True,
+            )
             continue
         attempted += 1
         try:
-            drain_delivery_cleanup_job(user_id, route_name, request_id)
+            drain_delivery_cleanup_job(
+                user_id,
+                route_name,
+                request_id,
+                max_refs=1,
+                blob_timeout=1,
+            )
         except Exception:
             pass
     return attempted
@@ -3101,7 +3168,9 @@ def replay_friend_delivery_receipt(
         raise ValueError("request_id was already used for a different delivery")
     response = replay_delivery_response(receipt, user_id)
     if receipt.get("state") == "revoked":
-        drain_delivery_cleanup_job(user_id, route_name, request_id)
+        drain_delivery_cleanup_job(
+            user_id, route_name, request_id, max_refs=1, blob_timeout=1
+        )
         return response
     stored_payload = receipt.get("ably_payload") or {}
     if stored_payload and not receipt.get("published"):
@@ -3356,7 +3425,6 @@ def chat():
         err, status = auth_error
         return jsonify(err), status
     user_id = auth["user_id"]
-    safe_drain_pending_delivery_cleanup_jobs(user_id, limit=5)
     body = flask_request.get_json(silent=True)
     if not isinstance(body, dict):
         return jsonify({"ok": False, "error": "JSON object is required"}), 400
@@ -3376,6 +3444,7 @@ def chat():
             request_id = validate_request_id(body.get("request_id"))
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+        safe_drain_pending_delivery_cleanup_jobs(user_id, limit=1)
         friend = find_friend_from_message(user_id, user_message)
         if not friend:
             reply = "Sorry, I couldn't find the contact name you mentioned. Please include an exact friend name."
@@ -5550,7 +5619,7 @@ def assist_message():
         err, status = auth_error
         return jsonify(err), status
     user_id = auth["user_id"]
-    safe_drain_pending_delivery_cleanup_jobs(user_id, limit=5)
+    safe_drain_pending_delivery_cleanup_jobs(user_id, limit=1)
     body = flask_request.get_json(silent=True)
     if not isinstance(body, dict):
         return jsonify({"ok": False, "error": "JSON object is required"}), 400
