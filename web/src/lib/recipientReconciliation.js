@@ -100,6 +100,40 @@ export async function reconcileRecipientSnapshot({
   return isCurrent(snapshot)
 }
 
+function canonicalIdentityKind(message) {
+  if (message?.role === 'assist_group') return 'assist_group'
+  if (['user', 'peer', 'ai_proxy'].includes(message?.role)) return 'shared_message'
+  return message?.role || ''
+}
+
+function hasSameCanonicalIdentity(first, second) {
+  if (first?.id && second?.id && first.id === second.id) return true
+  return Boolean(
+    first?.requestId
+    && second?.requestId
+    && first.requestId === second.requestId
+    && canonicalIdentityKind(first) === canonicalIdentityKind(second),
+  )
+}
+
+export function reconcileCanonicalMessage(messages = [], placeholderId, canonicalMessage) {
+  if (!canonicalMessage?.id) return messages
+  const next = []
+  let insertionIndex = -1
+  messages.forEach((message) => {
+    const matches = message?.id === placeholderId
+      || hasSameCanonicalIdentity(message, canonicalMessage)
+    if (matches) {
+      if (insertionIndex < 0) insertionIndex = next.length
+      return
+    }
+    next.push(message)
+  })
+  if (insertionIndex < 0) insertionIndex = next.length
+  next.splice(insertionIndex, 0, canonicalMessage)
+  return next
+}
+
 export function mergeCanonicalHistoryTail(currentMessages = [], recentMessages = []) {
   const recentById = new Map()
   const recentOrder = []
@@ -110,10 +144,9 @@ export function mergeCanonicalHistoryTail(currentMessages = [], recentMessages =
   })
   if (!recentOrder.length) return currentMessages
 
-  const currentById = new Map(
-    currentMessages.filter((message) => message?.id).map((message) => [message.id, message]),
-  )
-  const overlapIndex = currentMessages.findIndex((message) => recentById.has(message?.id))
+  const canonicalRecent = recentOrder.map((id) => recentById.get(id))
+  const matchesRecent = (message) => canonicalRecent.some((recent) => hasSameCanonicalIdentity(message, recent))
+  const overlapIndex = currentMessages.findIndex(matchesRecent)
   const pendingIndex = overlapIndex < 0
     ? currentMessages.findIndex((message) => (
         (message?.status && message.status !== 'complete')
@@ -124,8 +157,11 @@ export function mergeCanonicalHistoryTail(currentMessages = [], recentMessages =
     ? currentMessages.slice(0, overlapIndex)
     : pendingIndex >= 0 ? currentMessages.slice(0, pendingIndex) : currentMessages
   const pendingTail = overlapIndex >= 0
-    ? currentMessages.slice(overlapIndex).filter((message) => !recentById.has(message?.id))
+    ? currentMessages.slice(overlapIndex).filter((message) => !matchesRecent(message))
     : pendingIndex >= 0 ? currentMessages.slice(pendingIndex) : []
-  const canonicalTail = recentOrder.map((id) => ({ ...currentById.get(id), ...recentById.get(id) }))
+  const canonicalTail = canonicalRecent.map((recent) => {
+    const current = currentMessages.find((message) => hasSameCanonicalIdentity(message, recent))
+    return current?.id === recent.id ? { ...current, ...recent } : recent
+  })
   return [...prefix, ...canonicalTail, ...pendingTail]
 }

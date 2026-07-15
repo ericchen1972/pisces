@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createReconnectGate, createRecipientReconciler, mergeCanonicalHistoryTail, reconcileRecipientSnapshot } from './recipientReconciliation.js'
+import { createReconnectGate, createRecipientReconciler, mergeCanonicalHistoryTail, reconcileCanonicalMessage, reconcileRecipientSnapshot } from './recipientReconciliation.js'
 
 afterEach(() => vi.useRealTimers())
 
@@ -145,5 +145,28 @@ describe('recipient reconciliation snapshot safety', () => {
       { id: 'server-1', text: 'canonical' },
       { id: 'pending', text: 'pending', status: 'sending' },
     ])
+  })
+
+  it.each([
+    ['assist', { id: 'assist-client-1', role: 'assist_group', requestId: 'request-1', status: 'streaming' }, { id: 'assist-server-1', role: 'assist_group', requestId: 'request-1', status: 'complete' }],
+    ['voice', { id: 'voice-client-1', role: 'user', requestId: 'request-2', audioUrl: 'blob:voice' }, { id: 'voice-server-1', role: 'user', requestId: 'request-2', audioUrl: 'https://blob/voice.webm' }],
+  ])('removes a pending %s message when polling sees its canonical request identity', (_kind, pending, canonical) => {
+    expect(mergeCanonicalHistoryTail([pending], [canonical])).toEqual([canonical])
+  })
+
+  it.each([
+    ['assist', { id: 'assist-client-1', role: 'assist_group', requestId: 'request-1', status: 'streaming' }, { id: 'assist-server-1', role: 'assist_group', requestId: 'request-1', status: 'complete' }],
+    ['voice', { id: 'voice-client-1', role: 'user', requestId: 'request-2', audioUrl: 'blob:voice' }, { id: 'voice-server-1', role: 'user', requestId: 'request-2', audioUrl: 'https://blob/voice.webm' }],
+  ])('keeps one canonical %s message when success lands after polling', (_kind, pending, canonical) => {
+    const polled = mergeCanonicalHistoryTail([pending], [canonical])
+    expect(reconcileCanonicalMessage(polled, pending.id, canonical)).toEqual([canonical])
+    expect(reconcileCanonicalMessage([canonical, pending], pending.id, canonical)).toEqual([canonical])
+  })
+
+  it('does not copy transient pending state into a different canonical message id', () => {
+    const retry = vi.fn()
+    const pending = { id: 'assist-client', role: 'assist_group', requestId: 'request-3', status: 'streaming', retry }
+    const canonical = { id: 'assist-server', role: 'assist_group', requestId: 'request-3', userText: 'saved' }
+    expect(mergeCanonicalHistoryTail([pending], [canonical])).toEqual([canonical])
   })
 })

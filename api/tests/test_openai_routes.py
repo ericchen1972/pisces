@@ -3391,26 +3391,31 @@ def test_assist_send_preserves_private_roles_recipient_shape_and_ably_payload(
 
     assert response.status_code == 200
     assert body["assist_group"]["ai_text"] == "OpenAI confirms delivery to Amy."
+    assert body["assist_group"]["client_request_id"] == "assist-123"
     assert body["outbound_message"] == {
         "text": "Bo says hello",
         "as_user": False,
         "sender_mode": "ai_proxy",
         "avatar_url": "https://ai-avatar",
         "message_id": published[0][1]["message_id"],
+        "client_request_id": "assist-123",
         "audio_url": "",
         "image_url": "",
         "music_url": "",
     }
     assert [item[2] for item in saved] == ["assist_user", "peer", "assist_ai"]
     assert saved[0][4]["visibility"] == "private_to_user"
+    assert saved[0][4]["client_request_id"] == "assist-123"
     assert saved[1][:4] == ("user-b", "user-a", "peer", "Bo says hello")
     assert saved[1][5] == published[0][1]["message_id"] == body["outbound_message"]["message_id"]
     assert saved[1][4] == {
         "visibility": "shared",
         "sender_mode": "ai_proxy",
         "avatar_url": "https://ai-avatar",
+        "client_request_id": "assist-123",
     }
     assert saved[2][4]["visibility"] == "private_to_user"
+    assert saved[2][4]["client_request_id"] == "assist-123"
     assert published[0][0] == "user-b"
     assert published[0][1]["sender_mode"] == "ai_proxy"
     assert published[0][1]["sender_avatar_url"] == "https://ai-avatar"
@@ -3453,6 +3458,47 @@ def test_assist_send_preserves_private_roles_recipient_shape_and_ably_payload(
     assert failed_receipt["lease_expires_at"] <= datetime.now(timezone.utc)
     assert "response" not in failed_receipt
 
+
+def test_chat_history_returns_durable_client_request_identity(monkeypatch):
+    message = SimpleNamespace(
+        id="canonical-message",
+        to_dict=lambda: {
+            "role": "user",
+            "text": "hello",
+            "created_at": datetime.now(timezone.utc),
+            "client_request_id": "client-request-1",
+        },
+    )
+
+    class Query:
+        def order_by(self, *_args, **_kwargs):
+            return self
+
+        def limit(self, _value):
+            return self
+
+        def stream(self):
+            return [message]
+
+    query = Query()
+
+    class Chain:
+        def document(self, *_args):
+            return self
+
+        def collection(self, name):
+            return query if name == "messages" else self
+
+    chain = Chain()
+    monkeypatch.setattr(
+        main,
+        "get_firestore_client",
+        lambda: SimpleNamespace(collection=lambda *_args: chain),
+    )
+
+    messages = main.get_chat_messages("user-a", "user-b")
+
+    assert messages[0]["client_request_id"] == "client-request-1"
 
 @pytest.mark.parametrize(
     "url",

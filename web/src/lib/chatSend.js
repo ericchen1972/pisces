@@ -40,6 +40,7 @@ export function canonicalIncomingMessage(payload) {
   if (!payload?.message_id) return null
   return {
     id: payload.message_id,
+    requestId: payload.client_request_id || '',
     role: effectiveMessageRole({ role: 'peer', sender_mode: payload.sender_mode }, 'peer'),
     senderMode: payload.sender_mode || 'user',
     text: payload.text || '',
@@ -56,6 +57,7 @@ export function canonicalOutboundMessage(payload) {
   const senderMode = payload.sender_mode === 'ai_proxy' ? 'ai_proxy' : 'user'
   return {
     id: payload.message_id,
+    requestId: payload.client_request_id || '',
     role: effectiveMessageRole({ role: 'user', sender_mode: senderMode }, 'user'),
     senderMode,
     text: payload.text || '',

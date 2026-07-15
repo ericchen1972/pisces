@@ -17,7 +17,7 @@ import { createAccountOperationScope } from './lib/operationScope.js'
 import { avatarProcessingErrorMessage, createAvatarPreviewOwner, prepareAvatarPreview } from './lib/avatarMedia.js'
 import { createOwnedObjectUrlRegistry, discardRecordedMessage } from './lib/ownedObjectUrls.js'
 import { authorizeIncomingFriend } from './lib/realtimeFriendGate.js'
-import { createReconnectGate, createRecipientReconciler, mergeCanonicalHistoryTail, reconcileRecipientSnapshot } from './lib/recipientReconciliation.js'
+import { createReconnectGate, createRecipientReconciler, mergeCanonicalHistoryTail, reconcileCanonicalMessage, reconcileRecipientSnapshot } from './lib/recipientReconciliation.js'
 import { requireSuccessfulVoiceResponse } from './lib/voiceResponse.js'
 import { mergeStreamMessage, streamAiTurn } from './lib/stream.js'
 import {
@@ -448,12 +448,14 @@ function LoginHome() {
             id: gid,
             role: 'assist_group',
             groupId: gid,
+            requestId: message.client_request_id || '',
             collapsed: true,
             userText: '',
             aiText: '',
             aiAudioUrl: '',
           })
         }
+        view[idx].requestId ||= message.client_request_id || ''
         if (role === 'assist_user') view[idx].userText = message.text || ''
         if (role === 'assist_ai') {
           view[idx].aiText = message.text || ''
@@ -463,6 +465,7 @@ function LoginHome() {
       }
       view.push({
         id: message.id || `${message.role}-${Math.random().toString(36).slice(2, 8)}`,
+        requestId: message.client_request_id || '',
         role,
         text: message.text || '',
         audioUrl: message.audio_url || '',
@@ -1477,10 +1480,7 @@ function LoginHome() {
             const current = prev[senderId] || []
             return {
               ...prev,
-              [senderId]: [
-                ...current,
-                incomingMessage,
-              ],
+              [senderId]: reconcileCanonicalMessage(current, '', incomingMessage),
             }
           })
 
@@ -1649,6 +1649,7 @@ function LoginHome() {
           recordedObjectUrlsRef.current.own(audioUrl, { contactId, messageId: audioMessageId })
           const shouldUseAiVoiceFlow = contactId === 'pisces-core' || isAiAssistMode
           const isAssistVoiceFlow = isAiAssistMode && contactId !== 'pisces-core'
+          const personVoiceRequestId = shouldUseAiVoiceFlow ? '' : createClientRequestId('person-voice')
           const typingId = `vt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
           const assistRequestId = createClientRequestId('assist-voice')
           const assistTempId = `assist-v-${assistRequestId}`
@@ -1660,7 +1661,7 @@ function LoginHome() {
                 ...prev,
                 [contactId]: [
                   ...current,
-                  { id: audioMessageId, role: 'user', audioUrl, audioDuration: recordedDurationSeconds },
+                  { id: audioMessageId, role: 'user', requestId: personVoiceRequestId, audioUrl, audioDuration: recordedDurationSeconds },
                   ...(isAssistVoiceFlow
                     ? [
                         {
@@ -1694,14 +1695,13 @@ function LoginHome() {
             const audioBase64 = btoa(binary)
 
             if (!shouldUseAiVoiceFlow && contactId !== 'pisces-core') {
-              const voiceRequestId = createClientRequestId('person-voice')
               const data = await sendPersonVoiceRequest({
                 url: `${apiBaseUrl}/api/messages/send-voice`,
                 contactId,
                 audioBase64,
                 mimeType: blob.type || recorder.mimeType || 'audio/webm',
                 durationSeconds: recordedDurationSeconds,
-                requestId: voiceRequestId,
+                requestId: personVoiceRequestId,
                 signal: recordingOperation.signal,
               })
               if (!accountOperationScope.isOwner(recordingOperation, recordingOperationRef)) return
@@ -1709,18 +1709,21 @@ function LoginHome() {
               recordedObjectUrlsRef.current.replace(audioUrl, confirmedAudioUrl)
               runIfRecordingCurrent(() => setMessagesByContact((prev) => {
                 const current = prev[contactId] || []
+                const existingVoiceMessage = current.find((message) => (
+                  message.id === audioMessageId
+                  || (personVoiceRequestId && message.requestId === personVoiceRequestId)
+                ))
+                const canonicalVoiceMessage = {
+                  ...existingVoiceMessage,
+                  id: data?.message?.message_id || audioMessageId,
+                  role: 'user',
+                  requestId: data?.message?.client_request_id || personVoiceRequestId,
+                  audioUrl: confirmedAudioUrl,
+                  audioDuration: Number(data?.message?.audio_duration_seconds || existingVoiceMessage?.audioDuration || 0),
+                }
                 return {
                   ...prev,
-                  [contactId]: current.map((m) =>
-                    m.id === audioMessageId
-                      ? {
-                          ...m,
-                          id: data?.message?.message_id || audioMessageId,
-                          audioUrl: confirmedAudioUrl,
-                          audioDuration: Number(data?.message?.audio_duration_seconds || m.audioDuration || 0),
-                        }
-                      : m,
-                  ),
+                  [contactId]: reconcileCanonicalMessage(current, audioMessageId, canonicalVoiceMessage),
                 }
               }))
             } else if (isAssistVoiceFlow) {
@@ -1770,11 +1773,11 @@ function LoginHome() {
                 const withTranscript = current.map((message) => message.id === audioMessageId
                   ? { ...message, text: assistTranscript, audioUrl: '' }
                   : message)
-                const replaced = mergeStreamMessage(withTranscript, assistTempId, assistMessage)
+                const replaced = reconcileCanonicalMessage(withTranscript, assistTempId, assistMessage)
                 return {
                   ...prev,
-                  [contactId]: outboundMessage && !replaced.some((message) => message.id === outboundMessage.id)
-                    ? [...replaced, outboundMessage]
+                  [contactId]: outboundMessage
+                    ? reconcileCanonicalMessage(replaced, '', outboundMessage)
                     : replaced,
                 }
               }))
@@ -2057,9 +2060,9 @@ function LoginHome() {
             aiAudioUrl: audioUrl,
             status: 'complete',
           }
-          const replaced = mergeStreamMessage(current, temporaryId, assistMessage)
-          const withCanonicalOutbound = outboundMessage && !replaced.some((message) => message.id === outboundMessage.id)
-            ? [...replaced, outboundMessage]
+          const replaced = reconcileCanonicalMessage(current, temporaryId, assistMessage)
+          const withCanonicalOutbound = outboundMessage
+            ? reconcileCanonicalMessage(replaced, '', outboundMessage)
             : replaced
           return { ...previous, [contactId]: withCanonicalOutbound }
         })
@@ -2136,9 +2139,10 @@ function LoginHome() {
         if (personSendIdentityRef.current?.requestId === identity.requestId) personSendIdentityRef.current = null
         setMessagesByContact((previous) => {
           const current = previous[contactId] || []
-          return current.some((item) => item.id === message.id)
-            ? previous
-            : { ...previous, [contactId]: [...current, message] }
+          return {
+            ...previous,
+            [contactId]: reconcileCanonicalMessage(current, '', message),
+          }
         })
         setChatInput((current) => current.trim() === input ? '' : current)
         setPendingAttachment((current) => current === attachment ? null : current)

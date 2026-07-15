@@ -37,4 +37,13 @@ describe('remaining visible interface policy', () => {
     expect(source).toContain('selectedContactIdRef.current === senderId')
     expect(source).not.toContain('apiBaseUrl, selectedContact?.id]')
   })
+
+  it('wires durable client request identity through history, voice pending, and canonical success', () => {
+    const source = readFileSync(`${process.cwd()}/src/App.jsx`, 'utf8')
+    expect(source).toContain("requestId: message.client_request_id || ''")
+    expect(source).toContain("const personVoiceRequestId = shouldUseAiVoiceFlow ? '' : createClientRequestId('person-voice')")
+    expect(source).toContain('requestId: personVoiceRequestId')
+    expect(source).toContain('reconcileCanonicalMessage(current, audioMessageId, canonicalVoiceMessage)')
+    expect(source).toContain('reconcileCanonicalMessage(current, temporaryId, assistMessage)')
+  })
 })

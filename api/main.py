@@ -1259,6 +1259,7 @@ def get_chat_messages(user_id, contact_id, history_range=None):
                 "assist_group_id": (data.get("assist_group_id") or "").strip(),
                 "visibility": (data.get("visibility") or "").strip() or "shared",
                 "sender_mode": (data.get("sender_mode") or "").strip() or ("ai_proxy" if role == "ai_proxy" else "user"),
+                "client_request_id": (data.get("client_request_id") or "").strip(),
                 "avatar_url": (data.get("avatar_url") or "").strip(),
                 "audio_url": audio_url,
                 "audio_duration_seconds": float(data.get("audio_duration_seconds") or 0),
@@ -4588,12 +4589,14 @@ def send_message():
         sender_extras = {
                 "visibility": "shared",
                 "sender_mode": "user",
+                **({"client_request_id": request_id} if idempotent else {}),
                 **({"image_url": image_url} if image_url else {}),
                 **({"music_url": music_url} if music_url else {}),
         }
         recipient_extras = {
                 "visibility": "shared",
                 "sender_mode": "user",
+                **({"client_request_id": request_id} if idempotent else {}),
                 "avatar_url": (sender_data.get("avatar_url") or "").strip(),
                 **({"image_url": image_url} if image_url else {}),
                 **({"music_url": music_url} if music_url else {}),
@@ -4608,6 +4611,7 @@ def send_message():
             "sender_display_name": (sender_data.get("display_name") or ""),
             "sender_avatar_url": (sender_data.get("avatar_url") or ""),
             "sender_mode": "user",
+            **({"client_request_id": request_id} if idempotent else {}),
             "image_url": image_url,
             "music_url": music_url,
         }
@@ -4837,6 +4841,7 @@ def send_voice_message():
         sender_extras = {
                 "visibility": "shared",
                 "sender_mode": "user",
+                **({"client_request_id": request_id} if idempotent else {}),
                 "audio_url": audio_url,
                 "audio_duration_seconds": duration_seconds,
                 "transcript_text": transcript,
@@ -4844,6 +4849,7 @@ def send_voice_message():
         recipient_extras = {
                 "visibility": "shared",
                 "sender_mode": "user",
+                **({"client_request_id": request_id} if idempotent else {}),
                 "avatar_url": (sender_data.get("avatar_url") or "").strip(),
                 "audio_url": audio_url,
                 "audio_duration_seconds": duration_seconds,
@@ -4860,6 +4866,7 @@ def send_voice_message():
             "sender_display_name": (sender_data.get("display_name") or ""),
             "sender_avatar_url": (sender_data.get("avatar_url") or ""),
             "sender_mode": "user",
+            **({"client_request_id": request_id} if idempotent else {}),
         }
         response_payload = {"ok": True, "message": payload}
         if idempotent:
@@ -5153,6 +5160,7 @@ def assist_message():
                 "sender_display_name": (user_data.get("display_name") or ""),
                 "sender_avatar_url": sender_avatar_url,
                 "sender_mode": sender_mode,
+                "client_request_id": request_id,
                 "audio_url": outbound_audio_url,
                 "image_url": outbound_image_url,
                 "music_url": outbound_music_url,
@@ -5160,6 +5168,7 @@ def assist_message():
             recipient_extras = {
                 "visibility": "shared",
                 "sender_mode": sender_mode,
+                "client_request_id": request_id,
                 "avatar_url": sender_avatar_url,
                 **({"audio_url": outbound_audio_url} if outbound_audio_url else {}),
                 **({"image_url": outbound_image_url} if outbound_image_url else {}),
@@ -5172,6 +5181,7 @@ def assist_message():
                 "sender_mode": sender_mode,
                 "avatar_url": sender_avatar_url,
                 "message_id": payload["message_id"],
+                "client_request_id": request_id,
                 "audio_url": outbound_audio_url,
                 "image_url": outbound_image_url,
                 "music_url": outbound_music_url,
@@ -5237,6 +5247,7 @@ def assist_message():
                 "ok": True,
                 "assist_group": {
                     "id": group_id,
+                    "client_request_id": request_id,
                     "user_text": user_message,
                     "ai_text": ai_text,
                     "collapsed": False,
@@ -5253,9 +5264,9 @@ def assist_message():
                 request_id=request_id,
                 payload_hash=payload_hash,
                 message_writes=[
-                    {"user_id": user_id, "contact_id": contact_id, "role": "assist_user", "text": user_message, "extras": {"visibility": "private_to_user", "assist_group_id": group_id}, "message_id": deterministic_message_id(user_id, "assist_message", contact_id, request_id, "request")},
+                    {"user_id": user_id, "contact_id": contact_id, "role": "assist_user", "text": user_message, "extras": {"visibility": "private_to_user", "assist_group_id": group_id, "client_request_id": request_id}, "message_id": deterministic_message_id(user_id, "assist_message", contact_id, request_id, "request")},
                     {"user_id": contact_id, "contact_id": user_id, "role": "peer", "text": (outbound_message or {}).get("text") or "", "extras": recipient_extras, "message_id": canonical_message_id},
-                    {"user_id": user_id, "contact_id": contact_id, "role": "assist_ai", "text": ai_text, "extras": {"visibility": "private_to_user", "assist_group_id": group_id, **({"audio_url": assist_ai_audio_url} if assist_ai_audio_url else {})}, "message_id": deterministic_message_id(user_id, "assist_message", contact_id, request_id, "confirmation")},
+                    {"user_id": user_id, "contact_id": contact_id, "role": "assist_ai", "text": ai_text, "extras": {"visibility": "private_to_user", "assist_group_id": group_id, "client_request_id": request_id, **({"audio_url": assist_ai_audio_url} if assist_ai_audio_url else {})}, "message_id": deterministic_message_id(user_id, "assist_message", contact_id, request_id, "confirmation")},
                 ],
                 meta_writes=[
                     {"user_id": user_id, "contact_id": contact_id, "unread_increment": 0, "preview_text": outbound_text},
@@ -5305,8 +5316,8 @@ def assist_message():
                 request_id=request_id,
                 payload_hash=payload_hash,
                 message_writes=[
-                    {"user_id": user_id, "contact_id": contact_id, "role": "assist_user", "text": user_message, "extras": {"visibility": "private_to_user", "assist_group_id": group_id}, "message_id": deterministic_message_id(user_id, "assist_message", contact_id, request_id, "request")},
-                    {"user_id": user_id, "contact_id": contact_id, "role": "assist_ai", "text": ai_text, "extras": {"visibility": "private_to_user", "assist_group_id": group_id}, "message_id": deterministic_message_id(user_id, "assist_message", contact_id, request_id, "advice")},
+                    {"user_id": user_id, "contact_id": contact_id, "role": "assist_user", "text": user_message, "extras": {"visibility": "private_to_user", "assist_group_id": group_id, "client_request_id": request_id}, "message_id": deterministic_message_id(user_id, "assist_message", contact_id, request_id, "request")},
+                    {"user_id": user_id, "contact_id": contact_id, "role": "assist_ai", "text": ai_text, "extras": {"visibility": "private_to_user", "assist_group_id": group_id, "client_request_id": request_id}, "message_id": deterministic_message_id(user_id, "assist_message", contact_id, request_id, "advice")},
                 ],
                 meta_writes=[],
                 receipt_data={

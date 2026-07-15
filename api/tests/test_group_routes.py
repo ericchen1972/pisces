@@ -1409,8 +1409,15 @@ def test_direct_delivery_replays_same_request_without_duplicate_or_unread_increm
     assert first.status_code == second.status_code == 200
     assert first.get_json() == second.get_json()
     message_id = first.get_json()["message"]["message_id"]
+    assert first.get_json()["message"]["client_request_id"] == request_id
     assert message_id == main.deterministic_message_id("user-a", f"direct_{kind}", "user-b", request_id, "outbound")
     assert len([path for path in firestore.data if path[-2:] == ("messages", message_id)]) == 2
+    assert firestore.read(
+        f"users/user-a/chats/user-b/messages/{message_id}"
+    )["client_request_id"] == request_id
+    assert firestore.read(
+        f"users/user-b/chats/user-a/messages/{message_id}"
+    )["client_request_id"] == request_id
     assert firestore.read("users/user-b/chat_meta/user-a")["unread_count"].value == 1
     assert len(attempts) == 1
     if kind == "voice":

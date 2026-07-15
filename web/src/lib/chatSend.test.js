@@ -28,6 +28,7 @@ describe('sendAssistRequest', () => {
       assist_group: { id: 'assist-canonical', user_text: 'draft', ai_text: 'sent' },
       outbound_message: {
         message_id: 'outbound-canonical',
+        client_request_id: 'stable-assist-id',
         sender_mode: senderMode,
         text: 'hello',
         audio_url: '/voice',
@@ -60,6 +61,7 @@ describe('sendAssistRequest', () => {
     expect(JSON.parse(fetchImpl.mock.calls[1][1].body).request_id).toBe('stable-assist-id')
     expect(first.outboundMessage).toEqual({
       id: 'outbound-canonical',
+      requestId: 'stable-assist-id',
       role,
       senderMode,
       text: 'hello',
@@ -77,6 +79,7 @@ describe('sendPersonRequest', () => {
       ok: true,
       message: {
         message_id: 'server-message',
+        client_request_id: 'person-stable-1',
         sender_mode: 'user',
         text: '',
         image_url: 'https://store.public.blob.vercel-storage.com/image.png',
@@ -98,7 +101,7 @@ describe('sendPersonRequest', () => {
       image_url: 'https://store.public.blob.vercel-storage.com/image.png',
       request_id: 'person-stable-1',
     })
-    expect(message).toMatchObject({ id: 'server-message', role: 'user', imageUrl: 'https://store.public.blob.vercel-storage.com/image.png', avatarUrl: 'https://google/avatar' })
+    expect(message).toMatchObject({ id: 'server-message', requestId: 'person-stable-1', role: 'user', imageUrl: 'https://store.public.blob.vercel-storage.com/image.png', avatarUrl: 'https://google/avatar' })
   })
 
   it('reuses one request id for a failed draft retry and allocates after content or success changes', () => {
@@ -216,9 +219,10 @@ describe('effective AI proxy roles', () => {
   it('uses sender_mode for Ably messages', () => {
     expect(canonicalIncomingMessage({
       message_id: 'ably-1',
+      client_request_id: 'remote-request-1',
       sender_mode: 'ai_proxy',
       text: 'AI delivery',
-    })).toMatchObject({ id: 'ably-1', role: 'ai_proxy', senderMode: 'ai_proxy' })
+    })).toMatchObject({ id: 'ably-1', requestId: 'remote-request-1', role: 'ai_proxy', senderMode: 'ai_proxy' })
   })
 })
 
