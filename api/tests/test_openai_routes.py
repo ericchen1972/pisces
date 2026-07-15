@@ -1690,7 +1690,7 @@ def test_send_voice_route_uses_openai_transcription_and_preserves_shared_deliver
 
 @pytest.mark.parametrize(
     ("failure_stage", "expected_status"),
-    [("blob", 502), ("firestore", 500), ("ably", 500)],
+    [("blob", 502), ("firestore", 500), ("ably", 200)],
 )
 def test_send_voice_failures_are_stable_and_redacted(
     signed_in_client, route_stubs, monkeypatch, failure_stage, expected_status
@@ -1760,6 +1760,9 @@ def test_send_voice_failures_are_stable_and_redacted(
     assert "sk-private" not in serialized
     assert captured
     assert secret not in repr(captured)
+    if failure_stage == "ably":
+        assert response.get_json()["ok"] is True
+        assert response.get_json()["realtime_delivered"] is False
 
 
 def test_voice_chat_routes_openai_transcription_into_openai_text_reply(

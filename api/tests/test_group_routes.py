@@ -1111,6 +1111,79 @@ def test_text_delivery_succeeds_after_durable_write_when_realtime_publish_fails(
     assert private_provider_detail not in repr(logged)
 
 
+def test_voice_delivery_succeeds_after_durable_write_when_realtime_publish_fails(
+    signed_in_client, monkeypatch
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(main, "transcribe_audio_bytes", lambda *_args: "durable voice")
+    monkeypatch.setattr(
+        main,
+        "upload_audio_to_vercel_blob",
+        lambda *_args: "https://blob/voice.webm",
+    )
+
+    private_provider_detail = "ably-secret-never-log"
+
+    def fail_publish(*_args):
+        raise RuntimeError(private_provider_detail)
+
+    logged = []
+    deleted_blobs = []
+    monkeypatch.setattr(main, "publish_user_channel_message", fail_publish)
+    monkeypatch.setattr(main, "delete_vercel_blob", deleted_blobs.append)
+    monkeypatch.setattr(
+        main,
+        "log_tool_error",
+        lambda *args, **kwargs: logged.append((args, kwargs)),
+    )
+
+    response = signed_in_client.post(
+        "/api/messages/send-voice",
+        json={
+            "recipient_user_id": "user-b",
+            "audio_base64": base64.b64encode(b"voice").decode("ascii"),
+            "mime_type": "audio/webm",
+            "duration_seconds": 1.5,
+        },
+    )
+
+    body = response.get_json()
+    assert response.status_code == 200
+    assert body["ok"] is True
+    assert body["realtime_delivered"] is False
+    message_id = body["message"]["message_id"]
+    sender_message = firestore.read(
+        f"users/user-a/chats/user-b/messages/{message_id}"
+    )
+    recipient_message = firestore.read(
+        f"users/user-b/chats/user-a/messages/{message_id}"
+    )
+    assert sender_message["audio_url"] == "https://blob/voice.webm"
+    assert recipient_message["transcript_text"] == "durable voice"
+    assert (
+        firestore.read("users/user-b/chat_meta/user-a")["unread_count"].value
+        == 1
+    )
+    assert deleted_blobs == []
+    assert logged[0][0][:5] == (
+        "user-a",
+        "user-b",
+        "ably_publish",
+        "send_voice_message",
+        "RuntimeError",
+    )
+    assert private_provider_detail not in repr(logged)
+
+
 def test_delete_after_voice_persistence_before_publish_revokes_delivery(
     signed_in_client, monkeypatch
 ):

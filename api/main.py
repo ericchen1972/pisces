@@ -4589,7 +4589,24 @@ def send_voice_message():
             "sender_avatar_url": (sender_data.get("avatar_url") or ""),
             "sender_mode": "user",
         }
-        publish_user_channel_message(recipient_user_id, payload)
+        try:
+            publish_user_channel_message(recipient_user_id, payload)
+        except Exception as exc:
+            log_tool_error(
+                sender_user_id,
+                recipient_user_id,
+                "ably_publish",
+                "send_voice_message",
+                type(exc).__name__,
+                request_id=request_id,
+            )
+            return jsonify(
+                {
+                    "ok": True,
+                    "message": payload,
+                    "realtime_delivered": False,
+                }
+            )
         return jsonify({"ok": True, "message": payload})
     except AcceptedFriendshipRequired:
         try:
