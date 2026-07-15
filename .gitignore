@@ -10,6 +10,10 @@ web/.env.local
 # OS
 .DS_Store
 
+# Local Codex workspaces and visual brainstorming artifacts
+.worktrees/
+.superpowers/
+
 # Local notes
 AGENTS.md
 
