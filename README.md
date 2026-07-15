@@ -55,6 +55,23 @@ Backend credentials and service configuration:
 - `BLOB_READ_WRITE_TOKEN` (with the existing `spices_READ_WRITE_TOKEN` and `VITE_BLOB_READ_WRITE_TOKEN` fallbacks)
 - `FIRESTORE_PROJECT_ID` and `FIRESTORE_DATABASE_ID` when overriding the existing internal project/database names
 - `GOOGLE_CLIENT_ID` for Google sign-in
+- `ENABLE_TESTER_LOGIN`: local development defaults to enabled; Cloud Run defaults to disabled. Set explicitly to `true` only for a controlled test deployment.
+
+## OpenAI cost controls
+
+Every OpenAI-backed route requires an authenticated server session and applies a Firestore transaction quota keyed by the verified account ID and capability. Current limits are:
+
+| Capability | Per minute | Per hour |
+| --- | ---: | ---: |
+| Text chat and private assist | 20 | 200 |
+| Recorded AI voice chat | 6 | 40 |
+| Transcription | 12 | 100 |
+| Text-to-speech | 20 | 120 |
+| Realtime session issuance | 3 | 20 |
+
+Rejected requests return HTTP `429`, a `Retry-After` header, and a stable JSON error. Quota storage failures fail closed with HTTP `503`. A provider attempt consumes quota even when the provider later fails.
+
+Text chat and assist input is limited to 20,000 characters, direct TTS input is capped at 4,096 characters (with tighter product read-aloud limits where applicable), and decoded audio is capped at 10 MiB. Validation happens before quota consumption and provider calls.
 
 ## Local development
 

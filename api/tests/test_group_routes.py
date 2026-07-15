@@ -1070,6 +1070,7 @@ def test_concurrent_delete_winning_transaction_prevents_text_delivery_and_publis
 def test_concurrent_delete_winning_voice_persistence_prevents_delivery_and_publish(
     signed_in_client, monkeypatch
 ):
+    monkeypatch.setattr(main, "enforce_openai_quota", lambda *_args, **_kwargs: None)
     firestore = DeleteWinsFirestore()
     firestore.seed("users/user-a", display_name="Alice")
     firestore.seed("users/user-b", display_name="Bob")
@@ -1428,6 +1429,7 @@ def test_direct_delivery_replays_same_request_without_duplicate_or_unread_increm
 def test_concurrent_direct_replay_after_commit_does_not_duplicate_durable_state(
     signed_in_client, monkeypatch, kind
 ):
+    monkeypatch.setattr(main, "enforce_openai_quota", lambda *_args, **_kwargs: None)
     firestore = FakeFirestoreClient()
     firestore.seed("users/user-a", display_name="Alice")
     firestore.seed("users/user-b", display_name="Bob")

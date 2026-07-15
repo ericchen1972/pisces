@@ -559,6 +559,7 @@ def test_removed_legacy_live_token_route_returns_not_found(
 def test_about_friend_context_uses_openai_route_and_main_room_only(
     signed_in_client, monkeypatch
 ):
+    monkeypatch.setattr(main, "enforce_openai_quota", lambda *_args, **_kwargs: None)
     planner_calls = []
     monkeypatch.setattr(main, "get_user_history_range", lambda _uid: 10)
     user_doc = SimpleNamespace(exists=True, to_dict=lambda: {"display_name": "Eric"})
@@ -624,6 +625,7 @@ def test_about_friend_context_uses_openai_route_and_main_room_only(
 def test_about_friend_context_returns_empty_context_when_lookup_has_no_match(
     signed_in_client, monkeypatch
 ):
+    monkeypatch.setattr(main, "enforce_openai_quota", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(main, "get_user_history_range", lambda _uid: 10)
     user_doc = SimpleNamespace(exists=True, to_dict=lambda: {"display_name": "Eric"})
     monkeypatch.setattr(
@@ -665,6 +667,7 @@ def test_about_friend_context_returns_empty_context_when_lookup_has_no_match(
 def test_about_friend_context_clamps_fetch_and_omits_unrelated_sensitive_history(
     signed_in_client, monkeypatch
 ):
+    monkeypatch.setattr(main, "enforce_openai_quota", lambda *_args, **_kwargs: None)
     fetched_ranges = []
     monkeypatch.setattr(main, "get_user_history_range", lambda _uid: 9999)
     user_doc = SimpleNamespace(exists=True, to_dict=lambda: {"display_name": "Eric"})
@@ -1344,6 +1347,7 @@ def route_stubs(monkeypatch):
     saved = []
     receipts = {}
     monkeypatch.setattr(main, "get_openai_service", lambda: service, raising=False)
+    monkeypatch.setattr(main, "enforce_openai_quota", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(main, "get_user_ai_settings", lambda _uid: dict(main.DEFAULT_AI_SETTINGS))
     monkeypatch.setattr(main, "get_user_history_range", lambda _uid: 30)
     monkeypatch.setattr(main, "get_chat_messages", lambda *_args, **_kwargs: [])
@@ -2253,10 +2257,10 @@ def test_assist_planners_keep_incoming_peer_history(route_stubs):
     ]
 
 
-def test_legacy_chat_uses_openai_text_and_ignores_raw_body_user_id(client, route_stubs):
+def test_legacy_chat_uses_verified_account_and_ignores_raw_body_user_id(signed_in_client, route_stubs):
     service, saved = route_stubs
 
-    response = client.post(
+    response = signed_in_client.post(
         "/api/chat",
         json={"message": "hello", "user_id": "attacker-chosen-id"},
     )
@@ -2265,29 +2269,20 @@ def test_legacy_chat_uses_openai_text_and_ignores_raw_body_user_id(client, route
     assert response.get_json()["reply"] == "OpenAI reply"
     routed = next(kwargs for name, kwargs in service.calls if name == "decide_chat_output")
     generated = next(kwargs for name, kwargs in service.calls if name == "generate_text")
-    assert routed["user_id"] == generated["user_id"]
-    assert routed["user_id"]
-    assert routed["user_id"] != "attacker-chosen-id"
-    assert saved == []
-
-
-def test_legacy_chat_uses_distinct_stable_anonymous_session_identifiers(app, route_stubs):
-    service, _saved = route_stubs
-    first_client = app.test_client()
-    second_client = app.test_client()
-
-    first_client.post("/api/chat", json={"message": "one"})
-    first_client.post("/api/chat", json={"message": "two"})
-    second_client.post("/api/chat", json={"message": "three"})
-
-    routed_ids = [
-        kwargs["user_id"]
-        for name, kwargs in service.calls
-        if name == "decide_chat_output"
+    assert routed["user_id"] == generated["user_id"] == "user-a"
+    assert [(entry[0], entry[1], entry[2]) for entry in saved] == [
+        ("user-a", "pisces-core", "user"),
+        ("user-a", "pisces-core", "ai"),
     ]
-    assert routed_ids[0] == routed_ids[1]
-    assert routed_ids[0] != routed_ids[2]
-    assert all(value.startswith("legacy-anonymous:") for value in routed_ids)
+
+
+def test_legacy_chat_rejects_anonymous_sessions_without_openai_calls(client, route_stubs):
+    service, _saved = route_stubs
+
+    response = client.post("/api/chat", json={"message": "one"})
+
+    assert response.status_code == 401
+    assert service.calls == []
 
 
 def test_ai_room_forwarding_decision_false_returns_private_openai_advice_without_send(

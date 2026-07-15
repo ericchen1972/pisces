@@ -324,6 +324,7 @@ function LoginHome() {
   const [googleError, setGoogleError] = useState('')
   const [isLoggingIn, setIsLoggingIn] = useState(false)
   const [isSignedIn, setIsSignedIn] = useState(false)
+  const [testerLoginEnabled, setTesterLoginEnabled] = useState(false)
   const [currentUser, setCurrentUser] = useState(null)
   const [selectedContact, setSelectedContact] = useState(null)
   const [chatInput, setChatInput] = useState('')
@@ -1226,6 +1227,7 @@ function LoginHome() {
           signal: authTransition.signal,
         })
         const data = await res.json()
+        setTesterLoginEnabled(data?.tester_login_enabled === true)
         if (res.ok && data?.ok && data?.authenticated && data?.user?.id) {
           const authContext = applySignedInUser(data.user, authTransition)
           if (authContext) {
@@ -2314,6 +2316,7 @@ function LoginHome() {
           googleButtonRef={googleButtonRef}
           isLoggingIn={isLoggingIn}
           error={googleError}
+          testerLoginEnabled={testerLoginEnabled}
           onOpenTesterLogin={() => {
             setTesterError('')
             setTesterModalOpen(true)

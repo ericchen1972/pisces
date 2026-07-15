@@ -1,4 +1,4 @@
-export default function LoginScreen({ locale = 'en', googleButtonRef, isLoggingIn = false, error = '', onOpenTesterLogin }) {
+export default function LoginScreen({ locale = 'en', googleButtonRef, isLoggingIn = false, error = '', testerLoginEnabled = false, onOpenTesterLogin }) {
   const zh = locale === 'zh-TW'
   return (
     <main className="login-screen">
@@ -11,9 +11,11 @@ export default function LoginScreen({ locale = 'en', googleButtonRef, isLoggingI
         </div>
         {isLoggingIn ? <p className="form-status" role="status">{zh ? '登入中…' : 'Signing in…'}</p> : null}
         {error ? <p className="form-error" role="alert">{error}</p> : null}
-        <button type="button" className="text-button" onClick={onOpenTesterLogin}>
-          {zh ? '測試帳號登入' : 'Tester login'}
-        </button>
+        {testerLoginEnabled ? (
+          <button type="button" className="text-button" onClick={onOpenTesterLogin}>
+            {zh ? '測試帳號登入' : 'Tester login'}
+          </button>
+        ) : null}
       </section>
     </main>
   )

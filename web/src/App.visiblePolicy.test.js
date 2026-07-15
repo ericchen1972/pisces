@@ -46,4 +46,12 @@ describe('remaining visible interface policy', () => {
     expect(source).toContain('reconcileCanonicalMessage(current, audioMessageId, canonicalVoiceMessage)')
     expect(source).toContain('reconcileCanonicalMessage(current, temporaryId, assistMessage)')
   })
+
+  it('derives tester-login visibility only from the session capability response', () => {
+    const source = readFileSync(`${process.cwd()}/src/App.jsx`, 'utf8')
+    const restore = source.slice(source.indexOf('const restore = async () =>'), source.indexOf('const rawUi = localStorage'))
+    const settingsSave = source.slice(source.indexOf('const saveUserSettings = async'), source.indexOf('const openAddFriendModal'))
+    expect(restore).toContain('setTesterLoginEnabled(data?.tester_login_enabled === true)')
+    expect(settingsSave).not.toContain('setTesterLoginEnabled')
+  })
 })

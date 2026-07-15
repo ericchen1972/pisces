@@ -1,0 +1,8 @@
+{
+  "OPENAI_KEY": "replace-with-secret",
+  "GEMINI_API_KEY": "replace-with-secret",
+  "SESSION_SECRET": "replace-with-a-long-random-secret",
+  "ABLY_KEY": "replace-with-secret",
+  "BLOB_READ_WRITE_TOKEN": "replace-with-secret",
+  "ENABLE_TESTER_LOGIN": "false"
+}

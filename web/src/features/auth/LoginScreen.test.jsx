@@ -6,7 +6,7 @@ afterEach(cleanup)
 
 describe('LoginScreen', () => {
   it('shows the Convia dark sign-in surface without legacy phone chrome or branding', () => {
-    const { container } = render(<LoginScreen locale="en" googleButtonRef={{ current: null }} onOpenTesterLogin={() => {}} />)
+    const { container } = render(<LoginScreen locale="en" googleButtonRef={{ current: null }} testerLoginEnabled onOpenTesterLogin={() => {}} />)
 
     expect(screen.getByRole('heading', { name: 'Convia' })).toBeInTheDocument()
     expect(screen.getByLabelText('Sign in with Google')).toBeInTheDocument()
@@ -17,7 +17,7 @@ describe('LoginScreen', () => {
   })
 
   it('leaves the Google logo to the official rendered button', () => {
-    const { container } = render(<LoginScreen locale="en" googleButtonRef={{ current: null }} onOpenTesterLogin={() => {}} />)
+    const { container } = render(<LoginScreen locale="en" googleButtonRef={{ current: null }} testerLoginEnabled onOpenTesterLogin={() => {}} />)
 
     expect(container.querySelector('.google-signin__target')).toBeInTheDocument()
     expect(container.querySelector('.google-signin > svg')).not.toBeInTheDocument()
@@ -25,11 +25,22 @@ describe('LoginScreen', () => {
 
   it('keeps tester login reachable and localizes only zh-TW/Hant', () => {
     const onOpenTesterLogin = vi.fn()
-    const { rerender } = render(<LoginScreen locale="en" googleButtonRef={{ current: null }} onOpenTesterLogin={onOpenTesterLogin} />)
+    const { rerender } = render(<LoginScreen locale="en" googleButtonRef={{ current: null }} testerLoginEnabled onOpenTesterLogin={onOpenTesterLogin} />)
     fireEvent.click(screen.getByRole('button', { name: 'Tester login' }))
     expect(onOpenTesterLogin).toHaveBeenCalledOnce()
 
-    rerender(<LoginScreen locale="zh-TW" googleButtonRef={{ current: null }} onOpenTesterLogin={() => {}} />)
+    rerender(<LoginScreen locale="zh-TW" googleButtonRef={{ current: null }} testerLoginEnabled onOpenTesterLogin={() => {}} />)
     expect(screen.getByRole('button', { name: '測試帳號登入' })).toBeInTheDocument()
+  })
+
+  it('keeps tester login hidden until the server capability is explicitly enabled', () => {
+    const { rerender } = render(<LoginScreen locale="en" googleButtonRef={{ current: null }} onOpenTesterLogin={() => {}} />)
+    expect(screen.queryByRole('button', { name: 'Tester login' })).not.toBeInTheDocument()
+
+    rerender(<LoginScreen locale="en" googleButtonRef={{ current: null }} testerLoginEnabled={false} onOpenTesterLogin={() => {}} />)
+    expect(screen.queryByRole('button', { name: 'Tester login' })).not.toBeInTheDocument()
+
+    rerender(<LoginScreen locale="en" googleButtonRef={{ current: null }} testerLoginEnabled onOpenTesterLogin={() => {}} />)
+    expect(screen.getByRole('button', { name: 'Tester login' })).toBeInTheDocument()
   })
 })

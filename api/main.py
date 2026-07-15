@@ -34,6 +34,8 @@ MAX_AVATAR_BYTES = 5 * 1024 * 1024
 MAX_AVATAR_BASE64_CHARS = ((MAX_AVATAR_BYTES + 2) // 3) * 4
 MAX_PUBLIC_MEDIA_URL_LENGTH = 2048
 TRUSTED_PUBLIC_MEDIA_HOST_SUFFIX = ".blob.vercel-storage.com"
+MAX_CHAT_TEXT_CHARS = 20_000
+MAX_TTS_TEXT_CHARS = 4_096
 app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 
@@ -164,6 +166,18 @@ def get_config_value(*keys):
         if value:
             return value
     return ""
+
+
+def is_tester_login_enabled():
+    environment_value = os.getenv("ENABLE_TESTER_LOGIN")
+    raw = (
+        environment_value
+        if environment_value is not None
+        else get_config_value("ENABLE_TESTER_LOGIN")
+    ).strip().lower()
+    if raw:
+        return raw in {"1", "true", "yes", "on"}
+    return not bool(os.getenv("K_SERVICE"))
 
 
 SESSION_SECRET = get_config_value("SESSION_SECRET", "FLASK_SECRET_KEY", "SECRET_KEY") or "pisces-dev-secret-key"
@@ -1315,14 +1329,6 @@ def validate_request_id(value):
     if not isinstance(value, str) or not value.strip() or len(value.strip()) > 128:
         raise ValueError("request_id must be a nonempty string of at most 128 characters")
     return value.strip()
-
-
-def anonymous_safety_user_id():
-    identifier = session.get("anonymous_safety_id")
-    if not isinstance(identifier, str) or not identifier:
-        identifier = secrets.token_urlsafe(24)
-        session["anonymous_safety_id"] = identifier
-    return f"legacy-anonymous:{identifier}"
 
 
 def deterministic_message_id(user_id, route_name, contact_id, request_id, kind):
@@ -2833,6 +2839,10 @@ def speech_transcribe():
     except AudioInputError as exc:
         return jsonify({"ok": False, "error": str(exc)}), exc.status
 
+    quota_error = enforce_openai_quota(auth["user_id"], "transcription")
+    if quota_error:
+        return quota_error
+
     try:
         transcript = transcribe_audio_bytes(
             audio_bytes,
@@ -2874,15 +2884,18 @@ def speech_synthesize():
     instructions = raw_instructions.strip()
     if not text_value:
         return jsonify({"ok": False, "error": "text is required"}), 400
-    if len(text_value) > 200:
-        return jsonify({"ok": False, "error": "text must be 200 characters or fewer"}), 400
-    if not tts_text_within_product_limits(text_value):
+    if len(text_value) > MAX_TTS_TEXT_CHARS:
+        return jsonify({"ok": False, "error": "text is too long"}), 413
+    if len(text_value) > 200 or not tts_text_within_product_limits(text_value):
         return jsonify({"ok": False, "error": "text exceeds read-aloud limits"}), 400
     if voice not in OPENAI_VOICES:
         return jsonify({"ok": False, "error": "voice is invalid"}), 400
     if len(instructions) > 500:
         return jsonify({"ok": False, "error": "instructions must be 500 characters or fewer"}), 400
     instructions = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", instructions)
+    quota_error = enforce_openai_quota(auth["user_id"], "tts")
+    if quota_error:
+        return quota_error
     try:
         result = get_openai_service().synthesize(
             text=text_value,
@@ -2919,16 +2932,26 @@ def chat():
     if flask_request.method == "OPTIONS":
         return ("", 204)
 
+    auth, auth_error = get_session_auth(required=True)
+    if auth_error:
+        err, status = auth_error
+        return jsonify(err), status
+    user_id = auth["user_id"]
     body = flask_request.get_json(silent=True)
     if not isinstance(body, dict):
         return jsonify({"ok": False, "error": "JSON object is required"}), 400
-    user_message = (body.get("message") or "").strip()
-    auth, _ = get_session_auth(required=False)
-    user_id = (auth or {}).get("user_id") or ""
-    safety_user_id = user_id or anonymous_safety_user_id()
+    raw_message = body.get("message", "")
+    if not isinstance(raw_message, str):
+        return jsonify({"ok": False, "error": "message must be a string"}), 400
+    user_message = raw_message.strip()
     contact_id = (body.get("contact_id") or "pisces-core").strip() or "pisces-core"
     if not user_message:
-        return jsonify({"error": "message is required"}), 400
+        return jsonify({"ok": False, "error": "message is required"}), 400
+    if len(user_message) > MAX_CHAT_TEXT_CHARS:
+        return jsonify({"ok": False, "error": "message is too long"}), 413
+    quota_error = enforce_openai_quota(user_id, "text")
+    if quota_error:
+        return quota_error
 
     if contact_id == "pisces-core" and has_forward_intent_in_ai_room(user_message):
         if not user_id:
@@ -3318,7 +3341,7 @@ def chat():
             ai_settings,
             history_messages,
             extra_context_text=extra_context_text,
-            user_id=safety_user_id,
+            user_id=user_id,
         )
     except Exception as exc:
         return jsonify({"error": "AI reply is currently unavailable."}), 502
@@ -3409,7 +3432,7 @@ def chat_stream():
     body = flask_request.get_json(silent=True)
     if not isinstance(body, dict):
         return jsonify({"error": "JSON body is required"}), 400
-    raw_message = body.get("message")
+    raw_message = body.get("message", "")
     raw_contact_id = body.get("contact_id")
     if not isinstance(raw_message, str):
         return jsonify({"error": "message is required"}), 400
@@ -3421,6 +3444,11 @@ def chat_stream():
         return jsonify({"error": "message is required"}), 400
     if not contact_id:
         return jsonify({"error": "contact_id is required"}), 400
+    if len(user_message) > MAX_CHAT_TEXT_CHARS:
+        return jsonify({"ok": False, "error": "message is too long"}), 413
+    quota_error = enforce_openai_quota(user_id, "text")
+    if quota_error:
+        return quota_error
     try:
         request_id = validate_request_id(body.get("request_id"))
     except ValueError as exc:
@@ -3677,6 +3705,10 @@ def voice_chat():
     except AudioInputError as exc:
         return jsonify({"error": str(exc)}), exc.status
 
+    quota_error = enforce_openai_quota(user_id, "voice")
+    if quota_error:
+        return quota_error
+
     try:
         transcript = transcribe_audio_bytes(
             audio_bytes,
@@ -3882,6 +3914,8 @@ def auth_google():
 def auth_tester():
     if flask_request.method == "OPTIONS":
         return ("", 204)
+    if not is_tester_login_enabled():
+        return jsonify({"ok": False, "error": "not found"}), 404
 
     body = flask_request.get_json(silent=True) or {}
     email = (body.get("email") or "").strip().lower()
@@ -3954,13 +3988,23 @@ def session_me():
         return auth_error
     user_id = auth["user_id"]
     if not user_id:
-        return jsonify({"ok": True, "authenticated": False, "user": None})
+        return jsonify({
+            "ok": True,
+            "authenticated": False,
+            "user": None,
+            "tester_login_enabled": is_tester_login_enabled(),
+        })
     try:
         client = get_firestore_client()
         doc = client.collection("users").document(user_id).get()
         if not doc.exists:
             session.clear()
-            return jsonify({"ok": True, "authenticated": False, "user": None})
+            return jsonify({
+                "ok": True,
+                "authenticated": False,
+                "user": None,
+                "tester_login_enabled": is_tester_login_enabled(),
+            })
         data = doc.to_dict() or {}
         user = {
             "id": user_id,
@@ -3979,7 +4023,12 @@ def session_me():
             "history_range": sanitize_history_range(data.get("history_range", 30)),
         }
         set_user_session(user)
-        return jsonify({"ok": True, "authenticated": True, "user": user})
+        return jsonify({
+            "ok": True,
+            "authenticated": True,
+            "user": user,
+            "tester_login_enabled": is_tester_login_enabled(),
+        })
     except Exception as exc:
         return jsonify({"ok": False, "error": f"failed to load session user: {exc}"}), 500
 
@@ -4837,6 +4886,10 @@ def send_voice_message():
     except AudioInputError as exc:
         return jsonify({"ok": False, "error": str(exc)}), exc.status
 
+    quota_error = enforce_openai_quota(sender_user_id, "transcription")
+    if quota_error:
+        return quota_error
+
     payload_hash = delivery_payload_hash(
         recipient_user_id,
         {
@@ -5048,9 +5101,14 @@ def assist_message():
         err, status = auth_error
         return jsonify(err), status
     user_id = auth["user_id"]
-    body = flask_request.get_json(silent=True) or {}
+    body = flask_request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "JSON object is required"}), 400
     contact_id = (body.get("contact_id") or "").strip()
-    user_message = (body.get("message") or "").strip()
+    raw_message = body.get("message")
+    if not isinstance(raw_message, str):
+        return jsonify({"ok": False, "error": "message must be a string"}), 400
+    user_message = raw_message.strip()
 
     if not contact_id:
         return jsonify({"ok": False, "error": "contact_id is required"}), 400
@@ -5058,6 +5116,11 @@ def assist_message():
         return jsonify({"ok": False, "error": "message is required"}), 400
     if contact_id == "pisces-core":
         return jsonify({"ok": False, "error": "assist mode is only for friend chats"}), 400
+    if len(user_message) > MAX_CHAT_TEXT_CHARS:
+        return jsonify({"ok": False, "error": "message is too long"}), 413
+    quota_error = enforce_openai_quota(user_id, "text")
+    if quota_error:
+        return quota_error
 
     try:
         request_id = validate_request_id(body.get("request_id"))
@@ -5513,15 +5576,25 @@ MIN_REALTIME_SECRET_LIFETIME_SECONDS = 5
 MAX_REALTIME_SECRET_LIFETIME_SECONDS = 900
 REALTIME_QUOTA_PER_MINUTE = 3
 REALTIME_QUOTA_PER_HOUR = 20
+OPENAI_QUOTA_LIMITS = {
+    "text": {"minute": 20, "hour": 200},
+    "voice": {"minute": 6, "hour": 40},
+    "transcription": {"minute": 12, "hour": 100},
+    "tts": {"minute": 20, "hour": 120},
+    "realtime": {"minute": REALTIME_QUOTA_PER_MINUTE, "hour": REALTIME_QUOTA_PER_HOUR},
+}
 MAX_REALTIME_ABOUT_HISTORY_FETCH = 20
 MAX_REALTIME_ABOUT_HISTORY_MESSAGES = 6
 MAX_REALTIME_ABOUT_HISTORY_TEXT_CHARS = 1000
 MAX_REALTIME_ABOUT_HISTORY_TOTAL_CHARS = 4000
 
 
-def consume_realtime_issuance_quota(user_id, *, now=None, client=None):
+def consume_openai_quota(user_id, category, *, now=None, client=None, limits=None):
     if not user_id:
-        raise RuntimeError("Realtime quota requires a user")
+        raise RuntimeError("OpenAI quota requires a user")
+    if category not in OPENAI_QUOTA_LIMITS:
+        raise RuntimeError("OpenAI quota category is invalid")
+    limits = dict(limits or OPENAI_QUOTA_LIMITS[category])
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -5530,7 +5603,7 @@ def consume_realtime_issuance_quota(user_id, *, now=None, client=None):
         client.collection("users")
         .document(user_id)
         .collection("security")
-        .document("realtime_issuance_quota")
+        .document(f"openai_quota_{category}")
     )
 
     def operation(transaction):
@@ -5550,12 +5623,12 @@ def consume_realtime_issuance_quota(user_id, *, now=None, client=None):
             issued for issued in issued_at if (now - issued).total_seconds() < 60
         ]
         retry_after = 0
-        if len(minute_events) >= REALTIME_QUOTA_PER_MINUTE:
+        if len(minute_events) >= int(limits["minute"]):
             retry_after = max(
                 retry_after,
                 math.ceil(60 - (now - minute_events[0]).total_seconds()),
             )
-        if len(issued_at) >= REALTIME_QUOTA_PER_HOUR:
+        if len(issued_at) >= int(limits["hour"]):
             retry_after = max(
                 retry_after,
                 math.ceil(3600 - (now - issued_at[0]).total_seconds()),
@@ -5572,6 +5645,30 @@ def consume_realtime_issuance_quota(user_id, *, now=None, client=None):
         return {"allowed": True, "retry_after": 0}
 
     return firestore.transactional(operation)(client.transaction())
+
+
+def consume_realtime_issuance_quota(user_id, *, now=None, client=None):
+    return consume_openai_quota(
+        user_id,
+        "realtime",
+        now=now,
+        client=client,
+        limits={"minute": REALTIME_QUOTA_PER_MINUTE, "hour": REALTIME_QUOTA_PER_HOUR},
+    )
+
+
+def enforce_openai_quota(user_id, category):
+    try:
+        quota = consume_openai_quota(user_id, category)
+    except Exception:
+        return jsonify({"ok": False, "error": "openai_quota_unavailable", "category": category}), 503
+    if quota.get("allowed"):
+        return None
+    retry_after = max(1, int(quota.get("retry_after") or 1))
+    response = jsonify({"ok": False, "error": "openai_rate_limit_exceeded", "category": category})
+    response.status_code = 429
+    response.headers["Retry-After"] = str(retry_after)
+    return response
 
 
 def select_realtime_about_history(history, transcript, requested_name):
@@ -5800,6 +5897,9 @@ def openai_realtime_about_friend_context():
         return jsonify({"ok": True, "matched": False, "context": ""})
 
     user_id = auth["user_id"]
+    quota_error = enforce_openai_quota(user_id, "text")
+    if quota_error:
+        return quota_error
     try:
         try:
             history_range = int(get_user_history_range(user_id))
