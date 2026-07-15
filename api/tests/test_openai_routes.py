@@ -9,6 +9,11 @@ import pytest
 
 import main
 from openai_service import OpenAIService
+from test_contact_groups import FakeFirestoreClient, fake_transactional
+
+
+REAL_PERSIST_DELIVERY_ONCE = main.persist_delivery_once
+REAL_CONFIRM_FRIEND_DELIVERY = main.confirm_friend_delivery_before_publish
 
 
 class RealtimeServiceStub:
@@ -1492,6 +1497,9 @@ def route_stubs(monkeypatch):
         return done_payload
 
     monkeypatch.setattr(main, "persist_delivery_once", persist_once)
+    monkeypatch.setattr(
+        main, "confirm_friend_delivery_before_publish", lambda *_args, **_kwargs: True
+    )
     monkeypatch.setattr(main, "reserve_delivery_request", reserve_delivery)
     monkeypatch.setattr(main, "release_delivery_request", release_delivery)
     monkeypatch.setattr(main, "reserve_stream_request", reserve_stream)
@@ -1516,18 +1524,20 @@ def forwarding_stubs(route_stubs, monkeypatch):
             "relationship": "friends",
         },
     )
-    user_doc = SimpleNamespace(
-        exists=True,
-        to_dict=lambda: {
-            "display_name": "Bo",
-            "avatar_url": "https://user-avatar",
-            "ai_avatar_url": "https://ai-avatar",
-        },
+    firestore = FakeFirestoreClient()
+    firestore.seed(
+        "users/user-a",
+        display_name="Bo",
+        avatar_url="https://user-avatar",
+        ai_avatar_url="https://ai-avatar",
     )
-    chain = SimpleNamespace(document=lambda *_args: SimpleNamespace(get=lambda: user_doc))
-    monkeypatch.setattr(
-        main, "get_firestore_client", lambda: SimpleNamespace(collection=lambda *_args: chain)
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
     )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
     monkeypatch.setattr(main, "upsert_chat_meta", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         main,
@@ -2403,6 +2413,11 @@ def test_ai_room_forwarding_confirmation_failure_is_sanitized(
         "reason": "send",
     }
     service.composed = {"as_user": False, "message_to_friend": "Hello Amy"}
+    service.media_decision = {"draw_image": True, "create_music": False}
+    monkeypatch.setattr(main, "generate_image_with_gemini", lambda *_args: (b"image", "image/png"))
+    monkeypatch.setattr(main, "upload_image_to_vercel_blob", lambda *_args: "https://blob/orphan.png")
+    deleted = []
+    monkeypatch.setattr(main, "delete_vercel_blob", deleted.append)
 
     def fail_generate_text(**_kwargs):
         raise RuntimeError("provider detail sk-secret-value")
@@ -2423,6 +2438,7 @@ def test_ai_room_forwarding_confirmation_failure_is_sanitized(
     assert payload == {"error": "AI confirmation is currently unavailable."}
     assert saved == []
     assert published == []
+    assert deleted == ["https://blob/orphan.png"]
     failed_receipt = next(iter(service.receipts.values()))
     assert failed_receipt["state"] == "processing"
     assert failed_receipt["lease_expires_at"] <= datetime.now(timezone.utc)
@@ -2447,6 +2463,15 @@ def test_concurrent_delivery_loser_replays_stored_winner_only(
     }
     monkeypatch.setattr(main, "get_delivery_receipt", lambda *_args: None)
     monkeypatch.setattr(main, "persist_delivery_once", lambda **_kwargs: (winner_receipt, False))
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Bo")
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
 
     response = signed_in_client.post(
         "/api/chat",
@@ -2456,6 +2481,196 @@ def test_concurrent_delivery_loser_replays_stored_winner_only(
     assert response.get_json()["reply"] == "WINNER CONFIRMATION"
     assert published == [("user-b", winner_payload)]
     assert saved == []
+
+
+@pytest.mark.parametrize("route_kind", ["forward", "assist"])
+def test_ai_outbound_revoked_after_persistence_rolls_back_before_publish_and_cleans_media(
+    signed_in_client, route_stubs, monkeypatch, route_kind
+):
+    service, _saved = route_stubs
+    service.assist_decision = {"send_to_friend": True, "voice": False, "reason": "send"}
+    service.media_decision = {"draw_image": True, "create_music": False}
+    service.composed = {"as_user": False, "message_to_friend": "Hello Amy"}
+    service.text = "Delivery confirmed."
+    monkeypatch.setattr(
+        main,
+        "get_friend_context",
+        lambda *_args: {"friend_name": "Amy", "special_prompt": "", "relationship": "friends"},
+    )
+    if route_kind == "forward":
+        monkeypatch.setattr(main, "has_forward_intent_in_ai_room", lambda _text: True)
+        monkeypatch.setattr(main, "find_friend_from_message", lambda *_args: {"id": "user-b"})
+        path = "/api/chat"
+        payload = {"contact_id": "pisces-core", "message": "Tell Amy hello", "request_id": "revoke-forward"}
+    else:
+        path = "/api/assist/message"
+        payload = {"contact_id": "user-b", "message": "Tell Amy hello", "request_id": "revoke-assist"}
+
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Bo")
+    firestore.seed("users/user-b", display_name="Amy")
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+        accepted_at="generation-old",
+    )
+    firestore.seed("users/user-a/chat_meta/user-b", last_message_preview="sender before")
+    firestore.seed(
+        "users/user-b/chat_meta/user-a",
+        last_message_preview="recipient before",
+        unread_count=7,
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(main.firestore, "transactional", fake_transactional)
+    monkeypatch.setattr(main, "generate_image_with_gemini", lambda *_args: (b"image", "image/png"))
+    monkeypatch.setattr(main, "upload_image_to_vercel_blob", lambda *_args: "https://blob/revoked.png")
+    deleted = []
+    published = []
+    monkeypatch.setattr(main, "delete_vercel_blob", deleted.append)
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *args: published.append(args))
+    monkeypatch.setattr(main, "confirm_friend_delivery_before_publish", REAL_CONFIRM_FRIEND_DELIVERY)
+
+    def persist_with_friendship(**kwargs):
+        assert kwargs["friendship_user_ids"] == ("user-a", "user-b")
+        result = REAL_PERSIST_DELIVERY_ONCE(**kwargs)
+        firestore.data.pop(("friendships", "user-a_user-b"), None)
+        return result
+
+    monkeypatch.setattr(main, "persist_delivery_once", persist_with_friendship)
+
+    response = signed_in_client.post(path, json=payload)
+
+    assert response.status_code == 403, response.get_json()
+    assert published == []
+    assert deleted == ["https://blob/revoked.png"]
+    assert not any("messages" in key for key in firestore.data)
+    assert firestore.read("users/user-a/chat_meta/user-b") == {
+        "last_message_preview": "sender before"
+    }
+    assert firestore.read("users/user-b/chat_meta/user-a") == {
+        "last_message_preview": "recipient before",
+        "unread_count": 7,
+    }
+
+
+@pytest.mark.parametrize("route_kind", ["forward", "assist"])
+def test_ai_outbound_unpublished_replay_does_not_cross_friendship_generation(
+    signed_in_client, route_stubs, monkeypatch, route_kind
+):
+    service, _saved = route_stubs
+    message = "Tell Amy hello"
+    route_name = "chat_forward" if route_kind == "forward" else "assist_message"
+    request_id = f"generation-replay-{route_kind}"
+    service.receipts[("user-a", route_name, request_id)] = {
+        "state": "completed",
+        "payload_hash": main.delivery_payload_hash("user-b", message),
+        "friendship_generation": "accepted_at:generation-old",
+        "published": False,
+        "ably_payload": {"message_id": "old-message", "text": "old"},
+        "response": (
+            {"reply": "old confirmation", "tts": {"should_read_aloud": False}}
+            if route_kind == "forward"
+            else {"ok": True, "assist_group": {"ai_text": "old confirmation"}, "outbound_message": {"message_id": "old-message"}}
+        ),
+    }
+    monkeypatch.setattr(
+        main,
+        "get_friend_context",
+        lambda *_args: {"friend_name": "Amy", "special_prompt": "", "relationship": "friends"},
+    )
+    if route_kind == "forward":
+        monkeypatch.setattr(main, "has_forward_intent_in_ai_room", lambda _text: True)
+        monkeypatch.setattr(main, "find_friend_from_message", lambda *_args: {"id": "user-b"})
+        path = "/api/chat"
+        payload = {"contact_id": "pisces-core", "message": message, "request_id": request_id}
+    else:
+        path = "/api/assist/message"
+        payload = {"contact_id": "user-b", "message": message, "request_id": request_id}
+
+    firestore = FakeFirestoreClient()
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+        accepted_at="generation-new",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    published = []
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *args: published.append(args))
+
+    response = signed_in_client.post(path, json=payload)
+
+    assert response.status_code == 200
+    assert response.get_json()["realtime_delivered"] is False
+    assert published == []
+    assert service.receipts[("user-a", route_name, request_id)]["published"] is False
+
+
+@pytest.mark.parametrize("route_kind", ["forward", "assist"])
+def test_ai_outbound_concurrent_winner_receipt_uses_generation_guard_and_cleans_loser_media(
+    signed_in_client, route_stubs, monkeypatch, route_kind
+):
+    service, _saved = route_stubs
+    service.assist_decision = {"send_to_friend": True, "voice": False, "reason": "send"}
+    service.media_decision = {"draw_image": True, "create_music": False}
+    service.composed = {"as_user": False, "message_to_friend": "LOSER TEXT"}
+    service.text = "LOSER CONFIRMATION"
+    message = "Tell Amy hello"
+    route_name = "chat_forward" if route_kind == "forward" else "assist_message"
+    request_id = f"concurrent-generation-{route_kind}"
+    winner_receipt = {
+        "state": "completed",
+        "payload_hash": main.delivery_payload_hash("user-b", message),
+        "friendship_generation": "accepted_at:generation-old",
+        "published": False,
+        "ably_payload": {"message_id": "winner-message", "text": "WINNER TEXT"},
+        "response": (
+            {"reply": "WINNER CONFIRMATION", "tts": {"should_read_aloud": False}}
+            if route_kind == "forward"
+            else {"ok": True, "assist_group": {"ai_text": "WINNER CONFIRMATION"}, "outbound_message": {"message_id": "winner-message"}}
+        ),
+    }
+    monkeypatch.setattr(
+        main,
+        "get_friend_context",
+        lambda *_args: {"friend_name": "Amy", "special_prompt": "", "relationship": "friends"},
+    )
+    if route_kind == "forward":
+        monkeypatch.setattr(main, "has_forward_intent_in_ai_room", lambda _text: True)
+        monkeypatch.setattr(main, "find_friend_from_message", lambda *_args: {"id": "user-b"})
+        path = "/api/chat"
+        payload = {"contact_id": "pisces-core", "message": message, "request_id": request_id}
+    else:
+        path = "/api/assist/message"
+        payload = {"contact_id": "user-b", "message": message, "request_id": request_id}
+
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Bo")
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+        accepted_at="generation-new",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(main, "generate_image_with_gemini", lambda *_args: (b"image", "image/png"))
+    monkeypatch.setattr(main, "upload_image_to_vercel_blob", lambda *_args: "https://blob/loser.png")
+    monkeypatch.setattr(main, "persist_delivery_once", lambda **_kwargs: (winner_receipt, False))
+    deleted = []
+    published = []
+    monkeypatch.setattr(main, "delete_vercel_blob", deleted.append)
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *args: published.append(args))
+
+    response = signed_in_client.post(path, json=payload)
+
+    assert response.status_code == 200
+    assert response.get_json()["realtime_delivered"] is False
+    assert published == []
+    assert deleted == ["https://blob/loser.png"]
 
 
 def test_chat_media_generators_run_only_after_openai_media_decision(

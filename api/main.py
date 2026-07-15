@@ -1513,6 +1513,14 @@ def persist_delivery_once(
                 **receipt_data,
                 "payload_hash": payload_hash,
                 "rollback_meta": rollback_meta,
+                "rollback_message_refs": [
+                    {
+                        "user_id": write["user_id"],
+                        "contact_id": write["contact_id"],
+                        "message_id": write["message_id"],
+                    }
+                    for write in message_writes
+                ],
                 **({"friendship_generation": friendship_generation} if friendship_generation else {}),
                 **({"state": "completed"} if owner_token else {}),
                 "updated_at": firestore.SERVER_TIMESTAMP,
@@ -1556,6 +1564,14 @@ def persist_delivery_once(
     receipt = {
         **receipt_data,
         "payload_hash": payload_hash,
+        "rollback_message_refs": [
+            {
+                "user_id": write["user_id"],
+                "contact_id": write["contact_id"],
+                "message_id": write["message_id"],
+            }
+            for write in message_writes
+        ],
         **({"state": "completed"} if owner_token else {}),
     }
     save_delivery_receipt(user_id, route_name, request_id, receipt)
@@ -2631,8 +2647,26 @@ def confirm_friend_delivery_before_publish(
             friendship_snapshot, user_a_id, user_b_id
         ) and (not expected_generation or current_generation == expected_generation):
             return True
-        tx.delete(sender_message_ref)
-        tx.delete(recipient_message_ref)
+        rollback_message_refs = receipt.get("rollback_message_refs") or []
+        if rollback_message_refs:
+            for item in rollback_message_refs:
+                if not isinstance(item, dict):
+                    continue
+                rollback_user_id = (item.get("user_id") or "").strip()
+                rollback_contact_id = (item.get("contact_id") or "").strip()
+                rollback_message_id = (item.get("message_id") or "").strip()
+                if rollback_user_id and rollback_contact_id and rollback_message_id:
+                    tx.delete(
+                        _chat_message_ref(
+                            client,
+                            rollback_user_id,
+                            rollback_contact_id,
+                            rollback_message_id,
+                        )
+                    )
+        else:
+            tx.delete(sender_message_ref)
+            tx.delete(recipient_message_ref)
         effective_rollback_meta = receipt.get("rollback_meta") or rollback_meta or {}
         for user_id, contact_id, ref, snapshot in (
             (sender_user_id, recipient_user_id, sender_meta_ref, sender_meta_snapshot),
@@ -2653,8 +2687,9 @@ def confirm_friend_delivery_before_publish(
     return commit(transaction)
 
 
-def replay_direct_delivery(user_id, route_name, request_id, payload_hash, recipient_user_id):
-    receipt = get_delivery_receipt(user_id, route_name, request_id)
+def replay_friend_delivery_receipt(
+    receipt, user_id, route_name, request_id, payload_hash, recipient_user_id
+):
     if not receipt or not _delivery_receipt_is_completed(receipt):
         return None
     if receipt.get("payload_hash") != payload_hash:
@@ -2682,6 +2717,17 @@ def replay_direct_delivery(user_id, route_name, request_id, payload_hash, recipi
             except Exception:
                 response["realtime_delivered"] = False
     return response
+
+
+def replay_direct_delivery(user_id, route_name, request_id, payload_hash, recipient_user_id):
+    return replay_friend_delivery_receipt(
+        get_delivery_receipt(user_id, route_name, request_id),
+        user_id,
+        route_name,
+        request_id,
+        payload_hash,
+        recipient_user_id,
+    )
 
 
 def decide_assist_action(user_message, history_messages, friend_name, user_id=""):
@@ -2917,21 +2963,17 @@ def chat():
             user_id, "chat_forward", request_id
         )
         if existing_receipt and _delivery_receipt_is_completed(existing_receipt):
-            if existing_receipt.get("payload_hash") != payload_hash:
+            try:
+                stored_response = replay_friend_delivery_receipt(
+                    existing_receipt,
+                    user_id,
+                    "chat_forward",
+                    request_id,
+                    payload_hash,
+                    target_id,
+                )
+            except ValueError:
                 return jsonify({"error": "request_id was already used for a different delivery"}), 409
-            stored_response = replay_delivery_response(existing_receipt, user_id)
-            stored_payload = existing_receipt.get("ably_payload") or {}
-            if stored_payload and not existing_receipt.get("published"):
-                try:
-                    publish_user_channel_message(target_id, stored_payload)
-                    save_delivery_receipt(
-                        user_id,
-                        "chat_forward",
-                        request_id,
-                        {"published": True},
-                    )
-                except Exception:
-                    pass
             return jsonify(stored_response)
 
         try:
@@ -2945,7 +2987,16 @@ def chat():
         except ValueError:
             return jsonify({"error": "request_id was already used for a different delivery"}), 409
         if _delivery_receipt_is_completed(reserved_receipt):
-            return jsonify(replay_delivery_response(reserved_receipt, user_id))
+            return jsonify(
+                replay_friend_delivery_receipt(
+                    reserved_receipt,
+                    user_id,
+                    "chat_forward",
+                    request_id,
+                    payload_hash,
+                    target_id,
+                )
+            )
         if not acquired:
             return jsonify({"error": "request is already in progress"}), 409
         delivery_owner = reserved_receipt["owner_token"]
@@ -3039,10 +3090,27 @@ def chat():
                 outbound_text = f'{sender_name} made a song for you. Hope you like it.'
         outbound_image_url = ""
         outbound_music_url = ""
+        outbound_blob_urls = []
+
+        def cleanup_outbound_blobs():
+            for blob_url in dict.fromkeys(outbound_blob_urls):
+                try:
+                    delete_vercel_blob(blob_url)
+                except Exception:
+                    log_tool_error(
+                        user_id,
+                        target_id,
+                        "outbound_cleanup",
+                        "chat_ai_room_forward",
+                        "blob_cleanup_failed",
+                        request_id=request_id,
+                    )
+
         if media_tools.get("draw_image"):
             try:
                 image_bytes, image_mime = generate_image_with_gemini(user_message)
                 outbound_image_url = upload_image_to_vercel_blob(user_id, image_bytes, image_mime or "image/png")
+                outbound_blob_urls.append(outbound_image_url)
             except Exception as exc:
                 log_tool_error(user_id, target_id, "draw_image", "chat_ai_room_forward_send", str(exc), input_snapshot={"message": user_message})
         if media_tools.get("create_music"):
@@ -3055,6 +3123,7 @@ def chat():
                     )
                 music_bytes = generate_music_with_lyria(music_seed)
                 outbound_music_url = upload_audio_to_vercel_blob(user_id, music_bytes, "audio/wav")
+                outbound_blob_urls.append(outbound_music_url)
             except Exception as exc:
                 log_tool_error(user_id, target_id, "create_music", "chat_ai_room_forward_send", str(exc), input_snapshot={"message": user_message})
         sender_mode = "user" if composed_as_user else "ai_proxy"
@@ -3081,6 +3150,7 @@ def chat():
                         base64.b64decode(audio_b64_tmp),
                         audio_mime_tmp or "audio/wav",
                     )
+                    outbound_blob_urls.append(outbound_audio_url)
                 except Exception:
                     log_tool_error(
                         user_id,
@@ -3132,6 +3202,7 @@ def chat():
                 input_items=confirmation_input,
             )
         except Exception:
+            cleanup_outbound_blobs()
             safe_release_delivery_request(user_id, "chat_forward", request_id, delivery_owner)
             return jsonify({"error": "AI confirmation is currently unavailable."}), 502
         audio_b64 = ""
@@ -3180,20 +3251,39 @@ def chat():
                     **({"audio_artifact_id": confirmation_audio_artifact_id} if confirmation_audio_artifact_id else {}),
                 },
                 owner_token=delivery_owner,
+                friendship_user_ids=(user_id, target_id),
             )
+        except AcceptedFriendshipRequired:
+            cleanup_outbound_blobs()
+            safe_release_delivery_request(user_id, "chat_forward", request_id, delivery_owner)
+            return jsonify({"error": "accepted friendship required"}), 403
         except Exception as exc:
+            cleanup_outbound_blobs()
             safe_release_delivery_request(user_id, "chat_forward", request_id, delivery_owner)
             log_tool_error(user_id, target_id, "send_msg", "chat_ai_room_forward", type(exc).__name__, request_id=request_id)
             return jsonify({"error": "Message delivery is currently unavailable."}), 500
         if not created:
-            stored_payload = stored_receipt.get("ably_payload") or {}
-            if stored_payload and not stored_receipt.get("published"):
-                try:
-                    publish_user_channel_message(target_id, stored_payload)
-                    save_delivery_receipt(user_id, "chat_forward", request_id, {"published": True})
-                except Exception:
-                    pass
-            return jsonify(replay_delivery_response(stored_receipt, user_id))
+            cleanup_outbound_blobs()
+            return jsonify(
+                replay_friend_delivery_receipt(
+                    stored_receipt,
+                    user_id,
+                    "chat_forward",
+                    request_id,
+                    payload_hash,
+                    target_id,
+                )
+            )
+        if not confirm_friend_delivery_before_publish(
+            get_firestore_client(),
+            user_id,
+            target_id,
+            canonical_message_id,
+            "chat_forward",
+            request_id,
+        ):
+            cleanup_outbound_blobs()
+            return jsonify({"error": "accepted friendship required"}), 403
         try:
             publish_user_channel_message(target_id, payload)
             save_delivery_receipt(
@@ -4974,6 +5064,23 @@ def assist_message():
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     delivery_owner = ""
+    outbound_blob_urls = []
+    outbound_blobs_durable = False
+
+    def cleanup_outbound_blobs():
+        for blob_url in dict.fromkeys(outbound_blob_urls):
+            try:
+                delete_vercel_blob(blob_url)
+            except Exception:
+                log_tool_error(
+                    user_id,
+                    contact_id,
+                    "outbound_cleanup",
+                    "assist_message",
+                    "blob_cleanup_failed",
+                    request_id=request_id,
+                )
+
     try:
         friend_ctx = get_friend_context(user_id, contact_id)
         if not friend_ctx:
@@ -4984,21 +5091,18 @@ def assist_message():
             user_id, "assist_message", request_id
         )
         if existing_receipt and _delivery_receipt_is_completed(existing_receipt):
-            if existing_receipt.get("payload_hash") != payload_hash:
+            try:
+                stored_response = replay_friend_delivery_receipt(
+                    existing_receipt,
+                    user_id,
+                    "assist_message",
+                    request_id,
+                    payload_hash,
+                    contact_id,
+                )
+            except ValueError:
                 return jsonify({"ok": False, "error": "request_id was already used for a different delivery"}), 409
-            stored_payload = existing_receipt.get("ably_payload") or {}
-            if stored_payload and not existing_receipt.get("published"):
-                try:
-                    publish_user_channel_message(contact_id, stored_payload)
-                    save_delivery_receipt(
-                        user_id,
-                        "assist_message",
-                        request_id,
-                        {"published": True},
-                    )
-                except Exception:
-                    pass
-            return jsonify(replay_delivery_response(existing_receipt, user_id))
+            return jsonify(stored_response)
 
         try:
             reserved_receipt, acquired = reserve_delivery_request(
@@ -5011,7 +5115,16 @@ def assist_message():
         except ValueError:
             return jsonify({"ok": False, "error": "request_id was already used for a different delivery"}), 409
         if _delivery_receipt_is_completed(reserved_receipt):
-            return jsonify(replay_delivery_response(reserved_receipt, user_id))
+            return jsonify(
+                replay_friend_delivery_receipt(
+                    reserved_receipt,
+                    user_id,
+                    "assist_message",
+                    request_id,
+                    payload_hash,
+                    contact_id,
+                )
+            )
         if not acquired:
             return jsonify({"ok": False, "error": "request is already in progress"}), 409
         delivery_owner = reserved_receipt["owner_token"]
@@ -5091,6 +5204,7 @@ def assist_message():
                 try:
                     image_bytes, image_mime = generate_image_with_gemini(user_message)
                     outbound_image_url = upload_image_to_vercel_blob(user_id, image_bytes, image_mime or "image/png")
+                    outbound_blob_urls.append(outbound_image_url)
                 except Exception as exc:
                     log_tool_error(
                         user_id,
@@ -5105,6 +5219,7 @@ def assist_message():
                 try:
                     music_bytes = generate_music_with_lyria(user_message)
                     outbound_music_url = upload_audio_to_vercel_blob(user_id, music_bytes, "audio/wav")
+                    outbound_blob_urls.append(outbound_music_url)
                 except Exception as exc:
                     log_tool_error(
                         user_id,
@@ -5138,6 +5253,7 @@ def assist_message():
                             base64.b64decode(audio_b64_tmp),
                             audio_mime_tmp or "audio/wav",
                         )
+                        outbound_blob_urls.append(outbound_audio_url)
                     except Exception:
                         log_tool_error(
                             user_id,
@@ -5281,16 +5397,31 @@ def assist_message():
                     **({"audio_artifact_id": private_audio_artifact_id} if private_audio_artifact_id else {}),
                 },
                 owner_token=delivery_owner,
+                friendship_user_ids=(user_id, contact_id),
             )
             if not created:
-                stored_payload = stored_receipt.get("ably_payload") or {}
-                if stored_payload and not stored_receipt.get("published"):
-                    try:
-                        publish_user_channel_message(contact_id, stored_payload)
-                        save_delivery_receipt(user_id, "assist_message", request_id, {"published": True})
-                    except Exception:
-                        pass
-                return jsonify(replay_delivery_response(stored_receipt, user_id))
+                cleanup_outbound_blobs()
+                return jsonify(
+                    replay_friend_delivery_receipt(
+                        stored_receipt,
+                        user_id,
+                        "assist_message",
+                        request_id,
+                        payload_hash,
+                        contact_id,
+                    )
+                )
+            if not confirm_friend_delivery_before_publish(
+                get_firestore_client(),
+                user_id,
+                contact_id,
+                canonical_message_id,
+                "assist_message",
+                request_id,
+            ):
+                cleanup_outbound_blobs()
+                return jsonify({"ok": False, "error": "accepted friendship required"}), 403
+            outbound_blobs_durable = True
             if ably_payload:
                 try:
                     publish_user_channel_message(contact_id, ably_payload)
@@ -5333,7 +5464,20 @@ def assist_message():
             if not created:
                 return jsonify(replay_delivery_response(stored_receipt, user_id))
         return jsonify(response_payload)
+    except AcceptedFriendshipRequired:
+        if not outbound_blobs_durable:
+            cleanup_outbound_blobs()
+        if delivery_owner:
+            try:
+                safe_release_delivery_request(
+                    user_id, "assist_message", request_id, delivery_owner
+                )
+            except Exception:
+                pass
+        return jsonify({"ok": False, "error": "accepted friendship required"}), 403
     except Exception as exc:
+        if not outbound_blobs_durable:
+            cleanup_outbound_blobs()
         if delivery_owner:
             try:
                 safe_release_delivery_request(
