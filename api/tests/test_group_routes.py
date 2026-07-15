@@ -1054,6 +1054,34 @@ def test_delete_after_text_persistence_before_publish_revokes_delivery(
     assert not any("messages" in path for path in firestore.data)
 
 
+def test_legacy_pre_publish_rollback_restores_existing_metadata(
+    signed_in_client, monkeypatch
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    firestore.seed("users/user-a/chat_meta/user-b", last_message_preview="sender before", unread_count=4)
+    firestore.seed("users/user-b/chat_meta/user-a", last_message_preview="recipient before", unread_count=9)
+    firestore.seed("friendships/user-a_user-b", user_a_id="user-a", user_b_id="user-b", status="accepted")
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    original_persist = main.persist_friend_delivery
+
+    def persist_then_revoke(*args, **kwargs):
+        rollback_meta = original_persist(*args, **kwargs)
+        firestore.data.pop(("friendships", "user-a_user-b"), None)
+        return rollback_meta
+
+    monkeypatch.setattr(main, "persist_friend_delivery", persist_then_revoke)
+    published = []
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *args: published.append(args))
+    response = signed_in_client.post("/api/messages/send", json={"recipient_user_id": "user-b", "text": "legacy race"})
+    assert response.status_code == 403
+    assert published == []
+    assert not any("messages" in path for path in firestore.data)
+    assert firestore.read("users/user-a/chat_meta/user-b") == {"last_message_preview": "sender before", "unread_count": 4}
+    assert firestore.read("users/user-b/chat_meta/user-a") == {"last_message_preview": "recipient before", "unread_count": 9}
+
+
 def test_text_delivery_succeeds_after_durable_write_when_realtime_publish_fails(
     signed_in_client, monkeypatch
 ):

@@ -2510,17 +2510,28 @@ def persist_friend_delivery(
             friendship_snapshot, user_a_id, user_b_id
         ):
             raise AcceptedFriendshipRequired("accepted friendship required")
+        sender_meta_snapshot = next(iter(tx.get(sender_meta_ref)))
+        recipient_meta_snapshot = next(iter(tx.get(recipient_meta_ref)))
+        rollback_meta = {
+            f"{sender_user_id}:{recipient_user_id}": (
+                sender_meta_snapshot.to_dict() if sender_meta_snapshot.exists else None
+            ),
+            f"{recipient_user_id}:{sender_user_id}": (
+                recipient_meta_snapshot.to_dict() if recipient_meta_snapshot.exists else None
+            ),
+        }
         tx.set(sender_message_ref, sender_message)
         tx.set(recipient_message_ref, recipient_message)
         tx.set(sender_meta_ref, sender_meta, merge=True)
         tx.set(recipient_meta_ref, recipient_meta, merge=True)
+        return rollback_meta
 
-    commit(transaction)
+    return commit(transaction)
 
 
 def confirm_friend_delivery_before_publish(
     client, sender_user_id, recipient_user_id, message_id,
-    receipt_route_name="", receipt_request_id="",
+    receipt_route_name="", receipt_request_id="", rollback_meta=None,
 ):
     friendship_ref, _pair_key, user_a_id, user_b_id = _friendship_reference(
         client, sender_user_id, recipient_user_id
@@ -2571,7 +2582,7 @@ def confirm_friend_delivery_before_publish(
             receipt = receipt_snapshot.to_dict() if receipt_snapshot.exists else {}
         tx.delete(sender_message_ref)
         tx.delete(recipient_message_ref)
-        rollback_meta = receipt.get("rollback_meta") or {}
+        effective_rollback_meta = receipt.get("rollback_meta") or rollback_meta or {}
         for user_id, contact_id, ref, snapshot in (
             (sender_user_id, recipient_user_id, sender_meta_ref, sender_meta_snapshot),
             (recipient_user_id, sender_user_id, recipient_meta_ref, recipient_meta_snapshot),
@@ -2579,7 +2590,7 @@ def confirm_friend_delivery_before_publish(
             current = snapshot.to_dict() if snapshot.exists else {}
             if current.get("direct_delivery_guard") != message_id:
                 continue
-            prior = rollback_meta.get(f"{user_id}:{contact_id}")
+            prior = effective_rollback_meta.get(f"{user_id}:{contact_id}")
             if prior is None:
                 tx.delete(ref)
             else:
@@ -4477,6 +4488,7 @@ def send_message():
             return jsonify(replay)
 
     delivery_owner = ""
+    rollback_meta = None
     try:
         client = get_firestore_client()
 
@@ -4565,13 +4577,14 @@ def send_message():
             if not created:
                 return jsonify(replay_delivery_response(receipt, sender_user_id))
         else:
-            persist_friend_delivery(
+            rollback_meta = persist_friend_delivery(
                 client, sender_user_id, recipient_user_id, message_id, text,
                 sender_extras, recipient_extras, preview_text,
             )
         if not confirm_friend_delivery_before_publish(
             client, sender_user_id, recipient_user_id, message_id,
             route_name if idempotent else "", request_id if idempotent else "",
+            rollback_meta,
         ):
             raise AcceptedFriendshipRequired("accepted friendship required")
 
@@ -4625,6 +4638,7 @@ def send_voice_message():
         return jsonify({"ok": False, "error": str(exc)}), 400
     route_name = "direct_voice"
     delivery_owner = ""
+    rollback_meta = None
     recipient_user_id = (body.get("recipient_user_id") or "").strip()
     duration_seconds_raw = body.get("duration_seconds")
 
@@ -4796,13 +4810,14 @@ def send_voice_message():
             if not created:
                 return jsonify(replay_delivery_response(receipt, sender_user_id))
         else:
-            persist_friend_delivery(
+            rollback_meta = persist_friend_delivery(
                 client, sender_user_id, recipient_user_id, message_id, "",
                 sender_extras, recipient_extras, transcript or "Voice message",
             )
         if not confirm_friend_delivery_before_publish(
             client, sender_user_id, recipient_user_id, message_id,
             route_name if idempotent else "", request_id if idempotent else "",
+            rollback_meta,
         ):
             raise AcceptedFriendshipRequired("accepted friendship required")
 
