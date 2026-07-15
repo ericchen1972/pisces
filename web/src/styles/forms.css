@@ -3,7 +3,7 @@
 .login-wordmark { width: 54px; height: 54px; display: grid; place-items: center; border-radius: 14px; background: #ececec; color: #171717; font-size: 28px; font-weight: 700; }
 .login-card h1 { margin: 0; font-size: 30px; letter-spacing: -.03em; }
 .login-card > p { margin: 0; color: var(--muted); line-height: 1.5; }
-.google-signin { width: 100%; min-height: 46px; display: flex; align-items: center; justify-content: center; gap: 10px; padding: 5px 12px; border: 1px solid #565656; border-radius: 9px; background: #fff; color: #171717; }
+.google-signin { width: 100%; min-height: 46px; display: flex; align-items: center; justify-content: center; }
 .google-signin__target { min-width: 210px; min-height: 36px; }
 .text-button { border: 0; background: transparent; color: #d5d5d5; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
 .form-stack { display: grid; gap: 16px; }

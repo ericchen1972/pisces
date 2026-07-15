@@ -16,6 +16,13 @@ describe('LoginScreen', () => {
     expect(container.querySelector('img[src*="background"], img[src*="logo.webp"]')).not.toBeInTheDocument()
   })
 
+  it('leaves the Google logo to the official rendered button', () => {
+    const { container } = render(<LoginScreen locale="en" googleButtonRef={{ current: null }} onOpenTesterLogin={() => {}} />)
+
+    expect(container.querySelector('.google-signin__target')).toBeInTheDocument()
+    expect(container.querySelector('.google-signin > svg')).not.toBeInTheDocument()
+  })
+
   it('keeps tester login reachable and localizes only zh-TW/Hant', () => {
     const onOpenTesterLogin = vi.fn()
     const { rerender } = render(<LoginScreen locale="en" googleButtonRef={{ current: null }} onOpenTesterLogin={onOpenTesterLogin} />)
