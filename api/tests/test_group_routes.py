@@ -1919,6 +1919,227 @@ def test_generation_rollback_cleanup_job_retries_transient_public_and_private_fa
     assert firestore.read(cleanup_path) is None
 
 
+def test_revoked_terminal_blocks_request_reuse_after_cleanup_and_payload_mismatch(monkeypatch):
+    firestore = FakeFirestoreClient()
+    request_id = "terminal-revoked"
+    receipt_id = main.hashlib.sha256(f"assist_message:{request_id}".encode()).hexdigest()
+    receipt_path = f"users/user-a/delivery_receipts/{receipt_id}"
+    terminal_path = f"users/user-a/delivery_terminals/{receipt_id}"
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+        accepted_at="generation-new",
+    )
+    receipt = {
+        "state": "completed",
+        "payload_hash": "hash-1",
+        "friendship_generation": "accepted_at:generation-old",
+        "published": False,
+        "ably_payload": {"message_id": "message-1"},
+        "response": {"ok": True, "outbound_message": {"id": "message-1"}},
+        "owned_media_refs": [
+            {"kind": "public_blob", "url": "https://blob/terminal.png"},
+        ],
+    }
+    firestore.seed(receipt_path, **receipt)
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(main, "delete_vercel_blob", lambda _url: None)
+
+    first = main.replay_friend_delivery_receipt(
+        receipt, "user-a", "assist_message", request_id, "hash-1", "user-b"
+    )
+    terminal = firestore.read(terminal_path)
+    reserved, acquired = main.reserve_delivery_request(
+        user_id="user-a",
+        route_name="assist_message",
+        request_id=request_id,
+        payload_hash="hash-1",
+        receipt_data={"contact_id": "user-b"},
+    )
+
+    assert first["realtime_delivered"] is False
+    assert terminal["state"] == "revoked"
+    assert terminal["payload_hash"] == "hash-1"
+    assert terminal["sender_user_id"] == "user-a"
+    assert terminal["recipient_user_id"] == "user-b"
+    assert terminal["friendship_generation"] == "accepted_at:generation-old"
+    assert "secret" not in main.json.dumps(terminal, default=str).lower()
+    assert reserved == terminal
+    assert acquired is False
+    assert firestore.read(receipt_path) is None
+    with pytest.raises(ValueError, match="different delivery"):
+        main.reserve_delivery_request(
+            user_id="user-a",
+            route_name="assist_message",
+            request_id=request_id,
+            payload_hash="hash-2",
+            receipt_data={"contact_id": "user-b"},
+        )
+
+
+def test_pending_cleanup_drain_is_bounded_and_user_scoped(monkeypatch):
+    firestore = FakeFirestoreClient()
+    for index in range(7):
+        request_id = f"request-{index}"
+        job_id = main.hashlib.sha256(f"assist_message:{request_id}".encode()).hexdigest()
+        firestore.seed(
+            f"users/user-a/delivery_cleanup_jobs/{job_id}",
+            owner_user_id="user-a",
+            route_name="assist_message",
+            request_id=request_id,
+            owned_media_refs=[
+                {"kind": "public_blob", "url": f"https://blob/a-{index}.png"}
+            ],
+        )
+    firestore.seed(
+        "users/user-b/delivery_cleanup_jobs/job-b",
+        owner_user_id="user-b",
+        route_name="assist_message",
+        request_id="request-b",
+        owned_media_refs=[{"kind": "public_blob", "url": "https://blob/b.png"}],
+    )
+    deleted = []
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(main, "delete_vercel_blob", deleted.append)
+
+    assert main.drain_pending_delivery_cleanup_jobs("user-a", limit=5) == 5
+
+    assert len(deleted) == 5
+    assert all("/a-" in url for url in deleted)
+    assert firestore.read("users/user-b/delivery_cleanup_jobs/job-b") is not None
+    remaining = [
+        path
+        for path in firestore.data
+        if path[:3] == ("users", "user-a", "delivery_cleanup_jobs")
+    ]
+    assert len(remaining) == 2
+
+
+def test_terminal_replay_route_skips_quota_provider_persistence_and_publish(
+    signed_in_client, monkeypatch
+):
+    firestore = FakeFirestoreClient()
+    request_id = "terminal-route-replay"
+    payload_hash = main.delivery_payload_hash("user-b", "Tell Amy hello")
+    terminal_id = main.hashlib.sha256(f"chat_forward:{request_id}".encode()).hexdigest()
+    firestore.seed(
+        f"users/user-a/delivery_terminals/{terminal_id}",
+        route_name="chat_forward",
+        request_id=request_id,
+        payload_hash=payload_hash,
+        state="revoked",
+        response={"reply": "Delivery was cancelled.", "realtime_delivered": False},
+        sender_user_id="user-a",
+        recipient_user_id="user-b",
+        friendship_generation="accepted_at:old",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(main, "has_forward_intent_in_ai_room", lambda _text: True)
+    monkeypatch.setattr(main, "find_friend_from_message", lambda *_args: {"id": "user-b"})
+    monkeypatch.setattr(main, "get_friend_context", lambda *_args: {"friend_name": "Amy"})
+    monkeypatch.setattr(main, "enforce_openai_quota", lambda *_args: pytest.fail("no quota"))
+    monkeypatch.setattr(main, "get_openai_service", lambda: pytest.fail("no provider"))
+    monkeypatch.setattr(main, "persist_delivery_once", lambda *_args, **_kwargs: pytest.fail("no persist"))
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *_args: pytest.fail("no publish"))
+
+    response = signed_in_client.post(
+        "/api/chat",
+        json={
+            "message": "Tell Amy hello",
+            "contact_id": "pisces-core",
+            "request_id": request_id,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "reply": "Delivery was cancelled.",
+        "realtime_delivered": False,
+    }
+    mismatch = signed_in_client.post(
+        "/api/chat",
+        json={
+            "message": "Tell Amy something different",
+            "contact_id": "pisces-core",
+            "request_id": request_id,
+        },
+    )
+    assert mismatch.status_code == 409
+
+
+def test_unrelated_outbound_route_opportunistically_retries_pending_cleanup(
+    signed_in_client, monkeypatch
+):
+    firestore = FakeFirestoreClient()
+    request_id = "pending-from-earlier"
+    cleanup_id = main.hashlib.sha256(f"assist_message:{request_id}".encode()).hexdigest()
+    cleanup_path = f"users/user-a/delivery_cleanup_jobs/{cleanup_id}"
+    firestore.seed(
+        cleanup_path,
+        owner_user_id="user-a",
+        route_name="assist_message",
+        request_id=request_id,
+        owned_media_refs=[{"kind": "public_blob", "url": "https://blob/retry-later.png"}],
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(main, "delete_vercel_blob", lambda _url: None)
+
+    response = signed_in_client.post("/api/assist/message", json={})
+
+    assert response.status_code == 400
+    assert firestore.read(cleanup_path) is None
+
+
+def test_stale_rollback_merges_cleanup_refs_without_deleting_terminal(monkeypatch):
+    firestore = FakeFirestoreClient()
+    request_id = "merge-cleanup"
+    record_id = main.hashlib.sha256(f"chat_forward:{request_id}".encode()).hexdigest()
+    cleanup_path = f"users/user-a/delivery_cleanup_jobs/{record_id}"
+    terminal_path = f"users/user-a/delivery_terminals/{record_id}"
+    receipt_path = f"users/user-a/delivery_receipts/{record_id}"
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+        accepted_at="new",
+    )
+    firestore.seed(
+        cleanup_path,
+        owner_user_id="user-a",
+        route_name="chat_forward",
+        request_id=request_id,
+        owned_media_refs=[{"kind": "public_blob", "url": "https://blob/old.png"}],
+    )
+    receipt = {
+        "state": "completed",
+        "payload_hash": "hash-1",
+        "friendship_generation": "accepted_at:old",
+        "published": False,
+        "ably_payload": {"message_id": "merge-message"},
+        "response": {"ok": True},
+        "owned_media_refs": [
+            {"kind": "public_blob", "url": "https://blob/new.png"},
+            {"kind": "public_blob", "url": "https://blob/old.png"},
+        ],
+    }
+    firestore.seed(receipt_path, **receipt)
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(main, "delete_vercel_blob", lambda _url: (_ for _ in ()).throw(RuntimeError("keep")))
+
+    main.replay_friend_delivery_receipt(
+        receipt, "user-a", "chat_forward", request_id, "hash-1", "user-b"
+    )
+
+    assert firestore.read(cleanup_path)["owned_media_refs"] == [
+        {"kind": "public_blob", "url": "https://blob/old.png"},
+        {"kind": "public_blob", "url": "https://blob/new.png"},
+    ]
+    assert firestore.read(terminal_path)["state"] == "revoked"
+
+
 def test_stale_claim_does_not_cleanup_media_when_rollback_reread_confirms_generation(monkeypatch):
     receipt = {
         "state": "completed",

@@ -880,6 +880,50 @@ def test_delete_private_audio_artifact_keeps_record_when_blob_delete_fails(monke
     assert firestore.read(artifact_path) is not None
 
 
+def test_delete_vercel_blob_treats_not_found_as_success(monkeypatch):
+    monkeypatch.setattr(main, "get_blob_rw_token", lambda: "token")
+
+    def missing(*_args, **_kwargs):
+        raise main.error.HTTPError(
+            "https://vercel.com/api/blob/delete", 404, "Not Found", {}, io.BytesIO(b"missing")
+        )
+
+    monkeypatch.setattr(main.request, "urlopen", missing)
+
+    assert main.delete_vercel_blob("https://blob/already-gone.bin") is None
+
+
+def test_private_audio_cleanup_retries_document_delete_after_blob_is_already_absent(monkeypatch):
+    firestore = FakeFirestoreClient()
+    artifact_path = "users/user-a/audio_artifacts/artifact-doc-retry"
+    firestore.seed(artifact_path, blob_url="https://blob/already-gone.bin")
+    reference = (
+        firestore.collection("users")
+        .document("user-a")
+        .collection("audio_artifacts")
+        .document("artifact-doc-retry")
+    )
+    original_delete = reference.delete
+    attempts = {"count": 0}
+
+    def transient_document_delete():
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("firestore transient")
+        original_delete()
+
+    reference.delete = transient_document_delete
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(main, "_private_audio_artifact_ref", lambda *_args: reference)
+    monkeypatch.setattr(main, "delete_vercel_blob", lambda _url: None)
+
+    with pytest.raises(RuntimeError, match="firestore transient"):
+        main.delete_private_audio_artifact("user-a", "artifact-doc-retry")
+    assert firestore.read(artifact_path) is not None
+    assert main.delete_private_audio_artifact("user-a", "artifact-doc-retry") is True
+    assert firestore.read(artifact_path) is None
+
+
 def test_private_audio_artifact_cleans_ciphertext_when_metadata_save_fails(monkeypatch):
     monkeypatch.setattr(main, "get_audio_artifact_key", lambda: b"k" * 32)
     monkeypatch.setattr(
@@ -3561,6 +3605,7 @@ def test_delivery_reservation_rejects_active_owner_and_takes_over_expired(monkey
         }
     }
     monkeypatch.setattr(main, "get_firestore_client", lambda: SimpleNamespace())
+    monkeypatch.setattr(main, "get_delivery_terminal", lambda *_args: None)
     monkeypatch.setattr(
         main,
         "get_delivery_receipt",
