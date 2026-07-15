@@ -17,6 +17,7 @@ import { createAccountOperationScope } from './lib/operationScope.js'
 import { avatarProcessingErrorMessage, createAvatarPreviewOwner, prepareAvatarPreview } from './lib/avatarMedia.js'
 import { createOwnedObjectUrlRegistry, discardRecordedMessage } from './lib/ownedObjectUrls.js'
 import { authorizeIncomingFriend } from './lib/realtimeFriendGate.js'
+import { createRecipientReconciler, reconcileRecipientSnapshot } from './lib/recipientReconciliation.js'
 import { requireSuccessfulVoiceResponse } from './lib/voiceResponse.js'
 import { mergeStreamMessage, streamAiTurn } from './lib/stream.js'
 import {
@@ -396,6 +397,7 @@ function LoginHome() {
   const contactEditSaveRef = useRef(null)
   const aiEditSaveRef = useRef(null)
   const realtimeFriendRefreshesRef = useRef(new Map())
+  const recipientReconcilerRef = useRef(null)
   const avatarFileInputRef = useRef(null)
   const avatarPreviewOwnerRef = useRef(null)
   if (!avatarPreviewOwnerRef.current) avatarPreviewOwnerRef.current = createAvatarPreviewOwner()
@@ -1336,6 +1338,44 @@ function LoginHome() {
 
   useEffect(() => {
     if (!isSignedIn || !currentUser?.id) return
+    const accountId = String(currentUser.id)
+    const controller = createRecipientReconciler({
+      windowTarget: window,
+      documentTarget: document,
+      isVisible: () => document.visibilityState === 'visible',
+      run: async () => {
+        const authContext = authRequestGuard.snapshot()
+        const contactId = selectedContactIdRef.current
+        const contact = contactsRef.current.find((candidate) => candidate.id === contactId)
+        const snapshot = {
+          accountId,
+          contactId,
+          human: Boolean(contactId && contactId !== 'pisces-core' && contact && !contact.isAi),
+          authContext,
+        }
+        await reconcileRecipientSnapshot({
+          snapshot,
+          isCurrent: (candidate) => (
+            authRequestGuard.isCurrent(candidate.authContext)
+            && candidate.accountId === String(currentUser.id)
+            && candidate.contactId === selectedContactIdRef.current
+          ),
+          refreshSidebar: () => initializeContactData(currentUser, { bootstrap: false, authContext }),
+          // loadContactHistory replaces the keyed conversation with canonical server message ids.
+          refreshHistory: (selectedId) => loadContactHistory(selectedId),
+        })
+      },
+    })
+    recipientReconcilerRef.current = controller
+    controller.start()
+    return () => {
+      controller.stop()
+      if (recipientReconcilerRef.current === controller) recipientReconcilerRef.current = null
+    }
+  }, [isSignedIn, currentUser?.id, currentUser?.provider, apiBaseUrl])
+
+  useEffect(() => {
+    if (!isSignedIn || !currentUser?.id) return
 
     let isCancelled = false
 
@@ -1381,7 +1421,11 @@ function LoginHome() {
         realtime.connection.on('connected', () => {
           const authContext = authRequestGuard.snapshot()
           if (!isCancelled && authContext.userId === currentUser.id) {
-            initializeContactData(currentUser, { bootstrap: false, authContext })
+            if (recipientReconcilerRef.current) {
+              void recipientReconcilerRef.current.trigger()
+            } else {
+              initializeContactData(currentUser, { bootstrap: false, authContext })
+            }
           }
         })
 
