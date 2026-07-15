@@ -1,6 +1,7 @@
 import json
 import os
 import base64
+import io
 import re
 import struct
 import hashlib
@@ -12,12 +13,12 @@ import secrets
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
 from urllib import error, request
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from flask import Flask, Response, jsonify, request as flask_request, session
+from werkzeug.exceptions import RequestEntityTooLarge
 from google.auth.transport import requests as google_requests
 from google.cloud import firestore
-from google.cloud import speech_v1 as speech
 from google import genai
 from google.genai import types as genai_types
 from google.oauth2 import id_token
@@ -25,11 +26,22 @@ from google.oauth2 import service_account
 from ably import AblyRest
 from ably.types.message import Message
 from openai import OpenAI
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from contact_groups import ContactGroupError, ContactGroupService
 from openai_service import OpenAIService
 
 app = Flask(__name__)
+MAX_AUDIO_BYTES = 10 * 1024 * 1024
+MAX_AUDIO_BASE64_CHARS = ((MAX_AUDIO_BYTES + 2) // 3) * 4
+MAX_AVATAR_BYTES = 5 * 1024 * 1024
+MAX_AVATAR_BASE64_CHARS = ((MAX_AVATAR_BYTES + 2) // 3) * 4
+app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def request_too_large(_exc):
+    return jsonify({"ok": False, "error": "request body is too large"}), 413
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 FIRESTORE_SA_PATH = os.path.join(os.path.dirname(__file__), "keys", "firestore-sa.json")
 FIRESTORE_PROJECT_ID = os.getenv("FIRESTORE_PROJECT_ID", "pisces-hackathon")
@@ -39,7 +51,6 @@ GOOGLE_CLIENT_ID = os.getenv(
     "315346868518-os2tf8uc5282bggj40jbpkaltae1phi9.apps.googleusercontent.com",
 )
 CHAT_MODEL = "gemini-2.5-flash"
-TTS_MODEL = "gemini-2.5-pro-preview-tts"
 LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
 IMAGE_MODEL_CANDIDATES = [
     "gemini-3.1-flash-image-preview",
@@ -55,8 +66,60 @@ AI_DEFAULT_GLOBAL_PROMPT = (
 DEFAULT_AI_SETTINGS = {
     "gender": "female",
     "voice": "Achernar",
+    "openai_voice": "marin",
     "global_prompt": AI_DEFAULT_GLOBAL_PROMPT,
 }
+OPENAI_VOICES = {
+    "alloy",
+    "ash",
+    "ballad",
+    "coral",
+    "echo",
+    "sage",
+    "shimmer",
+    "verse",
+    "marin",
+    "cedar",
+}
+SUPPORTED_AUDIO_MIME_TYPES = {
+    "audio/webm", "audio/ogg", "audio/wav", "audio/x-wav",
+    "audio/mpeg", "audio/mp3", "audio/mp4", "audio/m4a",
+}
+SUPPORTED_AVATAR_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
+
+
+class AudioInputError(ValueError):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+def decode_audio_input(body):
+    if not isinstance(body, dict):
+        raise AudioInputError("JSON object is required")
+    encoded = body.get("audio_base64")
+    mime_value = body.get("mime_type", "audio/webm")
+    if not isinstance(encoded, str):
+        raise AudioInputError("audio_base64 must be a string")
+    if not isinstance(mime_value, str):
+        raise AudioInputError("mime_type must be a string")
+    encoded = encoded.strip()
+    if not encoded:
+        raise AudioInputError("audio_base64 is required")
+    if len(encoded) > MAX_AUDIO_BASE64_CHARS:
+        raise AudioInputError("audio payload is too large", 413)
+    mime_type = mime_value.split(";", 1)[0].strip().lower()
+    if mime_type not in SUPPORTED_AUDIO_MIME_TYPES:
+        raise AudioInputError("mime_type is unsupported")
+    try:
+        audio_bytes = base64.b64decode(encoded, validate=True)
+    except Exception:
+        raise AudioInputError("invalid base64 audio payload") from None
+    if not audio_bytes:
+        raise AudioInputError("audio payload is empty")
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        raise AudioInputError("audio payload is too large", 413)
+    return audio_bytes, mime_type
 FEMALE_VOICES = {
     "Achernar",
     "Aoede",
@@ -178,12 +241,25 @@ def extract_json_obj(text):
 
 
 def count_zh_chars(text):
-    return len(re.sub(r"\s+", "", text or ""))
+    return len(
+        re.findall(
+            r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]",
+            text or "",
+        )
+    )
 
 
 def count_en_words(text):
     words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]*", text or "")
     return len(words)
+
+
+def tts_text_within_product_limits(text):
+    return (
+        len(text or "") <= 500
+        and count_zh_chars(text) <= 100
+        and count_en_words(text) <= 50
+    )
 
 
 def has_explicit_voice_request(text):
@@ -582,55 +658,41 @@ def generate_plain_text_reply(
     )
 
 
+def extract_tts_audio_bytes(result):
+    if isinstance(result, (bytes, bytearray)):
+        audio_bytes = bytes(result)
+    else:
+        content = getattr(result, "content", None)
+        if isinstance(content, (bytes, bytearray)):
+            audio_bytes = bytes(content)
+        elif hasattr(result, "read"):
+            audio_bytes = result.read()
+        else:
+            audio_bytes = b""
+    if not isinstance(audio_bytes, (bytes, bytearray)) or not audio_bytes:
+        raise RuntimeError("TTS returned empty audio")
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        raise RuntimeError("TTS audio is too large")
+    return bytes(audio_bytes)
+
+
 def synthesize_tts_audio(text, language, voice_name, tone_prompt=""):
-    # Keep TTS input as plain message text to avoid speaking prompt metadata.
-    prompt = (text or "").strip()
-    if not prompt:
+    text_value = (text or "").strip()
+    if not text_value:
         raise RuntimeError("TTS text is empty")
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt},
-                ]
-            }
-        ],
-        "generationConfig": {
-            "responseModalities": ["AUDIO"],
-            "speechConfig": {
-                "voiceConfig": {
-                    "prebuiltVoiceConfig": {
-                        "voiceName": voice_name,
-                    }
-                }
-            },
-        },
-    }
-    data = call_gemini_generate_content(payload, model=TTS_MODEL, timeout=60)
-    candidates = data.get("candidates") or []
-    if not candidates:
-        raise RuntimeError("Gemini TTS returned no candidates")
-    content = candidates[0].get("content") or {}
-    parts = content.get("parts") or []
-    for part in parts:
-        inline_data = part.get("inlineData") or {}
-        audio_b64 = (inline_data.get("data") or "").strip()
-        mime_type = (inline_data.get("mimeType") or "audio/wav").strip()
-        if audio_b64:
-            mime_lower = mime_type.lower()
-            if "audio/l16" in mime_lower or "audio/pcm" in mime_lower or "audio/raw" in mime_lower:
-                sample_rate = 24000
-                rate_match = re.search(r"rate=(\d+)", mime_lower)
-                if rate_match:
-                    sample_rate = int(rate_match.group(1))
-                try:
-                    pcm_bytes = base64.b64decode(audio_b64)
-                    wav_bytes = pcm16_to_wav_bytes(pcm_bytes, sample_rate=sample_rate, channels=1)
-                    return base64.b64encode(wav_bytes).decode("ascii"), "audio/wav"
-                except Exception:
-                    pass
-            return audio_b64, mime_type
-    raise RuntimeError("Gemini TTS returned no audio data")
+    voice = voice_name if voice_name in OPENAI_VOICES else default_openai_voice("")
+    instruction_parts = []
+    if (language or "").strip():
+        instruction_parts.append(f"Speak in {(language or '').strip()}.")
+    if (tone_prompt or "").strip():
+        instruction_parts.append(f"Tone and delivery: {(tone_prompt or '').strip()}")
+    result = get_openai_service().synthesize(
+        text=text_value,
+        voice=voice,
+        instructions=" ".join(instruction_parts),
+    )
+    audio_bytes = extract_tts_audio_bytes(result)
+    return base64.b64encode(audio_bytes).decode("ascii"), "audio/wav"
 
 
 def create_live_ephemeral_token():
@@ -881,6 +943,135 @@ def upload_audio_to_vercel_blob(user_id, audio_bytes, mime_type="audio/wav"):
     if not blob_url.startswith("https://"):
         raise RuntimeError("blob upload succeeded but no valid url returned")
     return blob_url
+
+
+def download_trusted_audio(audio_url, max_bytes=MAX_AUDIO_BYTES):
+    parsed = urlparse(audio_url or "")
+    hostname = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not hostname.endswith(
+        ".blob.vercel-storage.com"
+    ):
+        raise ValueError("untrusted audio URL")
+    req = request.Request(audio_url, method="GET")
+    with request.urlopen(req, timeout=30) as resp:
+        audio_bytes = resp.read(max_bytes + 1)
+    if not audio_bytes or len(audio_bytes) > max_bytes:
+        raise RuntimeError("audio artifact is unavailable")
+    return audio_bytes
+
+
+def get_audio_artifact_key():
+    secret = (
+        get_config_value("AUDIO_ARTIFACT_SECRET")
+        or get_config_value("OPENAI_SAFETY_SALT")
+        or os.getenv("SESSION_SECRET", "")
+    )
+    if not secret or secret in {"change-me-in-production", "pisces-dev-secret-key"}:
+        if os.getenv("K_SERVICE"):
+            raise RuntimeError("AUDIO_ARTIFACT_SECRET is not configured")
+        secret = get_openai_api_key()
+    return hashlib.sha256(secret.encode("utf-8")).digest()
+
+
+def upload_private_audio_ciphertext(artifact_id, ciphertext):
+    token = get_blob_rw_token()
+    if not token:
+        raise RuntimeError("BLOB_READ_WRITE_TOKEN is not configured")
+    pathname = f"private-audio/{artifact_id}.bin"
+    endpoint = f"https://vercel.com/api/blob/?{urlencode({'pathname': pathname})}"
+    req = request.Request(
+        endpoint,
+        data=ciphertext,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "x-vercel-blob-access": "public",
+            "x-content-type": "application/octet-stream",
+            "x-add-random-suffix": "0",
+            "x-api-version": "12",
+            "Content-Type": "application/octet-stream",
+        },
+        method="PUT",
+    )
+    try:
+        with request.urlopen(req, timeout=45) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError("private audio upload failed") from exc
+    blob_url = (payload.get("url") or "").strip()
+    if not blob_url.startswith("https://"):
+        raise RuntimeError("private audio upload failed")
+    return blob_url
+
+
+def save_private_audio_artifact(user_id, artifact_id, artifact):
+    get_firestore_client().collection("users").document(user_id).collection(
+        "audio_artifacts"
+    ).document(artifact_id).set(
+        {**artifact, "created_at": firestore.SERVER_TIMESTAMP}
+    )
+
+
+def get_private_audio_artifact(user_id, artifact_id):
+    snapshot = (
+        get_firestore_client()
+        .collection("users")
+        .document(user_id)
+        .collection("audio_artifacts")
+        .document(artifact_id)
+        .get()
+    )
+    return snapshot.to_dict() if snapshot.exists else None
+
+
+def create_private_audio_artifact(user_id, audio_bytes, mime_type="audio/wav"):
+    if not audio_bytes or len(audio_bytes) > MAX_AUDIO_BYTES:
+        raise ValueError("invalid private audio artifact")
+    artifact_id = secrets.token_urlsafe(32)
+    nonce = secrets.token_bytes(12)
+    aad = f"{user_id}:{artifact_id}".encode("utf-8")
+    ciphertext = AESGCM(get_audio_artifact_key()).encrypt(nonce, audio_bytes, aad)
+    audio_url = upload_private_audio_ciphertext(artifact_id, ciphertext)
+    save_private_audio_artifact(
+        user_id,
+        artifact_id,
+        {
+            "blob_url": audio_url,
+            "nonce": base64.b64encode(nonce).decode("ascii"),
+            "audio_mime_type": mime_type or "audio/wav",
+            "plaintext_size": len(audio_bytes),
+            "ciphertext_size": len(ciphertext),
+        },
+    )
+    return artifact_id
+
+
+def load_private_audio_artifact(user_id, artifact_id):
+    artifact = get_private_audio_artifact(user_id, artifact_id)
+    if not artifact:
+        raise RuntimeError("audio artifact is unavailable")
+    ciphertext_size = int(artifact.get("ciphertext_size") or 0)
+    if ciphertext_size <= 16 or ciphertext_size > MAX_AUDIO_BYTES + 16:
+        raise RuntimeError("audio artifact is unavailable")
+    ciphertext = download_trusted_audio(
+        artifact.get("blob_url"), max_bytes=MAX_AUDIO_BYTES + 16
+    )
+    if len(ciphertext) != ciphertext_size:
+        raise RuntimeError("audio artifact is unavailable")
+    try:
+        nonce = base64.b64decode(artifact.get("nonce") or "", validate=True)
+        aad = f"{user_id}:{artifact_id}".encode("utf-8")
+        audio_bytes = AESGCM(get_audio_artifact_key()).decrypt(
+            nonce, ciphertext, aad
+        )
+    except Exception as exc:
+        raise RuntimeError("audio artifact is unavailable") from exc
+    if (
+        not audio_bytes
+        or len(audio_bytes) > MAX_AUDIO_BYTES
+        or len(audio_bytes) != int(artifact.get("plaintext_size") or 0)
+    ):
+        raise RuntimeError("audio artifact is unavailable")
+    return audio_bytes
 
 
 def upload_image_to_vercel_blob(user_id, image_bytes, mime_type="image/png"):
@@ -1144,7 +1335,11 @@ def build_tester_user_id(email):
     return f"tester_{digest[:24]}"
 
 
-def sanitize_ai_settings(gender, voice, global_prompt):
+def default_openai_voice(gender):
+    return "cedar" if (gender or "").strip().lower() == "male" else "marin"
+
+
+def sanitize_ai_settings(gender, voice, global_prompt, openai_voice=""):
     normalized_gender = (gender or "female").strip().lower()
     if normalized_gender not in ("female", "male"):
         normalized_gender = "female"
@@ -1155,9 +1350,13 @@ def sanitize_ai_settings(gender, voice, global_prompt):
         normalized_voice = "Achernar" if normalized_gender == "female" else "Achird"
 
     normalized_prompt = (global_prompt or "").strip() or AI_DEFAULT_GLOBAL_PROMPT
+    normalized_openai_voice = (openai_voice or "").strip().lower()
+    if normalized_openai_voice not in OPENAI_VOICES:
+        normalized_openai_voice = default_openai_voice(normalized_gender)
     return {
         "gender": normalized_gender,
         "voice": normalized_voice,
+        "openai_voice": normalized_openai_voice,
         "global_prompt": normalized_prompt,
     }
 
@@ -1177,6 +1376,7 @@ def get_user_ai_settings(user_id):
             data.get("ai_gender"),
             data.get("ai_voice"),
             data.get("ai_global_prompt"),
+            data.get("ai_openai_voice"),
         )
         settings.update(normalized)
     except Exception:
@@ -1360,6 +1560,43 @@ def delivery_payload_hash(contact_id, message):
     ).hexdigest()
 
 
+def replay_delivery_response(receipt, user_id):
+    response = json.loads(json.dumps((receipt or {}).get("response") or {}))
+    artifact_id = (receipt or {}).get("audio_artifact_id") or ""
+    if "assist_group" in response:
+        response["assist_group"].setdefault("audio_base64", "")
+        response["assist_group"].setdefault("audio_mime_type", "")
+    elif "tts" in response:
+        response.setdefault("audio_base64", "")
+        response.setdefault("audio_mime_type", "")
+    if not artifact_id:
+        return response
+    try:
+        audio_bytes = load_private_audio_artifact(user_id, artifact_id)
+        artifact = get_private_audio_artifact(user_id, artifact_id) or {}
+        audio_mime_type = artifact.get("audio_mime_type") or "audio/wav"
+        audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+    except Exception:
+        audio_b64 = ""
+        audio_mime_type = ""
+    if "assist_group" in response:
+        group = response.setdefault("assist_group", {})
+        group["audio_base64"] = audio_b64
+        group["audio_mime_type"] = audio_mime_type if audio_b64 else ""
+    else:
+        response["audio_base64"] = audio_b64
+        response["audio_mime_type"] = audio_mime_type if audio_b64 else ""
+    return response
+
+
+def receipt_response_without_audio(response, response_path=""):
+    stored = json.loads(json.dumps(response or {}))
+    target = stored.get("assist_group", {}) if response_path == "assist_group" else stored
+    target.pop("audio_base64", None)
+    target.pop("audio_mime_type", None)
+    return stored
+
+
 def _chat_message_ref(client, user_id, contact_id, message_id):
     return (
         client.collection("users")
@@ -1380,6 +1617,7 @@ def persist_delivery_once(
     message_writes,
     meta_writes,
     receipt_data,
+    owner_token=None,
 ):
     """Atomically persist delivery artifacts and its idempotency receipt."""
     client = get_firestore_client()
@@ -1404,7 +1642,12 @@ def persist_delivery_once(
                 existing = snapshot.to_dict() or {}
                 if existing.get("payload_hash") != payload_hash:
                     raise ValueError("request_id was already used for a different delivery")
-                return existing, False
+                if _delivery_receipt_is_completed(existing):
+                    return existing, False
+                if not owner_token:
+                    return existing, False
+                if existing.get("owner_token") != owner_token:
+                    raise RuntimeError("delivery lease is no longer owned")
             for write in message_writes:
                 ref = _chat_message_ref(
                     client,
@@ -1433,6 +1676,7 @@ def persist_delivery_once(
             receipt = {
                 **receipt_data,
                 "payload_hash": payload_hash,
+                **({"state": "completed"} if owner_token else {}),
                 "updated_at": firestore.SERVER_TIMESTAMP,
             }
             tx.set(receipt_ref, receipt)
@@ -1445,7 +1689,12 @@ def persist_delivery_once(
     if existing:
         if existing.get("payload_hash") != payload_hash:
             raise ValueError("request_id was already used for a different delivery")
-        return existing, False
+        if _delivery_receipt_is_completed(existing):
+            return existing, False
+        if not owner_token:
+            return existing, False
+        if existing.get("owner_token") != owner_token:
+            raise RuntimeError("delivery lease is no longer owned")
     for write in message_writes:
         save_chat_message(
             write["user_id"],
@@ -1462,7 +1711,11 @@ def persist_delivery_once(
             unread_increment=write.get("unread_increment") or 0,
             preview_text=write.get("preview_text") or "",
         )
-    receipt = {**receipt_data, "payload_hash": payload_hash}
+    receipt = {
+        **receipt_data,
+        "payload_hash": payload_hash,
+        **({"state": "completed"} if owner_token else {}),
+    }
     save_delivery_receipt(user_id, route_name, request_id, receipt)
     return receipt, True
 
@@ -1477,6 +1730,98 @@ def _stream_lease_is_active(receipt, now):
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     return expires_at > now
+
+
+def _delivery_receipt_is_completed(receipt):
+    return (receipt or {}).get("state") == "completed" or (
+        (receipt or {}).get("state") not in {"processing", "started"}
+        and isinstance((receipt or {}).get("response"), dict)
+    )
+
+
+def reserve_delivery_request(
+    *, user_id, route_name, request_id, payload_hash, receipt_data
+):
+    client = get_firestore_client()
+    now = datetime.now(timezone.utc)
+    owner_token = secrets.token_urlsafe(24)
+    lease_expires_at = now + timedelta(seconds=STREAM_LEASE_SECONDS)
+
+    def claimed(existing=None):
+        return {
+            **(existing or {}),
+            **receipt_data,
+            "payload_hash": payload_hash,
+            "state": "processing",
+            "owner_token": owner_token,
+            "lease_expires_at": lease_expires_at,
+        }
+
+    if hasattr(client, "transaction"):
+        receipt_ref = _delivery_receipt_ref(user_id, route_name, request_id)
+        transaction = client.transaction()
+
+        @firestore.transactional
+        def commit(tx):
+            snapshot = receipt_ref.get(transaction=tx)
+            existing = (snapshot.to_dict() or {}) if snapshot.exists else None
+            if existing:
+                if existing.get("payload_hash") != payload_hash:
+                    raise ValueError("request_id was already used for a different delivery")
+                if _delivery_receipt_is_completed(existing) or _stream_lease_is_active(existing, now):
+                    return existing, False
+            receipt = claimed(existing)
+            tx.set(receipt_ref, {**receipt, "updated_at": firestore.SERVER_TIMESTAMP}, merge=bool(existing))
+            return receipt, True
+
+        return commit(transaction)
+
+    existing = get_delivery_receipt(user_id, route_name, request_id)
+    if existing:
+        if existing.get("payload_hash") != payload_hash:
+            raise ValueError("request_id was already used for a different delivery")
+        if _delivery_receipt_is_completed(existing) or _stream_lease_is_active(existing, now):
+            return existing, False
+    receipt = claimed(existing)
+    save_delivery_receipt(user_id, route_name, request_id, receipt)
+    return receipt, True
+
+
+def release_delivery_request(user_id, route_name, request_id, owner_token):
+    client = get_firestore_client()
+    now = datetime.now(timezone.utc)
+    if hasattr(client, "transaction"):
+        receipt_ref = _delivery_receipt_ref(user_id, route_name, request_id)
+        transaction = client.transaction()
+
+        @firestore.transactional
+        def commit(tx):
+            snapshot = receipt_ref.get(transaction=tx)
+            receipt = (snapshot.to_dict() or {}) if snapshot.exists else {}
+            if receipt.get("state") == "processing" and receipt.get("owner_token") == owner_token:
+                tx.set(receipt_ref, {"lease_expires_at": now, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
+
+        return commit(transaction)
+    receipt = get_delivery_receipt(user_id, route_name, request_id) or {}
+    if receipt.get("state") == "processing" and receipt.get("owner_token") == owner_token:
+        save_delivery_receipt(user_id, route_name, request_id, {"lease_expires_at": now})
+
+
+def safe_release_delivery_request(user_id, route_name, request_id, owner_token):
+    try:
+        release_delivery_request(user_id, route_name, request_id, owner_token)
+    except Exception:
+        try:
+            receipt = get_delivery_receipt(user_id, route_name, request_id) or {}
+            if receipt.get("owner_token") == owner_token:
+                save_delivery_receipt(
+                    user_id,
+                    route_name,
+                    request_id,
+                    {"lease_expires_at": datetime.now(timezone.utc)},
+                )
+        except Exception:
+            pass
 
 
 def reserve_stream_request(
@@ -1603,6 +1948,23 @@ def release_stream_request(user_id, request_id, owner_token):
         save_delivery_receipt(
             user_id, "chat_stream", request_id, {"lease_expires_at": now}
         )
+
+
+def safe_release_stream_request(user_id, request_id, owner_token):
+    try:
+        release_stream_request(user_id, request_id, owner_token)
+    except Exception:
+        try:
+            receipt = get_delivery_receipt(user_id, "chat_stream", request_id) or {}
+            if receipt.get("owner_token") == owner_token:
+                save_delivery_receipt(
+                    user_id,
+                    "chat_stream",
+                    request_id,
+                    {"lease_expires_at": datetime.now(timezone.utc)},
+                )
+        except Exception:
+            pass
 
 
 def complete_stream_request(
@@ -2131,7 +2493,7 @@ def generate_gemini_reply(
     user_id="",
 ):
     global_prompt = ai_settings.get("global_prompt") or AI_DEFAULT_GLOBAL_PROMPT
-    voice_name = ai_settings.get("voice") or DEFAULT_AI_SETTINGS["voice"]
+    voice_name = ai_settings.get("openai_voice") or DEFAULT_AI_SETTINGS["openai_voice"]
     decision = build_chat_tool_decision(
         user_message,
         global_prompt,
@@ -2148,13 +2510,13 @@ def generate_gemini_reply(
     )
     if decision.get("should_read_aloud"):
         language = decision.get("language") or "zh-TW"
-        if language == "zh-TW" and count_zh_chars(reply_text) > 100:
+        if count_zh_chars(reply_text) > 100:
             decision.update(
                 should_read_aloud=False,
                 tone_prompt="",
                 reason="zh_limit_exceeded",
             )
-        elif language == "en-US" and count_en_words(reply_text) > 50:
+        elif count_en_words(reply_text) > 50:
             decision.update(
                 should_read_aloud=False,
                 tone_prompt="",
@@ -2280,41 +2642,24 @@ def sanitize_forward_message_text(user_message, outbound_text, friend_name):
     return text
 
 
-def transcribe_audio_bytes(audio_bytes, mime_type):
-    speech_client = speech.SpeechClient()
+def transcribe_audio_bytes(audio_bytes, mime_type, prompt=""):
     mime = (mime_type or "").lower()
-
-    config_kwargs = {
-        "language_code": "zh-TW",
-        "alternative_language_codes": ["en-US"],
-        "enable_automatic_punctuation": True,
-        "audio_channel_count": 1,
-    }
-    if "ogg" in mime:
-        config_kwargs["encoding"] = speech.RecognitionConfig.AudioEncoding.OGG_OPUS
-        # Opus requires explicit supported sample rates for stable recognition.
-        config_kwargs["sample_rate_hertz"] = 48000
-    elif "wav" in mime or "wave" in mime:
-        config_kwargs["encoding"] = speech.RecognitionConfig.AudioEncoding.LINEAR16
-    elif "webm" in mime:
-        config_kwargs["encoding"] = speech.RecognitionConfig.AudioEncoding.WEBM_OPUS
-        config_kwargs["sample_rate_hertz"] = 48000
-    else:
-        # Browser recorder is usually Opus in WebM/Ogg for this app.
-        config_kwargs["encoding"] = speech.RecognitionConfig.AudioEncoding.WEBM_OPUS
-        config_kwargs["sample_rate_hertz"] = 48000
-
-    config = speech.RecognitionConfig(**config_kwargs)
-    audio = speech.RecognitionAudio(content=audio_bytes)
-    response = speech_client.recognize(config=config, audio=audio)
-
-    transcripts = []
-    for result in response.results:
-        if result.alternatives:
-            text = (result.alternatives[0].transcript or "").strip()
-            if text:
-                transcripts.append(text)
-    return " ".join(transcripts).strip()
+    extension = {
+        "audio/webm": ".webm",
+        "audio/ogg": ".ogg",
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/mpeg": ".mp3",
+        "audio/mp3": ".mp3",
+        "audio/mp4": ".m4a",
+        "audio/m4a": ".m4a",
+    }.get(mime.split(";", 1)[0], ".webm")
+    audio_file = io.BytesIO(audio_bytes)
+    audio_file.name = f"audio{extension}"
+    audio_file.seek(0)
+    result = get_openai_service().transcribe(audio_file=audio_file, prompt=(prompt or "").strip())
+    text = result if isinstance(result, str) else getattr(result, "text", "")
+    return str(text or "").strip()
 
 
 @app.route("/api/speech/transcribe", methods=["POST", "OPTIONS"])
@@ -2327,26 +2672,76 @@ def speech_transcribe():
         err, status = auth_error
         return jsonify(err), status
 
-    body = flask_request.get_json(silent=True) or {}
-    audio_b64 = (body.get("audio_base64") or "").strip()
-    mime_type = (body.get("mime_type") or "audio/webm").strip()
-    if not audio_b64:
-        return jsonify({"ok": False, "error": "audio_base64 is required"}), 400
+    try:
+        body = flask_request.get_json(silent=True)
+        audio_bytes, mime_type = decode_audio_input(body)
+    except AudioInputError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), exc.status
 
     try:
-        audio_bytes = base64.b64decode(audio_b64)
+        transcript = transcribe_audio_bytes(
+            audio_bytes,
+            mime_type,
+            (body.get("locale") or body.get("language") or "").strip(),
+        )
     except Exception:
-        return jsonify({"ok": False, "error": "invalid base64 audio payload"}), 400
-
-    try:
-        transcript = transcribe_audio_bytes(audio_bytes, mime_type)
-    except Exception as exc:
-        return jsonify({"ok": False, "error": f"speech-to-text failed: {exc}"}), 502
+        return jsonify({"ok": False, "error": "speech-to-text is currently unavailable"}), 502
 
     if not transcript:
         return jsonify({"ok": False, "error": "speech-to-text returned empty transcript"}), 422
 
     return jsonify({"ok": True, "transcript": transcript})
+
+
+@app.route("/api/speech/synthesize", methods=["POST", "OPTIONS"])
+def speech_synthesize():
+    if flask_request.method == "OPTIONS":
+        return ("", 204)
+
+    auth, auth_error = get_session_auth(required=True)
+    if auth_error:
+        err, status = auth_error
+        return jsonify(err), status
+    body = flask_request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "JSON object is required"}), 400
+    raw_text = body.get("text")
+    raw_voice = body.get("voice")
+    raw_instructions = body.get("instructions", "")
+    if not isinstance(raw_text, str):
+        return jsonify({"ok": False, "error": "text must be a string"}), 400
+    if not isinstance(raw_voice, str):
+        return jsonify({"ok": False, "error": "voice must be a string"}), 400
+    if not isinstance(raw_instructions, str):
+        return jsonify({"ok": False, "error": "instructions must be a string"}), 400
+    text_value = raw_text.strip()
+    voice = raw_voice.strip().lower()
+    instructions = raw_instructions.strip()
+    if not text_value:
+        return jsonify({"ok": False, "error": "text is required"}), 400
+    if len(text_value) > 200:
+        return jsonify({"ok": False, "error": "text must be 200 characters or fewer"}), 400
+    if not tts_text_within_product_limits(text_value):
+        return jsonify({"ok": False, "error": "text exceeds read-aloud limits"}), 400
+    if voice not in OPENAI_VOICES:
+        return jsonify({"ok": False, "error": "voice is invalid"}), 400
+    if len(instructions) > 500:
+        return jsonify({"ok": False, "error": "instructions must be 500 characters or fewer"}), 400
+    instructions = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", instructions)
+    try:
+        result = get_openai_service().synthesize(
+            text=text_value,
+            voice=voice,
+            instructions=instructions,
+        )
+        audio_bytes = extract_tts_audio_bytes(result)
+    except Exception:
+        return jsonify({"ok": False, "error": "speech synthesis is currently unavailable"}), 502
+    return jsonify({
+        "ok": True,
+        "audio_base64": base64.b64encode(bytes(audio_bytes)).decode("ascii"),
+        "audio_mime_type": "audio/wav",
+    })
 
 
 @app.route("/")
@@ -2369,7 +2764,9 @@ def chat():
     if flask_request.method == "OPTIONS":
         return ("", 204)
 
-    body = flask_request.get_json(silent=True) or {}
+    body = flask_request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "JSON object is required"}), 400
     user_message = (body.get("message") or "").strip()
     auth, _ = get_session_auth(required=False)
     user_id = (auth or {}).get("user_id") or ""
@@ -2410,10 +2807,10 @@ def chat():
         existing_receipt = get_delivery_receipt(
             user_id, "chat_forward", request_id
         )
-        if existing_receipt:
+        if existing_receipt and _delivery_receipt_is_completed(existing_receipt):
             if existing_receipt.get("payload_hash") != payload_hash:
                 return jsonify({"error": "request_id was already used for a different delivery"}), 409
-            stored_response = existing_receipt.get("response") or {}
+            stored_response = replay_delivery_response(existing_receipt, user_id)
             stored_payload = existing_receipt.get("ably_payload") or {}
             if stored_payload and not existing_receipt.get("published"):
                 try:
@@ -2428,15 +2825,35 @@ def chat():
                     pass
             return jsonify(stored_response)
 
-        user_doc = get_firestore_client().collection("users").document(user_id).get()
-        user_data = user_doc.to_dict() if user_doc.exists else {}
-        ai_settings = get_user_ai_settings(user_id)
-        history_range = get_user_history_range(user_id)
-        friend_history = get_chat_messages(user_id, target_id, history_range=history_range)
-        decision = decide_assist_action(
-            user_message, friend_history, friend_ctx["friend_name"], user_id=user_id
-        )
-        media_tools = decide_media_tools(user_message, friend_history, user_id=user_id)
+        try:
+            reserved_receipt, acquired = reserve_delivery_request(
+                user_id=user_id,
+                route_name="chat_forward",
+                request_id=request_id,
+                payload_hash=payload_hash,
+                receipt_data={"contact_id": target_id},
+            )
+        except ValueError:
+            return jsonify({"error": "request_id was already used for a different delivery"}), 409
+        if _delivery_receipt_is_completed(reserved_receipt):
+            return jsonify(replay_delivery_response(reserved_receipt, user_id))
+        if not acquired:
+            return jsonify({"error": "request is already in progress"}), 409
+        delivery_owner = reserved_receipt["owner_token"]
+
+        try:
+            user_doc = get_firestore_client().collection("users").document(user_id).get()
+            user_data = user_doc.to_dict() if user_doc.exists else {}
+            ai_settings = get_user_ai_settings(user_id)
+            history_range = get_user_history_range(user_id)
+            friend_history = get_chat_messages(user_id, target_id, history_range=history_range)
+            decision = decide_assist_action(
+                user_message, friend_history, friend_ctx["friend_name"], user_id=user_id
+            )
+            media_tools = decide_media_tools(user_message, friend_history, user_id=user_id)
+        except Exception:
+            safe_release_delivery_request(user_id, "chat_forward", request_id, delivery_owner)
+            return jsonify({"error": "AI reply is currently unavailable."}), 502
         if has_explicit_voice_request(user_message):
             decision["voice"] = True
         if not decision.get("send_to_friend"):
@@ -2456,6 +2873,7 @@ def chat():
                     input_items=input_items,
                 )
             except Exception:
+                safe_release_delivery_request(user_id, "chat_forward", request_id, delivery_owner)
                 return jsonify({"error": "AI reply is currently unavailable."}), 502
             advice_response = {
                 "reply": reply,
@@ -2463,30 +2881,39 @@ def chat():
                 "audio_mime_type": "",
                 "tts": {"should_read_aloud": False},
             }
-            stored_receipt, created = persist_delivery_once(
-                user_id=user_id,
-                route_name="chat_forward",
-                request_id=request_id,
-                payload_hash=payload_hash,
-                message_writes=[
-                    {"user_id": user_id, "contact_id": contact_id, "role": "user", "text": user_message, "extras": {}, "message_id": deterministic_message_id(user_id, "chat_forward", contact_id, request_id, "request")},
-                    {"user_id": user_id, "contact_id": contact_id, "role": "ai", "text": reply, "extras": {}, "message_id": deterministic_message_id(user_id, "chat_forward", contact_id, request_id, "advice")},
-                ],
-                meta_writes=[],
-                receipt_data={"contact_id": target_id, "message_id": "", "ably_payload": {}, "published": True, "response": advice_response},
-            )
+            try:
+                stored_receipt, created = persist_delivery_once(
+                    user_id=user_id,
+                    route_name="chat_forward",
+                    request_id=request_id,
+                    payload_hash=payload_hash,
+                    message_writes=[
+                        {"user_id": user_id, "contact_id": contact_id, "role": "user", "text": user_message, "extras": {}, "message_id": deterministic_message_id(user_id, "chat_forward", contact_id, request_id, "request")},
+                        {"user_id": user_id, "contact_id": contact_id, "role": "ai", "text": reply, "extras": {}, "message_id": deterministic_message_id(user_id, "chat_forward", contact_id, request_id, "advice")},
+                    ],
+                    meta_writes=[],
+                    receipt_data={"contact_id": target_id, "message_id": "", "ably_payload": {}, "published": True, "response": advice_response},
+                    owner_token=delivery_owner,
+                )
+            except Exception:
+                safe_release_delivery_request(user_id, "chat_forward", request_id, delivery_owner)
+                return jsonify({"error": "Message delivery is currently unavailable."}), 500
             return jsonify(advice_response if created else stored_receipt.get("response") or {})
         style_prompt = friend_ctx["special_prompt"] or ai_settings.get("global_prompt") or AI_DEFAULT_GLOBAL_PROMPT
-        composed = compose_message_for_friend(
-            user_message=user_message,
-            history_messages=friend_history,
-            user_name=(user_data.get("display_name") or user_data.get("email") or "User"),
-            friend_name=friend_ctx["friend_name"],
-            ai_name=(user_data.get("ai_name") or "Pisces"),
-            style_prompt=style_prompt,
-            relationship=friend_ctx.get("relationship") or "",
-            user_id=user_id,
-        )
+        try:
+            composed = compose_message_for_friend(
+                user_message=user_message,
+                history_messages=friend_history,
+                user_name=(user_data.get("display_name") or user_data.get("email") or "User"),
+                friend_name=friend_ctx["friend_name"],
+                ai_name=(user_data.get("ai_name") or "Pisces"),
+                style_prompt=style_prompt,
+                relationship=friend_ctx.get("relationship") or "",
+                user_id=user_id,
+            )
+        except Exception:
+            safe_release_delivery_request(user_id, "chat_forward", request_id, delivery_owner)
+            return jsonify({"error": "AI reply is currently unavailable."}), 502
         composed_as_user = bool(composed.get("as_user")) and bool(
             has_explicit_send_as_user_intent(user_message)
         )
@@ -2537,7 +2964,7 @@ def chat():
                     audio_b64_tmp, audio_mime_tmp = synthesize_tts_audio(
                         outbound_text,
                         locale,
-                        ai_settings.get("voice") or DEFAULT_AI_SETTINGS["voice"],
+                        ai_settings.get("openai_voice") or DEFAULT_AI_SETTINGS["openai_voice"],
                         "warm and caring" if locale == "en-US" else "溫柔且貼心",
                     )
                     outbound_audio_url = upload_audio_to_vercel_blob(
@@ -2545,14 +2972,13 @@ def chat():
                         base64.b64decode(audio_b64_tmp),
                         audio_mime_tmp or "audio/wav",
                     )
-                except Exception as exc:
+                except Exception:
                     log_tool_error(
                         user_id,
                         target_id,
                         "text_to_speech",
                         "chat_ai_room_forward_send",
-                        str(exc),
-                        input_snapshot={"text": outbound_text},
+                        "speech synthesis unavailable",
                     )
         canonical_message_id = deterministic_message_id(
             user_id, "chat_forward", target_id, request_id, "outbound"
@@ -2597,18 +3023,28 @@ def chat():
                 input_items=confirmation_input,
             )
         except Exception:
+            safe_release_delivery_request(user_id, "chat_forward", request_id, delivery_owner)
             return jsonify({"error": "AI confirmation is currently unavailable."}), 502
         audio_b64 = ""
         audio_mime = ""
+        confirmation_audio_artifact_id = ""
         if has_explicit_voice_request(user_message):
             try:
                 zh_len = count_zh_chars(reply)
                 en_words = count_en_words(reply)
                 if zh_len <= 100 and en_words <= 50:
                     locale = "en-US" if en_words > 0 and zh_len == 0 else "zh-TW"
-                    audio_b64, audio_mime = synthesize_tts_audio(reply, locale, ai_settings.get("voice") or DEFAULT_AI_SETTINGS["voice"])
-            except Exception as exc:
-                log_tool_error(user_id, target_id, "text_to_speech", "chat_ai_room_forward", str(exc), input_snapshot={"text": reply})
+                    audio_b64, audio_mime = synthesize_tts_audio(reply, locale, ai_settings.get("openai_voice") or DEFAULT_AI_SETTINGS["openai_voice"])
+                    confirmation_audio_artifact_id = create_private_audio_artifact(
+                        user_id,
+                        base64.b64decode(audio_b64, validate=True),
+                        audio_mime or "audio/wav",
+                    )
+            except Exception:
+                audio_b64 = ""
+                audio_mime = ""
+                confirmation_audio_artifact_id = ""
+                log_tool_error(user_id, target_id, "text_to_speech", "chat_ai_room_forward", "speech synthesis unavailable")
         response_payload = {"reply": reply, "audio_base64": audio_b64, "audio_mime_type": audio_mime, "tts": {"should_read_aloud": bool(audio_b64)}}
         try:
             stored_receipt, created = persist_delivery_once(
@@ -2626,9 +3062,18 @@ def chat():
                     {"user_id": user_id, "contact_id": target_id, "unread_increment": 0, "preview_text": outbound_text},
                     {"user_id": target_id, "contact_id": user_id, "unread_increment": 1, "preview_text": outbound_text},
                 ],
-                receipt_data={"contact_id": target_id, "message_id": canonical_message_id, "ably_payload": payload, "published": False, "response": response_payload},
+                receipt_data={
+                    "contact_id": target_id,
+                    "message_id": canonical_message_id,
+                    "ably_payload": payload,
+                    "published": False,
+                    "response": receipt_response_without_audio(response_payload),
+                    **({"audio_artifact_id": confirmation_audio_artifact_id} if confirmation_audio_artifact_id else {}),
+                },
+                owner_token=delivery_owner,
             )
         except Exception as exc:
+            safe_release_delivery_request(user_id, "chat_forward", request_id, delivery_owner)
             log_tool_error(user_id, target_id, "send_msg", "chat_ai_room_forward", type(exc).__name__, request_id=request_id)
             return jsonify({"error": "Message delivery is currently unavailable."}), 500
         if not created:
@@ -2639,7 +3084,7 @@ def chat():
                     save_delivery_receipt(user_id, "chat_forward", request_id, {"published": True})
                 except Exception:
                     pass
-            return jsonify(stored_receipt.get("response") or {})
+            return jsonify(replay_delivery_response(stored_receipt, user_id))
         try:
             publish_user_channel_message(target_id, payload)
             save_delivery_receipt(
@@ -2721,35 +3166,26 @@ def _ndjson_line(payload):
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
 
-def _completed_stream_response(receipt, request_id):
+def _completed_stream_response(receipt, request_id, user_id):
     done_payload = receipt.get("done_payload") or {}
     replay_recipe = receipt.get("replay_recipe") or {}
     replay_text = (done_payload.get("reply") or "").strip() or "\u200b"
     events = [{"type": "delta", "text": replay_text}]
-    if replay_recipe.get("should_read_aloud"):
-        language = replay_recipe.get("language") or "zh-TW"
-        within_limit = not (
-            (language == "zh-TW" and count_zh_chars(replay_text) > 100)
-            or (language == "en-US" and count_en_words(replay_text) > 50)
-        )
-        if within_limit:
-            try:
-                audio_b64, audio_mime_type = synthesize_tts_audio(
-                    replay_recipe.get("reply") or replay_text,
-                    language,
-                    replay_recipe.get("voice") or DEFAULT_AI_SETTINGS["voice"],
-                    replay_recipe.get("tone_prompt") or "",
-                )
-                if audio_b64:
-                    events.append(
-                        {
-                            "type": "audio",
-                            "audio_base64": audio_b64,
-                            "audio_mime_type": audio_mime_type or "audio/wav",
-                        }
-                    )
-            except Exception:
-                pass
+    if replay_recipe.get("should_read_aloud") and replay_recipe.get("audio_artifact_id"):
+        try:
+            artifact_id = replay_recipe["audio_artifact_id"]
+            audio_bytes = load_private_audio_artifact(user_id, artifact_id)
+            artifact = get_private_audio_artifact(user_id, artifact_id) or {}
+            audio_mime_type = artifact.get("audio_mime_type") or "audio/wav"
+            events.append(
+                {
+                    "type": "audio",
+                    "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+                    "audio_mime_type": audio_mime_type,
+                }
+            )
+        except Exception:
+            pass
     events.append(done_payload)
     response = Response(
         iter(_ndjson_line(event) for event in events),
@@ -2801,7 +3237,7 @@ def chat_stream():
     if existing_receipt and existing_receipt.get("payload_hash") != payload_hash:
         return jsonify({"error": "request_id was already used for a different delivery"}), 409
     if existing_receipt and existing_receipt.get("state") == "completed":
-        return _completed_stream_response(existing_receipt, request_id)
+        return _completed_stream_response(existing_receipt, request_id, user_id)
     try:
         ai_settings = get_user_ai_settings(user_id)
         history_range = get_user_history_range(user_id)
@@ -2841,7 +3277,7 @@ def chat_stream():
     except ValueError:
         return jsonify({"error": "request_id was already used for a different delivery"}), 409
     if reserved_receipt.get("state") == "completed":
-        return _completed_stream_response(reserved_receipt, request_id)
+        return _completed_stream_response(reserved_receipt, request_id, user_id)
     if not acquired:
         return jsonify({"error": "request is already in progress"}), 409
     owner_token = reserved_receipt["owner_token"]
@@ -2883,10 +3319,7 @@ def chat_stream():
             extra_context_text=extra_context_text,
         )
     except Exception:
-        try:
-            release_stream_request(user_id, request_id, owner_token)
-        except Exception:
-            pass
+        safe_release_stream_request(user_id, request_id, owner_token)
         return jsonify({"error": "AI reply is currently unavailable."}), 502
 
     def generate():
@@ -2942,23 +3375,27 @@ def chat_stream():
 
             audio_b64 = ""
             audio_mime_type = ""
+            audio_artifact_id = ""
             if decision.get("should_read_aloud"):
                 language = decision.get("language") or "zh-TW"
-                within_limit = not (
-                    (language == "zh-TW" and count_zh_chars(reply_text) > 100)
-                    or (language == "en-US" and count_en_words(reply_text) > 50)
-                )
+                within_limit = tts_text_within_product_limits(reply_text)
                 if within_limit:
                     try:
                         audio_b64, audio_mime_type = synthesize_tts_audio(
                             reply_text,
                             language,
-                            ai_settings.get("voice") or DEFAULT_AI_SETTINGS["voice"],
+                            ai_settings.get("openai_voice") or DEFAULT_AI_SETTINGS["openai_voice"],
                             decision.get("tone_prompt") or "",
+                        )
+                        audio_artifact_id = create_private_audio_artifact(
+                            user_id,
+                            base64.b64decode(audio_b64, validate=True),
+                            audio_mime_type or "audio/wav",
                         )
                     except Exception:
                         audio_b64 = ""
                         audio_mime_type = ""
+                        audio_artifact_id = ""
 
             done_payload = {
                 "type": "done",
@@ -2967,13 +3404,9 @@ def chat_stream():
                 "image_url": image_url,
                 "music_url": music_url,
             }
-            selected_voice = ai_settings.get("voice") or DEFAULT_AI_SETTINGS["voice"]
             replay_recipe = {
-                "reply": reply_text,
-                "should_read_aloud": bool(decision.get("should_read_aloud")),
-                "language": decision.get("language") or "zh-TW",
-                "voice": selected_voice,
-                "tone_prompt": decision.get("tone_prompt") or "",
+                "should_read_aloud": bool(audio_artifact_id),
+                "audio_artifact_id": audio_artifact_id,
             }
             canonical_done_payload = complete_stream_request(
                 user_id,
@@ -3017,7 +3450,7 @@ def chat_stream():
         finally:
             if not completed:
                 try:
-                    release_stream_request(user_id, request_id, owner_token)
+                    safe_release_stream_request(user_id, request_id, owner_token)
                 except Exception:
                     pass
 
@@ -3031,24 +3464,28 @@ def voice_chat():
     if flask_request.method == "OPTIONS":
         return ("", 204)
 
-    body = flask_request.get_json(silent=True) or {}
-    audio_b64 = (body.get("audio_base64") or "").strip()
-    mime_type = (body.get("mime_type") or "audio/webm").strip()
-    auth, _ = get_session_auth(required=False)
-    user_id = (auth or {}).get("user_id") or (body.get("user_id") or "").strip()
+    auth, auth_error = get_session_auth(required=True)
+    if auth_error:
+        err, status = auth_error
+        return jsonify(err), status
+    user_id = auth["user_id"]
+    body = flask_request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "JSON object is required"}), 400
     contact_id = (body.get("contact_id") or "pisces-core").strip() or "pisces-core"
-    if not audio_b64:
-        return jsonify({"error": "audio_base64 is required"}), 400
+    try:
+        audio_bytes, mime_type = decode_audio_input(body)
+    except AudioInputError as exc:
+        return jsonify({"error": str(exc)}), exc.status
 
     try:
-        audio_bytes = base64.b64decode(audio_b64)
+        transcript = transcribe_audio_bytes(
+            audio_bytes,
+            mime_type,
+            (body.get("locale") or body.get("language") or "").strip(),
+        )
     except Exception:
-        return jsonify({"error": "invalid base64 audio payload"}), 400
-
-    try:
-        transcript = transcribe_audio_bytes(audio_bytes, mime_type)
-    except Exception as exc:
-        return jsonify({"error": f"speech-to-text failed: {exc}"}), 502
+        return jsonify({"error": "speech-to-text is currently unavailable"}), 502
 
     if not transcript:
         return jsonify({"error": "speech-to-text returned empty transcript"}), 422
@@ -3071,7 +3508,7 @@ def voice_chat():
             ai_settings,
             history_messages,
             extra_context_text=extra_context_text,
-            user_id=user_id or "legacy-anonymous-voice-chat",
+            user_id=user_id,
         )
     except Exception as exc:
         return jsonify({"error": "AI reply is currently unavailable.", "transcript": transcript}), 502
@@ -3213,6 +3650,7 @@ def auth_google():
             existing_data.get("ai_gender"),
             existing_data.get("ai_voice"),
             existing_data.get("ai_global_prompt"),
+            existing_data.get("ai_openai_voice"),
         )
         ai_avatar_url = (existing_data or {}).get("ai_avatar_url", "")
         history_range = sanitize_history_range((existing_data or {}).get("history_range", 30))
@@ -3278,6 +3716,7 @@ def auth_tester():
             existing_data.get("ai_gender"),
             existing_data.get("ai_voice"),
             existing_data.get("ai_global_prompt"),
+            existing_data.get("ai_openai_voice"),
         )
         ai_avatar_url = existing_ai_avatar
         user_avatar_url = avatar_url or (existing_data.get("avatar_url") or "")
@@ -3329,6 +3768,7 @@ def session_me():
                 data.get("ai_gender"),
                 data.get("ai_voice"),
                 data.get("ai_global_prompt"),
+                data.get("ai_openai_voice"),
             ),
             "identify_code": data.get("identify_code", ""),
             "history_range": sanitize_history_range(data.get("history_range", 30)),
@@ -3352,36 +3792,71 @@ def update_ai_settings():
     if flask_request.method == "OPTIONS":
         return ("", 204)
 
-    body = flask_request.get_json(silent=True) or {}
+    body = flask_request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "JSON object is required"}), 400
     auth, auth_error = get_session_auth(required=True)
     if auth_error:
         err, status = auth_error
         return jsonify(err), status
     user_id = auth["user_id"]
+    for field_name in (
+        "gender",
+        "voice",
+        "global_prompt",
+        "openai_voice",
+        "avatar_url",
+        "avatar_image_base64",
+        "avatar_mime_type",
+    ):
+        if field_name in body and not isinstance(body[field_name], str):
+            return jsonify({"ok": False, "error": f"{field_name} must be a string"}), 400
     avatar_url = (body.get("avatar_url") or "").strip()
     avatar_image_base64 = (body.get("avatar_image_base64") or "").strip()
     avatar_mime_type = (body.get("avatar_mime_type") or "image/webp").strip()
     gender = (body.get("gender") or "").strip()
     voice = (body.get("voice") or "").strip()
+    openai_voice = (body.get("openai_voice") or "").strip().lower()
     global_prompt = (body.get("global_prompt") or "").strip()
 
-    if avatar_url and not is_valid_avatar_url(avatar_url):
+    if avatar_url and (len(avatar_url) > 2048 or not is_valid_avatar_url(avatar_url)):
         return jsonify({"ok": False, "error": "avatar_url must be a valid https URL"}), 400
+    avatar_bytes = b""
+    if avatar_image_base64:
+        if len(avatar_image_base64) > MAX_AVATAR_BASE64_CHARS:
+            return jsonify({"ok": False, "error": "avatar image is too large"}), 413
+        if avatar_mime_type.lower() not in SUPPORTED_AVATAR_MIME_TYPES:
+            return jsonify({"ok": False, "error": "avatar_mime_type is unsupported"}), 400
+        try:
+            avatar_bytes = base64.b64decode(avatar_image_base64, validate=True)
+        except Exception:
+            return jsonify({"ok": False, "error": "avatar_image_base64 is invalid"}), 400
+        if not avatar_bytes:
+            return jsonify({"ok": False, "error": "avatar image is empty"}), 400
+        if len(avatar_bytes) > MAX_AVATAR_BYTES:
+            return jsonify({"ok": False, "error": "avatar image is too large"}), 413
+    if "openai_voice" in body and openai_voice not in OPENAI_VOICES:
+        return jsonify({"ok": False, "error": "openai_voice is invalid"}), 400
 
     target_user_id = user_id
 
-    normalized = sanitize_ai_settings(gender, voice, global_prompt)
     try:
         client = get_firestore_client()
         user_ref = client.collection("users").document(target_user_id)
         existing = user_ref.get()
         existing_data = existing.to_dict() if existing.exists else {}
+        normalized = sanitize_ai_settings(
+            gender if "gender" in body else existing_data.get("ai_gender"),
+            voice if "voice" in body else existing_data.get("ai_voice"),
+            global_prompt
+            if "global_prompt" in body
+            else existing_data.get("ai_global_prompt"),
+            openai_voice
+            if "openai_voice" in body
+            else existing_data.get("ai_openai_voice"),
+        )
         uploaded_avatar_url = ""
         if avatar_image_base64:
-            try:
-                avatar_bytes = base64.b64decode(avatar_image_base64)
-            except Exception:
-                return jsonify({"ok": False, "error": "avatar_image_base64 is invalid"}), 400
             uploaded_avatar_url = upload_avatar_to_vercel_blob(
                 target_user_id,
                 avatar_bytes,
@@ -3390,6 +3865,7 @@ def update_ai_settings():
         payload = {
             "ai_gender": normalized["gender"],
             "ai_voice": normalized["voice"],
+            "ai_openai_voice": normalized["openai_voice"],
             "ai_global_prompt": normalized["global_prompt"],
             "updated_at": firestore.SERVER_TIMESTAMP,
         }
@@ -3929,17 +4405,14 @@ def send_voice_message():
         err, status = auth_error
         return jsonify(err), status
     sender_user_id = auth["user_id"]
+    request_id = str(uuid.uuid4())
     recipient_user_id = (body.get("recipient_user_id") or "").strip()
-    audio_b64 = (body.get("audio_base64") or "").strip()
-    mime_type = (body.get("mime_type") or "audio/webm").strip()
     duration_seconds_raw = body.get("duration_seconds")
 
     if not recipient_user_id:
         return jsonify({"ok": False, "error": "recipient_user_id is required"}), 400
     if sender_user_id == recipient_user_id:
         return jsonify({"ok": False, "error": "cannot send message to yourself"}), 400
-    if not audio_b64:
-        return jsonify({"ok": False, "error": "audio_base64 is required"}), 400
 
     try:
         duration_seconds = float(duration_seconds_raw or 0)
@@ -3951,21 +4424,33 @@ def send_voice_message():
         duration_seconds = 600.0
 
     try:
-        audio_bytes = base64.b64decode(audio_b64)
-    except Exception:
-        return jsonify({"ok": False, "error": "invalid base64 audio payload"}), 400
+        audio_bytes, mime_type = decode_audio_input(body)
+    except AudioInputError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), exc.status
 
     try:
-        transcript = transcribe_audio_bytes(audio_bytes, mime_type)
-    except Exception as exc:
-        return jsonify({"ok": False, "error": f"speech-to-text failed: {exc}"}), 502
+        transcript = transcribe_audio_bytes(
+            audio_bytes,
+            mime_type,
+            (body.get("locale") or body.get("language") or "").strip(),
+        )
+    except Exception:
+        return jsonify({"ok": False, "error": "speech-to-text is currently unavailable"}), 502
     if not transcript:
         return jsonify({"ok": False, "error": "speech-to-text returned empty transcript"}), 422
 
     try:
         audio_url = upload_audio_to_vercel_blob(sender_user_id, audio_bytes, mime_type or "audio/webm")
     except Exception as exc:
-        return jsonify({"ok": False, "error": f"voice upload failed: {exc}"}), 502
+        log_tool_error(
+            sender_user_id,
+            recipient_user_id,
+            "voice_upload",
+            "send_voice_message",
+            type(exc).__name__,
+            request_id=request_id,
+        )
+        return jsonify({"ok": False, "error": "voice upload is currently unavailable"}), 502
 
     try:
         client = get_firestore_client()
@@ -4033,7 +4518,15 @@ def send_voice_message():
         publish_user_channel_message(recipient_user_id, payload)
         return jsonify({"ok": True, "message": payload})
     except Exception as exc:
-        return jsonify({"ok": False, "error": f"failed to send voice message: {exc}"}), 500
+        log_tool_error(
+            sender_user_id,
+            recipient_user_id,
+            "voice_delivery",
+            "send_voice_message",
+            type(exc).__name__,
+            request_id=request_id,
+        )
+        return jsonify({"ok": False, "error": "voice delivery is currently unavailable"}), 500
 
 
 @app.route("/api/assist/message", methods=["POST", "OPTIONS"])
@@ -4061,6 +4554,7 @@ def assist_message():
         request_id = validate_request_id(body.get("request_id"))
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
+    delivery_owner = ""
     try:
         friend_ctx = get_friend_context(user_id, contact_id)
         if not friend_ctx:
@@ -4070,7 +4564,7 @@ def assist_message():
         existing_receipt = get_delivery_receipt(
             user_id, "assist_message", request_id
         )
-        if existing_receipt:
+        if existing_receipt and _delivery_receipt_is_completed(existing_receipt):
             if existing_receipt.get("payload_hash") != payload_hash:
                 return jsonify({"ok": False, "error": "request_id was already used for a different delivery"}), 409
             stored_payload = existing_receipt.get("ably_payload") or {}
@@ -4085,7 +4579,23 @@ def assist_message():
                     )
                 except Exception:
                     pass
-            return jsonify(existing_receipt.get("response") or {})
+            return jsonify(replay_delivery_response(existing_receipt, user_id))
+
+        try:
+            reserved_receipt, acquired = reserve_delivery_request(
+                user_id=user_id,
+                route_name="assist_message",
+                request_id=request_id,
+                payload_hash=payload_hash,
+                receipt_data={"contact_id": contact_id},
+            )
+        except ValueError:
+            return jsonify({"ok": False, "error": "request_id was already used for a different delivery"}), 409
+        if _delivery_receipt_is_completed(reserved_receipt):
+            return jsonify(replay_delivery_response(reserved_receipt, user_id))
+        if not acquired:
+            return jsonify({"ok": False, "error": "request is already in progress"}), 409
+        delivery_owner = reserved_receipt["owner_token"]
 
         user_doc = get_firestore_client().collection("users").document(user_id).get()
         user_data = user_doc.to_dict() if user_doc.exists else {}
@@ -4201,7 +4711,7 @@ def assist_message():
                         audio_b64_tmp, audio_mime_tmp = synthesize_tts_audio(
                             outbound_text,
                             locale,
-                            ai_settings.get("voice") or DEFAULT_AI_SETTINGS["voice"],
+                            ai_settings.get("openai_voice") or DEFAULT_AI_SETTINGS["openai_voice"],
                             "warm and caring" if locale == "en-US" else "溫柔且貼心",
                         )
                         outbound_audio_url = upload_audio_to_vercel_blob(
@@ -4209,15 +4719,14 @@ def assist_message():
                             base64.b64decode(audio_b64_tmp),
                             audio_mime_tmp or "audio/wav",
                         )
-                    except Exception as exc:
+                    except Exception:
                         log_tool_error(
                             user_id,
                             contact_id,
                             "text_to_speech",
                             "assist_message_send_to_friend",
-                            str(exc),
+                            "speech synthesis unavailable",
                             request_id=request_id,
-                            input_snapshot={"text": outbound_text},
                         )
 
             canonical_message_id = deterministic_message_id(
@@ -4280,12 +4789,13 @@ def assist_message():
 
         audio_b64 = ""
         audio_mime_type = ""
+        private_audio_artifact_id = ""
         if decision.get("voice") and has_explicit_voice_request(user_message) and not (decision.get("send_to_friend") and outbound_message and outbound_message.get("audio_url")):
             zh_len = count_zh_chars(ai_text)
             en_words = count_en_words(ai_text)
             if zh_len <= 100 and en_words <= 50:
                 try:
-                    voice_name = ai_settings.get("voice") or DEFAULT_AI_SETTINGS["voice"]
+                    voice_name = ai_settings.get("openai_voice") or DEFAULT_AI_SETTINGS["openai_voice"]
                     locale = "en-US" if en_words > 0 and zh_len == 0 else "zh-TW"
                     audio_b64, audio_mime_type = synthesize_tts_audio(
                         ai_text,
@@ -4293,15 +4803,22 @@ def assist_message():
                         voice_name,
                         "warm and caring" if locale == "en-US" else "溫柔且貼心",
                     )
-                except Exception as exc:
+                    private_audio_artifact_id = create_private_audio_artifact(
+                        user_id,
+                        base64.b64decode(audio_b64, validate=True),
+                        audio_mime_type or "audio/wav",
+                    )
+                except Exception:
+                    audio_b64 = ""
+                    audio_mime_type = ""
+                    private_audio_artifact_id = ""
                     log_tool_error(
                         user_id,
                         contact_id,
                         "text_to_speech",
                         "assist_message",
-                        str(exc),
+                        "speech synthesis unavailable",
                         request_id=request_id,
-                        input_snapshot={"text": ai_text},
                     )
 
         response_payload = {
@@ -4332,7 +4849,15 @@ def assist_message():
                     {"user_id": user_id, "contact_id": contact_id, "unread_increment": 0, "preview_text": outbound_text},
                     {"user_id": contact_id, "contact_id": user_id, "unread_increment": 1, "preview_text": outbound_text},
                 ],
-                receipt_data={"contact_id": contact_id, "message_id": canonical_message_id, "ably_payload": ably_payload or {}, "published": False, "response": response_payload},
+                receipt_data={
+                    "contact_id": contact_id,
+                    "message_id": canonical_message_id,
+                    "ably_payload": ably_payload or {},
+                    "published": False,
+                    "response": receipt_response_without_audio(response_payload, "assist_group"),
+                    **({"audio_artifact_id": private_audio_artifact_id} if private_audio_artifact_id else {}),
+                },
+                owner_token=delivery_owner,
             )
             if not created:
                 stored_payload = stored_receipt.get("ably_payload") or {}
@@ -4342,7 +4867,7 @@ def assist_message():
                         save_delivery_receipt(user_id, "assist_message", request_id, {"published": True})
                     except Exception:
                         pass
-                return jsonify(stored_receipt.get("response") or {})
+                return jsonify(replay_delivery_response(stored_receipt, user_id))
             if ably_payload:
                 try:
                     publish_user_channel_message(contact_id, ably_payload)
@@ -4372,12 +4897,27 @@ def assist_message():
                     {"user_id": user_id, "contact_id": contact_id, "role": "assist_ai", "text": ai_text, "extras": {"visibility": "private_to_user", "assist_group_id": group_id}, "message_id": deterministic_message_id(user_id, "assist_message", contact_id, request_id, "advice")},
                 ],
                 meta_writes=[],
-                receipt_data={"contact_id": contact_id, "message_id": "", "ably_payload": {}, "published": True, "response": response_payload},
+                receipt_data={
+                    "contact_id": contact_id,
+                    "message_id": "",
+                    "ably_payload": {},
+                    "published": True,
+                    "response": receipt_response_without_audio(response_payload, "assist_group"),
+                    **({"audio_artifact_id": private_audio_artifact_id} if private_audio_artifact_id else {}),
+                },
+                owner_token=delivery_owner,
             )
             if not created:
-                return jsonify(stored_receipt.get("response") or {})
+                return jsonify(replay_delivery_response(stored_receipt, user_id))
         return jsonify(response_payload)
     except Exception as exc:
+        if delivery_owner:
+            try:
+                safe_release_delivery_request(
+                    user_id, "assist_message", request_id, delivery_owner
+                )
+            except Exception:
+                pass
         log_tool_error(
             user_id,
             contact_id,

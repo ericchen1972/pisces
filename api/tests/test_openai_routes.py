@@ -1,4 +1,6 @@
+import base64
 import hashlib
+import io
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -6,6 +8,520 @@ from types import SimpleNamespace
 import pytest
 
 import main
+
+
+def test_openai_voice_defaults_and_sanitization_preserve_legacy_fields():
+    assert main.OPENAI_VOICES == {
+        "alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer",
+        "verse", "marin", "cedar",
+    }
+    assert main.default_openai_voice("MALE") == "cedar"
+    assert main.default_openai_voice("female") == "marin"
+    assert main.default_openai_voice("unknown") == "marin"
+
+    settings = main.sanitize_ai_settings("male", "Achird", "be kind", "invalid")
+
+    assert settings == {
+        "gender": "male",
+        "voice": "Achird",
+        "global_prompt": "be kind",
+        "openai_voice": "cedar",
+    }
+    assert main.count_zh_chars("中文, English words!") == 2
+    assert main.tts_text_within_product_limits("中" * 100 + " word " * 50)
+    assert not main.tts_text_within_product_limits("中" * 101 + " short")
+    assert not main.tts_text_within_product_limits("中 " + "word " * 51)
+    assert not main.tts_text_within_product_limits("あ" * 501)
+
+
+def test_private_audio_artifact_encrypts_with_random_opaque_ids(monkeypatch):
+    uploads = []
+    docs = {}
+    monkeypatch.setattr(main, "get_audio_artifact_key", lambda: b"k" * 32)
+    monkeypatch.setattr(
+        main,
+        "upload_private_audio_ciphertext",
+        lambda artifact_id, data: uploads.append((artifact_id, data))
+        or f"https://opaque.public.blob.vercel-storage.com/{artifact_id}.bin",
+    )
+    monkeypatch.setattr(
+        main,
+        "save_private_audio_artifact",
+        lambda user_id, artifact_id, data: docs.setdefault((user_id, artifact_id), data),
+    )
+    wav = b"RIFF-private-wav"
+
+    first = main.create_private_audio_artifact("user-a", wav, "audio/wav")
+    second = main.create_private_audio_artifact("user-a", wav, "audio/wav")
+
+    assert first != second
+    assert "user-a" not in first and "user-a" not in second
+    assert uploads[0][1] != wav and wav not in uploads[0][1]
+    assert set(docs[("user-a", first)]) >= {"blob_url", "nonce", "audio_mime_type", "plaintext_size", "ciphertext_size"}
+
+
+def test_private_audio_artifact_replay_authenticates_and_is_user_scoped(monkeypatch):
+    records = {}
+    blobs = {}
+    monkeypatch.setattr(main, "get_audio_artifact_key", lambda: b"k" * 32)
+
+    def upload(artifact_id, data):
+        url = f"https://opaque.public.blob.vercel-storage.com/{artifact_id}.bin"
+        blobs[url] = data
+        return url
+
+    monkeypatch.setattr(main, "upload_private_audio_ciphertext", upload)
+    monkeypatch.setattr(
+        main,
+        "save_private_audio_artifact",
+        lambda user_id, artifact_id, data: records.setdefault((user_id, artifact_id), data),
+    )
+    monkeypatch.setattr(
+        main,
+        "get_private_audio_artifact",
+        lambda user_id, artifact_id: records.get((user_id, artifact_id)),
+    )
+    monkeypatch.setattr(main, "download_trusted_audio", lambda url, **_kwargs: blobs[url])
+    artifact_id = main.create_private_audio_artifact("user-a", b"RIFF-secret", "audio/wav")
+
+    assert main.load_private_audio_artifact("user-a", artifact_id) == b"RIFF-secret"
+    with pytest.raises(RuntimeError):
+        main.load_private_audio_artifact("user-b", artifact_id)
+    blobs[records[("user-a", artifact_id)]["blob_url"]] = b"tampered"
+    with pytest.raises(Exception):
+        main.load_private_audio_artifact("user-a", artifact_id)
+
+
+def test_transcribe_audio_bytes_uses_named_seeked_openai_file(monkeypatch):
+    seen = {}
+
+    class Service:
+        def transcribe(self, *, audio_file, prompt=""):
+            seen.update(
+                name=audio_file.name,
+                position=audio_file.tell(),
+                contents=audio_file.read(),
+                prompt=prompt,
+            )
+            return SimpleNamespace(text="  hello world  ")
+
+    monkeypatch.setattr(main, "get_openai_service", lambda: Service())
+
+    assert main.transcribe_audio_bytes(b"audio", "audio/webm", "zh-TW, en-US") == "hello world"
+    assert seen == {
+        "name": "audio.webm",
+        "position": 0,
+        "contents": b"audio",
+        "prompt": "zh-TW, en-US",
+    }
+
+
+@pytest.mark.parametrize(
+    ("mime_type", "filename"),
+    [("audio/mp3", "audio.mp3"), ("audio/m4a", "audio.m4a")],
+)
+def test_transcribe_audio_bytes_uses_safe_extension_for_supported_aliases(
+    monkeypatch, mime_type, filename
+):
+    seen = {}
+
+    class Service:
+        def transcribe(self, *, audio_file, prompt=""):
+            seen["name"] = audio_file.name
+            return "ok"
+
+    monkeypatch.setattr(main, "get_openai_service", lambda: Service())
+
+    assert main.transcribe_audio_bytes(b"audio", mime_type) == "ok"
+    assert seen["name"] == filename
+
+
+@pytest.mark.parametrize(
+    "provider_result",
+    [b"RIFFwav", SimpleNamespace(content=b"RIFFwav"), io.BytesIO(b"RIFFwav")],
+)
+def test_synthesize_tts_audio_uses_openai_voice_and_returns_wav(
+    monkeypatch, provider_result
+):
+    seen = {}
+
+    class Service:
+        def synthesize(self, **kwargs):
+            seen.update(kwargs)
+            return provider_result
+
+    monkeypatch.setattr(main, "get_openai_service", lambda: Service())
+
+    encoded, mime = main.synthesize_tts_audio(
+        "hello", "en-US", "coral", "warm and caring"
+    )
+
+    assert base64.b64decode(encoded) == b"RIFFwav"
+    assert mime == "audio/wav"
+    assert seen == {
+        "text": "hello",
+        "voice": "coral",
+        "instructions": "Speak in en-US. Tone and delivery: warm and caring",
+    }
+
+
+def test_synthesize_tts_audio_rejects_oversize_provider_audio(monkeypatch):
+    monkeypatch.setattr(main, "MAX_AUDIO_BYTES", 4)
+    monkeypatch.setattr(
+        main,
+        "get_openai_service",
+        lambda: SimpleNamespace(
+            synthesize=lambda **_kwargs: SimpleNamespace(content=b"12345")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="too large"):
+        main.synthesize_tts_audio("hello", "en-US", "coral")
+
+
+def test_speech_synthesize_requires_auth(client):
+    assert client.post("/api/speech/synthesize", json={"text": "hi", "voice": "coral"}).status_code == 401
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"text": 7, "voice": "coral"},
+        {"text": ["hello"], "voice": "coral"},
+        {"text": "hello", "voice": 7},
+        {"text": "hello", "voice": {"name": "coral"}},
+        {"text": "hello", "voice": "coral", "instructions": 7},
+        {"text": "hello", "voice": "coral", "instructions": []},
+        {"text": "hello", "voice": "coral", "instructions": None},
+    ],
+)
+def test_speech_synthesize_rejects_non_string_json_values(
+    signed_in_client, payload
+):
+    response = signed_in_client.post("/api/speech/synthesize", json=payload)
+
+    assert response.status_code == 400
+    assert response.is_json
+    assert response.get_json()["ok"] is False
+    assert isinstance(response.get_json()["error"], str)
+
+
+@pytest.mark.parametrize(
+    ("payload", "status"),
+    [
+        ({"audio_base64": "!!!!", "mime_type": "audio/webm"}, 400),
+        ({"audio_base64": "YQ==", "mime_type": "text/plain"}, 400),
+        ({"audio_base64": "", "mime_type": "audio/webm"}, 400),
+        ({"audio_base64": 7, "mime_type": "audio/webm"}, 400),
+        ({"audio_base64": "YQ==", "mime_type": []}, 400),
+    ],
+)
+def test_audio_routes_reject_invalid_input_before_provider(
+    signed_in_client, monkeypatch, payload, status
+):
+    monkeypatch.setattr(
+        main,
+        "get_openai_service",
+        lambda: pytest.fail("invalid audio must not call provider"),
+    )
+
+    response = signed_in_client.post("/api/speech/transcribe", json=payload)
+
+    assert response.status_code == status
+    assert response.is_json
+
+
+def test_audio_decoder_enforces_encoded_and_decoded_limits(monkeypatch):
+    monkeypatch.setattr(main, "MAX_AUDIO_BYTES", 4)
+    monkeypatch.setattr(main, "MAX_AUDIO_BASE64_CHARS", 8)
+
+    with pytest.raises(main.AudioInputError) as encoded_error:
+        main.decode_audio_input(
+            {"audio_base64": "A" * 9, "mime_type": "audio/webm"}
+        )
+    with pytest.raises(main.AudioInputError) as decoded_error:
+        main.decode_audio_input(
+            {
+                "audio_base64": base64.b64encode(b"12345").decode("ascii"),
+                "mime_type": "audio/wav; codecs=1",
+            }
+        )
+
+    assert encoded_error.value.status == 413
+    assert decoded_error.value.status == 413
+
+
+def test_voice_chat_requires_authenticated_session(client, monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "get_openai_service",
+        lambda: pytest.fail("anonymous voice chat must not call provider"),
+    )
+
+    response = client.post(
+        "/api/voice-chat",
+        json={"audio_base64": "YQ==", "mime_type": "audio/webm", "user_id": "spoof"},
+    )
+
+    assert response.status_code == 401
+
+
+def test_flask_audio_request_limit_returns_json_413(signed_in_client, monkeypatch):
+    monkeypatch.setitem(main.app.config, "MAX_CONTENT_LENGTH", 32)
+
+    response = signed_in_client.post(
+        "/api/speech/transcribe",
+        json={"audio_base64": "A" * 100, "mime_type": "audio/webm"},
+    )
+
+    assert response.status_code == 413
+    assert response.is_json
+    assert response.get_json() == {"ok": False, "error": "request body is too large"}
+
+
+def test_speech_synthesize_validates_input(signed_in_client):
+    assert signed_in_client.post(
+        "/api/speech/synthesize", json={"text": "hi", "voice": "not-a-voice"}
+    ).status_code == 400
+    assert signed_in_client.post(
+        "/api/speech/synthesize", json={"text": "字" * 201, "voice": "coral"}
+    ).status_code == 400
+    assert signed_in_client.post(
+        "/api/speech/synthesize", json={"text": "字" * 101, "voice": "coral"}
+    ).status_code == 400
+    assert signed_in_client.post(
+        "/api/speech/synthesize",
+        json={"text": "word " * 51, "voice": "coral"},
+    ).status_code == 400
+
+
+def test_speech_synthesize_returns_exact_openai_wav_payload(signed_in_client, monkeypatch):
+    seen = {}
+
+    class Service:
+        def synthesize(self, **kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(content=b"RIFF-openai-wav")
+
+    monkeypatch.setattr(main, "get_openai_service", lambda: Service())
+    response = signed_in_client.post(
+        "/api/speech/synthesize",
+        json={"text": "Hello", "voice": "sage", "instructions": "calm"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "ok": True,
+        "audio_base64": base64.b64encode(b"RIFF-openai-wav").decode("ascii"),
+        "audio_mime_type": "audio/wav",
+    }
+    assert seen == {"text": "Hello", "voice": "sage", "instructions": "calm"}
+
+
+@pytest.mark.parametrize("variant", ["bytes", "content", "read"])
+@pytest.mark.parametrize("provider_audio", [b"", b"12345"])
+def test_speech_synthesize_rejects_empty_or_oversize_provider_audio(
+    signed_in_client, monkeypatch, variant, provider_audio
+):
+    monkeypatch.setattr(main, "MAX_AUDIO_BYTES", 4)
+
+    class ReadResponse:
+        def read(self):
+            return provider_audio
+
+    responses = {
+        "bytes": provider_audio,
+        "content": SimpleNamespace(content=provider_audio),
+        "read": ReadResponse(),
+    }
+    monkeypatch.setattr(
+        main,
+        "get_openai_service",
+        lambda: SimpleNamespace(synthesize=lambda **_kwargs: responses[variant]),
+    )
+
+    response = signed_in_client.post(
+        "/api/speech/synthesize",
+        json={"text": "Hello", "voice": "sage"},
+    )
+
+    assert response.status_code == 502
+    assert response.get_json() == {
+        "ok": False,
+        "error": "speech synthesis is currently unavailable",
+    }
+    assert "audio" not in json.dumps(response.get_json()).lower()
+
+
+def test_ai_settings_api_rejects_invalid_and_persists_openai_voice(
+    signed_in_client, monkeypatch
+):
+    writes = []
+    document = SimpleNamespace(
+        get=lambda: SimpleNamespace(exists=True, to_dict=lambda: {}),
+        set=lambda payload, merge: writes.append((payload, merge)),
+    )
+    collection = SimpleNamespace(document=lambda _user_id: document)
+    monkeypatch.setattr(
+        main,
+        "get_firestore_client",
+        lambda: SimpleNamespace(collection=lambda _name: collection),
+    )
+
+    invalid = signed_in_client.post(
+        "/api/user/ai-settings",
+        json={"gender": "male", "voice": "Achird", "openai_voice": "bad"},
+    )
+    valid = signed_in_client.post(
+        "/api/user/ai-settings",
+        json={"gender": "male", "voice": "Achird", "openai_voice": "cedar"},
+    )
+
+    assert invalid.status_code == 400
+    assert invalid.get_json()["error"] == "openai_voice is invalid"
+    assert valid.status_code == 200
+    assert valid.get_json()["user"]["ai_settings"]["openai_voice"] == "cedar"
+    assert writes[-1][0]["ai_openai_voice"] == "cedar"
+    assert writes[-1][0]["ai_voice"] == "Achird"
+
+
+def test_ai_settings_partial_update_preserves_saved_openai_voice(
+    signed_in_client, monkeypatch
+):
+    writes = []
+    document = SimpleNamespace(
+        get=lambda: SimpleNamespace(
+            exists=True,
+            to_dict=lambda: {"ai_openai_voice": "sage"},
+        ),
+        set=lambda payload, merge: writes.append(payload),
+    )
+    collection = SimpleNamespace(document=lambda _user_id: document)
+    monkeypatch.setattr(
+        main,
+        "get_firestore_client",
+        lambda: SimpleNamespace(collection=lambda _name: collection),
+    )
+
+    response = signed_in_client.post(
+        "/api/user/ai-settings",
+        json={"gender": "female", "voice": "Achernar", "global_prompt": "kind"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["user"]["ai_settings"]["openai_voice"] == "sage"
+    assert writes[-1]["ai_openai_voice"] == "sage"
+
+
+def test_ai_settings_openai_voice_only_update_preserves_all_legacy_fields(
+    signed_in_client, monkeypatch
+):
+    writes = []
+    existing = {
+        "ai_gender": "male",
+        "ai_voice": "Achird",
+        "ai_global_prompt": "custom prompt",
+        "ai_openai_voice": "cedar",
+    }
+    document = SimpleNamespace(
+        get=lambda: SimpleNamespace(exists=True, to_dict=lambda: existing),
+        set=lambda payload, merge: writes.append(payload),
+    )
+    collection = SimpleNamespace(document=lambda _user_id: document)
+    monkeypatch.setattr(
+        main,
+        "get_firestore_client",
+        lambda: SimpleNamespace(collection=lambda _name: collection),
+    )
+
+    response = signed_in_client.post(
+        "/api/user/ai-settings", json={"openai_voice": "sage"}
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["user"]["ai_settings"] == {
+        "gender": "male",
+        "voice": "Achird",
+        "global_prompt": "custom prompt",
+        "openai_voice": "sage",
+    }
+    assert writes[-1]["ai_gender"] == "male"
+    assert writes[-1]["ai_voice"] == "Achird"
+    assert writes[-1]["ai_global_prompt"] == "custom prompt"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"gender": 7},
+        {"voice": ["Achird"]},
+        {"global_prompt": {"text": "kind"}},
+        {"openai_voice": 7},
+        {"gender": None},
+        {"voice": None},
+        {"global_prompt": None},
+        {"openai_voice": None},
+    ],
+)
+def test_ai_settings_rejects_non_object_and_non_string_explicit_fields(
+    signed_in_client, payload
+):
+    response = signed_in_client.post("/api/user/ai-settings", json=payload)
+
+    assert response.status_code == 400
+    assert response.is_json
+    assert response.get_json()["ok"] is False
+    assert isinstance(response.get_json()["error"], str)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"avatar_url": 7},
+        {"avatar_image_base64": []},
+        {"avatar_mime_type": {}},
+        {"avatar_url": "http://insecure.example/avatar.png"},
+        {"avatar_image_base64": "!!!!", "avatar_mime_type": "image/png"},
+        {"avatar_image_base64": "YQ==", "avatar_mime_type": "image/gif"},
+    ],
+)
+def test_ai_settings_rejects_invalid_avatar_inputs_before_upload(
+    signed_in_client, monkeypatch, payload
+):
+    monkeypatch.setattr(
+        main,
+        "upload_avatar_to_vercel_blob",
+        lambda *_args, **_kwargs: pytest.fail("invalid avatar must not upload"),
+    )
+
+    response = signed_in_client.post("/api/user/ai-settings", json=payload)
+
+    assert response.status_code == 400
+    assert response.is_json
+
+
+def test_ai_settings_rejects_oversize_avatar_before_upload(
+    signed_in_client, monkeypatch
+):
+    monkeypatch.setattr(main, "MAX_AVATAR_BYTES", 4)
+    monkeypatch.setattr(main, "MAX_AVATAR_BASE64_CHARS", 8)
+    monkeypatch.setattr(
+        main,
+        "upload_avatar_to_vercel_blob",
+        lambda *_args, **_kwargs: pytest.fail("oversize avatar must not upload"),
+    )
+
+    response = signed_in_client.post(
+        "/api/user/ai-settings",
+        json={
+            "avatar_image_base64": base64.b64encode(b"12345").decode("ascii"),
+            "avatar_mime_type": "image/png",
+        },
+    )
+
+    assert response.status_code == 413
 
 
 class FakeOpenAIService:
@@ -26,6 +542,8 @@ class FakeOpenAIService:
         self.composed = {"as_user": False, "message_to_friend": "Hello Amy"}
         self.text = "OpenAI reply"
         self.deltas = ["Open", "AI", " reply"]
+        self.transcription_text = "OpenAI transcript"
+        self.speech_bytes = b"RIFF-openai"
 
     def decide_chat_output(self, **kwargs):
         self.calls.append(("decide_chat_output", kwargs))
@@ -50,6 +568,24 @@ class FakeOpenAIService:
     def stream_text(self, **kwargs):
         self.calls.append(("stream_text", kwargs))
         yield from self.deltas
+
+    def transcribe(self, *, audio_file, prompt=""):
+        self.calls.append(
+            (
+                "transcribe",
+                {
+                    "name": audio_file.name,
+                    "position": audio_file.tell(),
+                    "contents": audio_file.read(),
+                    "prompt": prompt,
+                },
+            )
+        )
+        return self.transcription_text
+
+    def synthesize(self, **kwargs):
+        self.calls.append(("synthesize", kwargs))
+        return SimpleNamespace(content=self.speech_bytes)
 
 
 @pytest.fixture
@@ -89,7 +625,11 @@ def route_stubs(monkeypatch):
         key = (kwargs["user_id"], kwargs["route_name"], kwargs["request_id"])
         existing = receipts.get(key)
         if existing:
-            return existing, False
+            if existing.get("state") == "completed":
+                return existing, False
+            owner_token = kwargs.get("owner_token")
+            if not owner_token or existing.get("owner_token") != owner_token:
+                return existing, False
         for write in kwargs["message_writes"]:
             main.save_chat_message(
                 write["user_id"],
@@ -106,9 +646,41 @@ def route_stubs(monkeypatch):
                 unread_increment=write.get("unread_increment") or 0,
                 preview_text=write.get("preview_text") or "",
             )
-        receipt = {**kwargs["receipt_data"], "payload_hash": kwargs["payload_hash"]}
+        receipt = {
+            **kwargs["receipt_data"],
+            "payload_hash": kwargs["payload_hash"],
+            **({"state": "completed"} if kwargs.get("owner_token") else {}),
+        }
         receipts[key] = receipt
         return receipt, True
+
+    def reserve_delivery(**kwargs):
+        key = (kwargs["user_id"], kwargs["route_name"], kwargs["request_id"])
+        existing = receipts.get(key)
+        now = datetime.now(timezone.utc)
+        if existing:
+            if existing.get("payload_hash") != kwargs["payload_hash"]:
+                raise ValueError("request_id was already used for a different delivery")
+            expires_at = existing.get("lease_expires_at")
+            if existing.get("state") == "completed" or (
+                isinstance(expires_at, datetime) and expires_at > now
+            ):
+                return existing, False
+        receipt = {
+            **(existing or {}),
+            **kwargs["receipt_data"],
+            "payload_hash": kwargs["payload_hash"],
+            "state": "processing",
+            "owner_token": f"delivery-owner-{kwargs['request_id']}",
+            "lease_expires_at": now + timedelta(minutes=5),
+        }
+        receipts[key] = receipt
+        return receipt, True
+
+    def release_delivery(user_id, route_name, request_id, owner_token):
+        receipt = receipts.get((user_id, route_name, request_id)) or {}
+        if receipt.get("owner_token") == owner_token:
+            receipt["lease_expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
 
     def reserve_stream(**kwargs):
         key = (kwargs["user_id"], "chat_stream", kwargs["request_id"])
@@ -181,6 +753,8 @@ def route_stubs(monkeypatch):
         return done_payload
 
     monkeypatch.setattr(main, "persist_delivery_once", persist_once)
+    monkeypatch.setattr(main, "reserve_delivery_request", reserve_delivery)
+    monkeypatch.setattr(main, "release_delivery_request", release_delivery)
     monkeypatch.setattr(main, "reserve_stream_request", reserve_stream)
     monkeypatch.setattr(main, "release_stream_request", release_stream)
     monkeypatch.setattr(main, "complete_stream_request", complete_stream)
@@ -257,6 +831,484 @@ def test_get_openai_service_requires_key_and_caches_hashed_server_salt(monkeypat
     main.get_openai_service.cache_clear()
 
 
+def test_send_voice_route_uses_openai_transcription_and_preserves_shared_delivery(
+    signed_in_client, route_stubs, monkeypatch
+):
+    service, saved = route_stubs
+    service.transcription_text = "hello Amy"
+    audio_bytes = b"real-webm-audio"
+    uploads = []
+    published = []
+    metadata = []
+    docs = {
+        "user-a": SimpleNamespace(
+            exists=True,
+            to_dict=lambda: {
+                "display_name": "Bo",
+                "avatar_url": "https://sender-avatar",
+            },
+        ),
+        "user-b": SimpleNamespace(exists=True, to_dict=lambda: {"display_name": "Amy"}),
+    }
+    collection = SimpleNamespace(
+        document=lambda user_id: SimpleNamespace(get=lambda: docs[user_id])
+    )
+    monkeypatch.setattr(
+        main,
+        "get_firestore_client",
+        lambda: SimpleNamespace(collection=lambda _name: collection),
+    )
+    monkeypatch.setattr(
+        main,
+        "upload_audio_to_vercel_blob",
+        lambda user_id, data, mime: uploads.append((user_id, data, mime))
+        or "https://blob/voice.webm",
+    )
+    monkeypatch.setattr(
+        main,
+        "upsert_chat_meta",
+        lambda *args, **kwargs: metadata.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        main,
+        "publish_user_channel_message",
+        lambda user_id, payload: published.append((user_id, payload)),
+    )
+
+    response = signed_in_client.post(
+        "/api/messages/send-voice",
+        json={
+            "recipient_user_id": "user-b",
+            "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+            "mime_type": "audio/webm",
+            "duration_seconds": 2.5,
+            "locale": "zh-TW",
+        },
+    )
+
+    assert response.status_code == 200
+    transcribe = [kwargs for name, kwargs in service.calls if name == "transcribe"][-1]
+    assert transcribe == {
+        "name": "audio.webm",
+        "position": 0,
+        "contents": audio_bytes,
+        "prompt": "zh-TW",
+    }
+    assert uploads == [("user-a", audio_bytes, "audio/webm")]
+    assert [item[2] for item in saved] == ["user", "peer"]
+    assert saved[0][4]["visibility"] == saved[1][4]["visibility"] == "shared"
+    assert saved[0][4]["transcript_text"] == saved[1][4]["transcript_text"] == "hello Amy"
+    assert saved[1][4]["avatar_url"] == "https://sender-avatar"
+    assert len(metadata) == 2
+    assert published[0][0] == "user-b"
+    assert published[0][1]["audio_url"] == "https://blob/voice.webm"
+    assert response.get_json()["message"] == published[0][1]
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "expected_status"),
+    [("blob", 502), ("firestore", 500), ("ably", 500)],
+)
+def test_send_voice_failures_are_stable_and_redacted(
+    signed_in_client, route_stubs, monkeypatch, failure_stage, expected_status
+):
+    _service, _saved = route_stubs
+    captured = []
+    secret = "provider-secret-sentinel sk-private"
+    user_doc = SimpleNamespace(exists=True, to_dict=lambda: {"display_name": "Bo"})
+    uploads = []
+    collection = SimpleNamespace(
+        document=lambda _user_id: SimpleNamespace(get=lambda: user_doc)
+    )
+    if failure_stage == "firestore":
+        monkeypatch.setattr(
+            main,
+            "get_firestore_client",
+            lambda: (_ for _ in ()).throw(RuntimeError(secret)),
+        )
+    else:
+        monkeypatch.setattr(
+            main,
+            "get_firestore_client",
+            lambda: SimpleNamespace(collection=lambda _name: collection),
+        )
+    if failure_stage == "blob":
+        monkeypatch.setattr(
+            main,
+            "upload_audio_to_vercel_blob",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError(secret)),
+        )
+    else:
+        monkeypatch.setattr(
+            main, "upload_audio_to_vercel_blob", lambda *_args: "https://blob/audio"
+        )
+    monkeypatch.setattr(main, "upsert_chat_meta", lambda *_args, **_kwargs: None)
+    if failure_stage == "ably":
+        monkeypatch.setattr(
+            main,
+            "publish_user_channel_message",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError(secret)),
+        )
+    else:
+        monkeypatch.setattr(main, "publish_user_channel_message", lambda *_args: None)
+    monkeypatch.setattr(
+        main,
+        "log_tool_error",
+        lambda *args, **kwargs: captured.append((args, kwargs)),
+    )
+
+    response = signed_in_client.post(
+        "/api/messages/send-voice",
+        json={
+            "recipient_user_id": "user-b",
+            "audio_base64": "YQ==",
+            "mime_type": "audio/webm",
+        },
+    )
+
+    serialized = json.dumps(response.get_json())
+    assert response.status_code == expected_status
+    assert secret not in serialized
+    assert "sk-private" not in serialized
+    assert captured
+    assert secret not in repr(captured)
+
+
+def test_voice_chat_routes_openai_transcription_into_openai_text_reply(
+    signed_in_client, route_stubs, monkeypatch
+):
+    service, saved = route_stubs
+    service.transcription_text = "What should I say?"
+    user_doc = SimpleNamespace(
+        exists=True,
+        to_dict=lambda: {"display_name": "Bo"},
+    )
+    collection = SimpleNamespace(
+        document=lambda _user_id: SimpleNamespace(get=lambda: user_doc)
+    )
+    monkeypatch.setattr(
+        main,
+        "get_firestore_client",
+        lambda: SimpleNamespace(collection=lambda _name: collection),
+    )
+
+    response = signed_in_client.post(
+        "/api/voice-chat",
+        json={
+            "audio_base64": base64.b64encode(b"voice-bytes").decode("ascii"),
+            "mime_type": "audio/ogg",
+            "locale": "en-US",
+            "contact_id": "pisces-core",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["transcript"] == "What should I say?"
+    assert response.get_json()["reply"] == "OpenAI reply"
+    assert [name for name, _kwargs in service.calls].count("transcribe") == 1
+    assert any(name == "generate_text" for name, _kwargs in service.calls)
+    assert [item[2] for item in saved][-2:] == ["user", "ai"]
+
+
+def test_assist_outbound_voice_uses_saved_openai_voice_and_preserves_delivery(
+    signed_in_client, route_stubs, monkeypatch
+):
+    service, saved = route_stubs
+    service.assist_decision = {"send_to_friend": True, "voice": True, "reason": "send"}
+    service.composed = {"as_user": False, "message_to_friend": "Hello Amy"}
+    service.text = "Sent with care."
+    published = []
+    uploads = []
+    monkeypatch.setattr(main, "has_explicit_voice_request", lambda _text: True)
+    monkeypatch.setattr(
+        main,
+        "get_user_ai_settings",
+        lambda _uid: {**main.DEFAULT_AI_SETTINGS, "openai_voice": "sage"},
+    )
+    monkeypatch.setattr(
+        main,
+        "get_friend_context",
+        lambda *_args: {
+            "friend_name": "Amy",
+            "special_prompt": "warm",
+            "relationship": "friends",
+        },
+    )
+    user_doc = SimpleNamespace(
+        exists=True,
+        to_dict=lambda: {"display_name": "Bo", "ai_avatar_url": "https://ai-avatar"},
+    )
+    collection = SimpleNamespace(
+        document=lambda _user_id: SimpleNamespace(get=lambda: user_doc)
+    )
+    monkeypatch.setattr(
+        main,
+        "get_firestore_client",
+        lambda: SimpleNamespace(collection=lambda _name: collection),
+    )
+    monkeypatch.setattr(
+        main,
+        "upload_audio_to_vercel_blob",
+        lambda user_id, data, mime: uploads.append((user_id, data, mime))
+        or "https://blob/openai.wav",
+    )
+    monkeypatch.setattr(main, "upsert_chat_meta", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "publish_user_channel_message",
+        lambda uid, payload: published.append((uid, payload)),
+    )
+
+    response = signed_in_client.post(
+        "/api/assist/message",
+        json={
+            "contact_id": "user-b",
+            "message": "Send Amy a voice message",
+            "request_id": "assist-openai-voice-1",
+        },
+    )
+
+    assert response.status_code == 200
+    synth = [kwargs for name, kwargs in service.calls if name == "synthesize"][-1]
+    assert synth["text"] == "Hello Amy"
+    assert synth["voice"] == "sage"
+    assert uploads == [("user-a", b"RIFF-openai", "audio/wav")]
+    assert [item[2] for item in saved] == ["assist_user", "peer", "assist_ai"]
+    assert saved[1][4]["audio_url"] == "https://blob/openai.wav"
+    assert saved[2][4]["visibility"] == "private_to_user"
+    assert published[0][1]["audio_url"] == "https://blob/openai.wav"
+    assert response.get_json()["outbound_message"]["audio_url"] == "https://blob/openai.wav"
+    first_body = response.get_json()
+    retry = signed_in_client.post(
+        "/api/assist/message",
+        json={
+            "contact_id": "user-b",
+            "message": "Send Amy a voice message",
+            "request_id": "assist-openai-voice-1",
+        },
+    )
+    assert retry.status_code == 200
+    assert retry.get_json() == first_body
+    assert len([1 for name, _kwargs in service.calls if name == "synthesize"]) == 1
+    assert len(uploads) == 1
+
+
+def test_assist_processing_duplicate_has_no_provider_or_blob_side_effects(
+    signed_in_client, route_stubs, monkeypatch
+):
+    service, saved = route_stubs
+    request_id = "assist-active-owner"
+    message = "Send Amy a voice message"
+    service.receipts[("user-a", "assist_message", request_id)] = {
+        "state": "processing",
+        "payload_hash": main.delivery_payload_hash("user-b", message),
+        "owner_token": "other-owner",
+        "lease_expires_at": datetime.now(timezone.utc) + timedelta(minutes=1),
+    }
+    monkeypatch.setattr(
+        main,
+        "get_friend_context",
+        lambda *_args: {"friend_name": "Amy", "special_prompt": "", "relationship": "friends"},
+    )
+    monkeypatch.setattr(
+        main,
+        "upload_audio_to_vercel_blob",
+        lambda *_args: pytest.fail("processing loser must not upload"),
+    )
+
+    response = signed_in_client.post(
+        "/api/assist/message",
+        json={"contact_id": "user-b", "message": message, "request_id": request_id},
+    )
+
+    assert response.status_code == 409
+    assert service.calls == []
+    assert saved == []
+
+
+def test_ai_forward_processing_duplicate_has_no_provider_or_media_side_effects(
+    signed_in_client, forwarding_stubs, monkeypatch
+):
+    service, saved, published = forwarding_stubs
+    request_id = "forward-active-owner"
+    message = "Tell Amy hello"
+    service.receipts[("user-a", "chat_forward", request_id)] = {
+        "state": "processing",
+        "payload_hash": main.delivery_payload_hash("user-b", message),
+        "owner_token": "other-owner",
+        "lease_expires_at": datetime.now(timezone.utc) + timedelta(minutes=1),
+    }
+    monkeypatch.setattr(
+        main,
+        "generate_image_with_gemini",
+        lambda *_args: pytest.fail("processing loser must not generate media"),
+    )
+
+    response = signed_in_client.post(
+        "/api/chat",
+        json={"message": message, "contact_id": "pisces-core", "request_id": request_id},
+    )
+
+    assert response.status_code == 409
+    assert service.calls == []
+    assert saved == []
+    assert published == []
+
+
+def test_ai_forward_confirmation_upload_failure_is_text_only_and_replay_identical(
+    signed_in_client, forwarding_stubs, monkeypatch
+):
+    service, saved, published = forwarding_stubs
+    service.assist_decision = {"send_to_friend": True, "voice": True, "reason": "send"}
+    service.composed = {"as_user": False, "message_to_friend": "Hello Amy"}
+    service.text = "Delivery confirmed."
+    monkeypatch.setattr(main, "has_explicit_voice_request", lambda _text: True)
+    uploads = []
+
+    def upload(_uid, data, mime):
+        uploads.append((data, mime))
+        if len(uploads) == 1:
+            return "https://audio.public.blob.vercel-storage.com/outbound.wav"
+        raise RuntimeError("blob provider secret")
+
+    monkeypatch.setattr(main, "upload_audio_to_vercel_blob", upload)
+    monkeypatch.setattr(
+        main,
+        "create_private_audio_artifact",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("blob provider secret")),
+    )
+    monkeypatch.setattr(main, "log_tool_error", lambda *_args, **_kwargs: None)
+    payload = {
+        "message": "Send Amy a voice message",
+        "contact_id": "pisces-core",
+        "request_id": "forward-confirmation-upload-fail",
+    }
+
+    first = signed_in_client.post("/api/chat", json=payload)
+    retry = signed_in_client.post("/api/chat", json=payload)
+
+    assert first.status_code == retry.status_code == 200
+    assert first.get_json() == retry.get_json()
+    assert first.get_json()["reply"] == "Delivery confirmed."
+    assert first.get_json()["audio_base64"] == ""
+    assert first.get_json()["audio_mime_type"] == ""
+    receipt = service.receipts[("user-a", "chat_forward", payload["request_id"])]
+    assert "audio_base64" not in json.dumps(receipt, default=str)
+    assert len(uploads) == 1
+    assert len([1 for name, _kwargs in service.calls if name == "synthesize"]) == 2
+    assert [item[2] for item in saved].count("peer") == 1
+    assert len(published) == 1
+
+
+@pytest.mark.parametrize("failure_mode", ["none", "synth", "upload"])
+def test_assist_private_voice_uses_openai_tts_and_preserves_private_text_on_failure(
+    signed_in_client, route_stubs, monkeypatch, failure_mode
+):
+    service, saved = route_stubs
+    uploads = []
+    service.assist_decision = {"send_to_friend": False, "voice": True, "reason": "advice"}
+    service.text = "Ask gently."
+    if failure_mode == "synth":
+        service.synthesize = lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("provider secret")
+        )
+    monkeypatch.setattr(main, "has_explicit_voice_request", lambda _text: True)
+    monkeypatch.setattr(
+        main,
+        "get_user_ai_settings",
+        lambda _uid: {**main.DEFAULT_AI_SETTINGS, "openai_voice": "coral"},
+    )
+    monkeypatch.setattr(
+        main,
+        "get_friend_context",
+        lambda *_args: {
+            "friend_name": "Amy",
+            "special_prompt": "",
+            "relationship": "friends",
+        },
+    )
+    user_doc = SimpleNamespace(exists=True, to_dict=lambda: {"display_name": "Bo"})
+    collection = SimpleNamespace(
+        document=lambda _user_id: SimpleNamespace(get=lambda: user_doc)
+    )
+    monkeypatch.setattr(
+        main,
+        "get_firestore_client",
+        lambda: SimpleNamespace(collection=lambda _name: collection),
+    )
+    monkeypatch.setattr(main, "log_tool_error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "create_private_audio_artifact",
+        (
+            (lambda *_args: (_ for _ in ()).throw(RuntimeError("blob secret")))
+            if failure_mode == "upload"
+            else lambda uid, data, mime: uploads.append((uid, data, mime))
+            or "private-artifact"
+        ),
+    )
+    monkeypatch.setattr(
+        main, "load_private_audio_artifact", lambda *_args: b"RIFF-openai"
+    )
+    monkeypatch.setattr(
+        main,
+        "get_private_audio_artifact",
+        lambda *_args: {"audio_mime_type": "audio/wav"},
+    )
+
+    response = signed_in_client.post(
+        "/api/assist/message",
+        json={
+            "contact_id": "user-b",
+            "message": "Please read your advice aloud",
+            "request_id": f"assist-private-voice-{failure_mode}",
+        },
+    )
+
+    body = response.get_json()
+    assert response.status_code == 200
+    assert body["assist_group"]["ai_text"] == "Ask gently."
+    assert [item[2] for item in saved] == ["assist_user", "assist_ai"]
+    assert all(item[4]["visibility"] == "private_to_user" for item in saved)
+    if failure_mode in {"synth", "upload"}:
+        assert body["assist_group"]["audio_base64"] == ""
+        assert body["assist_group"]["audio_mime_type"] == ""
+        receipt = service.receipts[("user-a", "assist_message", f"assist-private-voice-{failure_mode}")]
+        assert "audio_base64" not in json.dumps(receipt, default=str)
+        if failure_mode == "upload":
+            retry = signed_in_client.post(
+                "/api/assist/message",
+                json={
+                    "contact_id": "user-b",
+                    "message": "Please read your advice aloud",
+                    "request_id": f"assist-private-voice-{failure_mode}",
+                },
+            )
+            assert retry.status_code == 200
+            assert retry.get_json() == body
+    else:
+        synth = [kwargs for name, kwargs in service.calls if name == "synthesize"][-1]
+        assert synth["voice"] == "coral"
+        assert base64.b64decode(body["assist_group"]["audio_base64"]) == b"RIFF-openai"
+        assert body["assist_group"]["audio_mime_type"] == "audio/wav"
+        receipt = service.receipts[("user-a", "assist_message", f"assist-private-voice-{failure_mode}")]
+        assert "RIFF-openai" not in json.dumps(receipt, default=str)
+        assert "audio_base64" not in json.dumps(receipt, default=str)
+        assert receipt["audio_artifact_id"] == "private-artifact"
+        assert "audio_artifact" not in receipt
+        assert main.replay_delivery_response(receipt, "user-a")["assist_group"]["audio_base64"] == body["assist_group"]["audio_base64"]
+        retry = signed_in_client.post(
+            "/api/assist/message",
+            json={
+                "contact_id": "user-b",
+                "message": "Please read your advice aloud",
+                "request_id": f"assist-private-voice-{failure_mode}",
+            },
+        )
+        assert retry.status_code == 200
+        assert retry.get_json()["assist_group"]["audio_base64"] == body["assist_group"]["audio_base64"]
+        assert len([1 for name, _kwargs in service.calls if name == "synthesize"]) == 1
+        assert len(uploads) == 1
 def test_get_openai_service_uses_api_key_when_session_secret_is_public_fallback(
     monkeypatch,
 ):
@@ -551,7 +1603,7 @@ def test_ai_room_forwarding_ably_failure_does_not_fail_or_repeat_durable_deliver
 
 
 def test_ai_room_forwarding_confirmation_failure_is_sanitized(
-    signed_in_client, forwarding_stubs
+    signed_in_client, forwarding_stubs, monkeypatch
 ):
     service, saved, published = forwarding_stubs
     service.assist_decision = {
@@ -565,6 +1617,11 @@ def test_ai_room_forwarding_confirmation_failure_is_sanitized(
         raise RuntimeError("provider detail sk-secret-value")
 
     service.generate_text = fail_generate_text
+    monkeypatch.setattr(
+        main,
+        "release_delivery_request",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("cleanup failure")),
+    )
 
     response = signed_in_client.post(
         "/api/chat", json={"message": "Tell Amy hello"}
@@ -575,7 +1632,10 @@ def test_ai_room_forwarding_confirmation_failure_is_sanitized(
     assert payload == {"error": "AI confirmation is currently unavailable."}
     assert saved == []
     assert published == []
-    assert service.receipts == {}
+    failed_receipt = next(iter(service.receipts.values()))
+    assert failed_receipt["state"] == "processing"
+    assert failed_receipt["lease_expires_at"] <= datetime.now(timezone.utc)
+    assert "response" not in failed_receipt
     assert "provider detail" not in response.get_data(as_text=True)
     assert "sk-secret-value" not in response.get_data(as_text=True)
 
@@ -1067,12 +2127,26 @@ def test_chat_stream_completed_spoken_retry_replays_delta_audio_done(
     }
     monkeypatch.setattr(main, "has_explicit_voice_request", lambda _text: True)
     tts_calls = []
+    wav_bytes = b"RIFF" + (b"a" * (1024 * 1024 + 1))
+    uploads = []
 
     def fake_tts(*args):
         tts_calls.append(args)
-        return "cmVwbGF5LWF1ZGlv", "audio/mpeg"
+        return base64.b64encode(wav_bytes).decode("ascii"), "audio/wav"
 
     monkeypatch.setattr(main, "synthesize_tts_audio", fake_tts)
+    monkeypatch.setattr(
+        main,
+        "create_private_audio_artifact",
+        lambda uid, data, mime: uploads.append((uid, data, mime))
+        or "private-replay-artifact",
+    )
+    monkeypatch.setattr(main, "load_private_audio_artifact", lambda *_args: wav_bytes)
+    monkeypatch.setattr(
+        main,
+        "get_private_audio_artifact",
+        lambda *_args: {"audio_mime_type": "audio/wav"},
+    )
     payload = {
         "message": "read this",
         "contact_id": "pisces-core",
@@ -1086,19 +2160,23 @@ def test_chat_stream_completed_spoken_retry_replays_delta_audio_done(
     assert [event["type"] for event in events] == ["delta", "audio", "done"]
     assert events[1] == {
         "type": "audio",
-        "audio_base64": "cmVwbGF5LWF1ZGlv",
-        "audio_mime_type": "audio/mpeg",
+        "audio_base64": base64.b64encode(wav_bytes).decode("ascii"),
+        "audio_mime_type": "audio/wav",
     }
-    assert tts_calls[-1] == ("OpenAI reply", "en-US", main.DEFAULT_AI_SETTINGS["voice"], "warm")
+    assert tts_calls == [(
+        "OpenAI reply",
+        "en-US",
+        main.DEFAULT_AI_SETTINGS["openai_voice"],
+        "warm",
+    )]
+    assert uploads == [("user-a", wav_bytes, "audio/wav")]
     receipt = service.receipts[("user-a", "chat_stream", "spoken-replay-1")]
     assert receipt["replay_recipe"] == {
-        "reply": "OpenAI reply",
         "should_read_aloud": True,
-        "language": "en-US",
-        "voice": main.DEFAULT_AI_SETTINGS["voice"],
-        "tone_prompt": "warm",
+        "audio_artifact_id": "private-replay-artifact",
     }
     assert "audio_base64" not in json.dumps(receipt, default=str)
+    assert len(json.dumps(receipt, default=str)) < 4096
 
 
 def test_chat_stream_completed_spoken_replay_tts_failure_falls_back_to_delta_done(
@@ -1113,6 +2191,11 @@ def test_chat_stream_completed_spoken_replay_tts_failure_falls_back_to_delta_don
     }
     monkeypatch.setattr(main, "has_explicit_voice_request", lambda _text: True)
     monkeypatch.setattr(main, "synthesize_tts_audio", lambda *_args: ("YXVkaW8=", "audio/wav"))
+    monkeypatch.setattr(
+        main,
+        "upload_audio_to_vercel_blob",
+        lambda *_args: "https://audio.public.blob.vercel-storage.com/fail.wav",
+    )
     payload = {
         "message": "請朗讀",
         "contact_id": "pisces-core",
@@ -1120,11 +2203,7 @@ def test_chat_stream_completed_spoken_replay_tts_failure_falls_back_to_delta_don
     }
     first = signed_in_client.post("/api/chat/stream", json=payload)
     first.get_data()
-    monkeypatch.setattr(
-        main,
-        "synthesize_tts_audio",
-        lambda *_args: (_ for _ in ()).throw(RuntimeError("tts unavailable")),
-    )
+    monkeypatch.setattr(main, "download_trusted_audio", lambda _url: (_ for _ in ()).throw(RuntimeError("fetch unavailable")))
     retry = signed_in_client.post("/api/chat/stream", json=payload)
     events = [json.loads(line) for line in retry.get_data(as_text=True).splitlines()]
 
@@ -1210,6 +2289,98 @@ def test_reserve_stream_request_atomically_takes_over_expired_lease(monkeypatch)
     assert acquired is True
     assert receipt["owner_token"] != "expired-owner"
     assert receipt["lease_expires_at"] > datetime.now(timezone.utc)
+
+
+def test_delivery_reservation_rejects_active_owner_and_takes_over_expired(monkeypatch):
+    now = datetime.now(timezone.utc)
+    receipts = {
+        ("user-a", "assist_message", "lease-1"): {
+            "state": "processing",
+            "payload_hash": "hash-1",
+            "owner_token": "first-owner",
+            "lease_expires_at": now + timedelta(minutes=1),
+        }
+    }
+    monkeypatch.setattr(main, "get_firestore_client", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        main,
+        "get_delivery_receipt",
+        lambda user, route, request_id: receipts.get((user, route, request_id)),
+    )
+    monkeypatch.setattr(
+        main,
+        "save_delivery_receipt",
+        lambda user, route, request_id, data: receipts.setdefault(
+            (user, route, request_id), {}
+        ).update(data),
+    )
+
+    active, acquired = main.reserve_delivery_request(
+        user_id="user-a",
+        route_name="assist_message",
+        request_id="lease-1",
+        payload_hash="hash-1",
+        receipt_data={"contact_id": "user-b"},
+    )
+    assert acquired is False
+    assert active["owner_token"] == "first-owner"
+
+    receipts[("user-a", "assist_message", "lease-1")]["lease_expires_at"] = (
+        now - timedelta(seconds=1)
+    )
+    taken, acquired = main.reserve_delivery_request(
+        user_id="user-a",
+        route_name="assist_message",
+        request_id="lease-1",
+        payload_hash="hash-1",
+        receipt_data={"contact_id": "user-b"},
+    )
+    assert acquired is True
+    assert taken["owner_token"] != "first-owner"
+    assert taken["state"] == "processing"
+
+
+def test_persist_delivery_once_requires_owner_for_processing_receipt(monkeypatch):
+    receipts = {
+        ("user-a", "assist_message", "request-1"): {
+            "state": "processing",
+            "payload_hash": "hash-1",
+            "owner_token": "winner-owner",
+        }
+    }
+    saved = []
+    monkeypatch.setattr(main, "get_firestore_client", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        main,
+        "get_delivery_receipt",
+        lambda user, route, request_id: receipts.get((user, route, request_id)),
+    )
+    monkeypatch.setattr(
+        main,
+        "save_delivery_receipt",
+        lambda user, route, request_id, data: receipts[(user, route, request_id)].update(data),
+    )
+    monkeypatch.setattr(
+        main,
+        "save_chat_message",
+        lambda *args, **kwargs: saved.append((args, kwargs)) or kwargs.get("message_id"),
+    )
+
+    with pytest.raises(RuntimeError, match="lease is no longer owned"):
+        main.persist_delivery_once(
+            user_id="user-a", route_name="assist_message", request_id="request-1",
+            payload_hash="hash-1", owner_token="loser-owner",
+            message_writes=[], meta_writes=[], receipt_data={"response": {}},
+        )
+    receipt, created = main.persist_delivery_once(
+        user_id="user-a", route_name="assist_message", request_id="request-1",
+        payload_hash="hash-1", owner_token="winner-owner",
+        message_writes=[{"user_id": "user-a", "contact_id": "user-b", "role": "assist_ai", "text": "done", "message_id": "message-1"}],
+        meta_writes=[], receipt_data={"response": {"ok": True}},
+    )
+    assert created is True
+    assert receipt["state"] == "completed"
+    assert len(saved) == 1
 
 
 def test_complete_stream_request_rejects_stale_owner(monkeypatch):
@@ -1486,7 +2657,10 @@ def test_assist_send_preserves_private_roles_recipient_shape_and_ably_payload(
     assert fallback.status_code == 500
     assert sum(item[2] == "peer" for item in saved) == peer_count
     assert len(published) == published_count
-    assert ("user-a", "assist_message", "assist-confirmation-failure") not in service.receipts
+    failed_receipt = service.receipts[("user-a", "assist_message", "assist-confirmation-failure")]
+    assert failed_receipt["state"] == "processing"
+    assert failed_receipt["lease_expires_at"] <= datetime.now(timezone.utc)
+    assert "response" not in failed_receipt
 
 
 def test_save_chat_message_returns_firestore_add_document_id(monkeypatch):
