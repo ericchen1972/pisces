@@ -3212,9 +3212,12 @@ def drain_delivery_cleanup_job(
                 )
                 if identity is not None
             }
-        elif receipt_state != "failed" or _receipt_has_active_cleanup_lease(
-            receipt, datetime.now(timezone.utc)
-        ):
+        elif receipt_state in {"processing", "started"}:
+            if _receipt_has_active_cleanup_lease(
+                receipt, datetime.now(timezone.utc)
+            ):
+                return False
+        elif receipt_state != "failed":
             return False
     remaining = [
         item
