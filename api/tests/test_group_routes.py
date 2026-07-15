@@ -1082,6 +1082,64 @@ def test_legacy_pre_publish_rollback_restores_existing_metadata(
     assert firestore.read("users/user-b/chat_meta/user-a") == {"last_message_preview": "recipient before", "unread_count": 9}
 
 
+@pytest.mark.parametrize("kind", ["text", "voice"])
+@pytest.mark.parametrize("idempotent", [False, True])
+def test_readded_friendship_generation_revokes_inflight_direct_delivery(
+    signed_in_client, monkeypatch, kind, idempotent
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    firestore.seed("friendships/user-a_user-b", user_a_id="user-a", user_b_id="user-b", status="accepted", accepted_at="generation-old")
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(main, "transcribe_audio_bytes", lambda *_args: "voice")
+    monkeypatch.setattr(main, "upload_audio_to_vercel_blob", lambda *_args: "https://blob/voice.webm")
+    target = "persist_delivery_once" if idempotent else "persist_friend_delivery"
+    original = getattr(main, target)
+    def persist_then_readd(*args, **kwargs):
+        result = original(*args, **kwargs)
+        firestore.seed("friendships/user-a_user-b", user_a_id="user-a", user_b_id="user-b", status="accepted", accepted_at="generation-new")
+        return result
+    monkeypatch.setattr(main, target, persist_then_readd)
+    published = []
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *args: published.append(args))
+    body = {"recipient_user_id": "user-b"}
+    if idempotent:
+        body["request_id"] = f"generation-{kind}"
+    if kind == "text":
+        path, body = "/api/messages/send", {**body, "text": "stale"}
+    else:
+        path, body = "/api/messages/send-voice", {**body, "audio_base64": "YQ==", "mime_type": "audio/webm"}
+    response = signed_in_client.post(path, json=body)
+    assert response.status_code == 403
+    assert published == []
+    assert not any("messages" in key for key in firestore.data)
+
+
+@pytest.mark.parametrize("persist_outcome", ["existing", "error"])
+def test_voice_idempotent_loser_or_failure_deletes_only_its_new_upload(
+    signed_in_client, monkeypatch, persist_outcome
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    firestore.seed("friendships/user-a_user-b", user_a_id="user-a", user_b_id="user-b", status="accepted", accepted_at="generation")
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(main, "transcribe_audio_bytes", lambda *_args: "voice")
+    monkeypatch.setattr(main, "upload_audio_to_vercel_blob", lambda *_args: "https://blob/new-upload.webm")
+    stored = {"state": "completed", "payload_hash": "ignored", "response": {"ok": True, "message": {"message_id": "winner", "audio_url": "https://blob/stored.webm"}}}
+    if persist_outcome == "existing":
+        monkeypatch.setattr(main, "persist_delivery_once", lambda **_kwargs: (stored, False))
+    else:
+        monkeypatch.setattr(main, "persist_delivery_once", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("db failed")))
+    deleted = []
+    monkeypatch.setattr(main, "delete_vercel_blob", deleted.append)
+    response = signed_in_client.post("/api/messages/send-voice", json={"recipient_user_id": "user-b", "audio_base64": "YQ==", "mime_type": "audio/webm", "request_id": f"cleanup-{persist_outcome}"})
+    assert response.status_code == (200 if persist_outcome == "existing" else 500)
+    assert deleted == ["https://blob/new-upload.webm"]
+    assert "https://blob/stored.webm" not in deleted
+
+
 def test_text_delivery_succeeds_after_durable_write_when_realtime_publish_fails(
     signed_in_client, monkeypatch
 ):

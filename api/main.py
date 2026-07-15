@@ -1414,6 +1414,7 @@ def persist_delivery_once(
 ):
     """Atomically persist delivery artifacts and its idempotency receipt."""
     client = get_firestore_client()
+    fallback_friendship_generation = secrets.token_urlsafe(24)
 
     def message_payload(write):
         payload = {
@@ -1441,6 +1442,8 @@ def persist_delivery_once(
                     return existing, False
                 if existing.get("owner_token") != owner_token:
                     raise RuntimeError("delivery lease is no longer owned")
+            friendship_generation = ""
+            friendship_ref = None
             if friendship_user_ids:
                 friendship_ref, _pair_key, user_a_id, user_b_id = _friendship_reference(
                     client, *friendship_user_ids
@@ -1450,6 +1453,10 @@ def persist_delivery_once(
                     friendship_snapshot, user_a_id, user_b_id
                 ):
                     raise AcceptedFriendshipRequired("accepted friendship required")
+                friendship_values = friendship_snapshot.to_dict() or {}
+                friendship_generation = friendship_generation_token(friendship_values)
+                if not friendship_generation:
+                    friendship_generation = f"relationship_generation:{fallback_friendship_generation}"
             rollback_meta = {}
             meta_refs = []
             for write in meta_writes:
@@ -1472,6 +1479,12 @@ def persist_delivery_once(
                     write["message_id"],
                 )
                 tx.set(ref, message_payload(write))
+            if friendship_ref is not None and friendship_generation.startswith("relationship_generation:"):
+                tx.set(
+                    friendship_ref,
+                    {"relationship_generation": friendship_generation.split(":", 1)[1]},
+                    merge=True,
+                )
             for write, ref in meta_refs:
                 meta = {
                     "updated_at": firestore.SERVER_TIMESTAMP,
@@ -1489,6 +1502,7 @@ def persist_delivery_once(
                 **receipt_data,
                 "payload_hash": payload_hash,
                 "rollback_meta": rollback_meta,
+                **({"friendship_generation": friendship_generation} if friendship_generation else {}),
                 **({"state": "completed"} if owner_token else {}),
                 "updated_at": firestore.SERVER_TIMESTAMP,
             }
@@ -2438,6 +2452,15 @@ def accepted_friendship_exists(client, first_user_id, second_user_id):
     )
 
 
+def friendship_generation_token(values):
+    values = values or {}
+    for field in ("accepted_at", "relationship_generation", "created_at"):
+        value = values.get(field)
+        if value is not None and str(value):
+            return f"{field}:{value}"
+    return ""
+
+
 def persist_friend_delivery(
     client,
     sender_user_id,
@@ -2502,6 +2525,7 @@ def persist_friend_delivery(
         "unread_count": firestore.Increment(1),
     }
     transaction = client.transaction()
+    fallback_friendship_generation = secrets.token_urlsafe(24)
 
     @firestore.transactional
     def commit(tx):
@@ -2510,6 +2534,10 @@ def persist_friend_delivery(
             friendship_snapshot, user_a_id, user_b_id
         ):
             raise AcceptedFriendshipRequired("accepted friendship required")
+        friendship_values = friendship_snapshot.to_dict() or {}
+        friendship_generation = friendship_generation_token(friendship_values)
+        if not friendship_generation:
+            friendship_generation = f"relationship_generation:{fallback_friendship_generation}"
         sender_meta_snapshot = next(iter(tx.get(sender_meta_ref)))
         recipient_meta_snapshot = next(iter(tx.get(recipient_meta_ref)))
         rollback_meta = {
@@ -2524,6 +2552,13 @@ def persist_friend_delivery(
         tx.set(recipient_message_ref, recipient_message)
         tx.set(sender_meta_ref, sender_meta, merge=True)
         tx.set(recipient_meta_ref, recipient_meta, merge=True)
+        if friendship_generation.startswith("relationship_generation:"):
+            tx.set(
+                friendship_ref,
+                {"relationship_generation": friendship_generation.split(":", 1)[1]},
+                merge=True,
+            )
+        rollback_meta["__friendship_generation__"] = friendship_generation
         return rollback_meta
 
     return commit(transaction)
@@ -2562,10 +2597,7 @@ def confirm_friend_delivery_before_publish(
     @firestore.transactional
     def commit(tx):
         friendship_snapshot = next(iter(tx.get(friendship_ref)))
-        if _is_accepted_friendship_snapshot(
-            friendship_snapshot, user_a_id, user_b_id
-        ):
-            return True
+        friendship_values = friendship_snapshot.to_dict() if friendship_snapshot.exists else {}
         receipt = {}
         sender_meta_ref = (
             client.collection("users").document(sender_user_id)
@@ -2580,6 +2612,14 @@ def confirm_friend_delivery_before_publish(
         if receipt_ref is not None:
             receipt_snapshot = next(iter(tx.get(receipt_ref)))
             receipt = receipt_snapshot.to_dict() if receipt_snapshot.exists else {}
+        expected_generation = receipt.get("friendship_generation") or (
+            (rollback_meta or {}).get("__friendship_generation__")
+        )
+        current_generation = friendship_generation_token(friendship_values)
+        if _is_accepted_friendship_snapshot(
+            friendship_snapshot, user_a_id, user_b_id
+        ) and (not expected_generation or current_generation == expected_generation):
+            return True
         tx.delete(sender_message_ref)
         tx.delete(recipient_message_ref)
         effective_rollback_meta = receipt.get("rollback_meta") or rollback_meta or {}
@@ -4639,6 +4679,8 @@ def send_voice_message():
     route_name = "direct_voice"
     delivery_owner = ""
     rollback_meta = None
+    audio_url = ""
+    voice_blob_durable = False
     recipient_user_id = (body.get("recipient_user_id") or "").strip()
     duration_seconds_raw = body.get("duration_seconds")
 
@@ -4748,6 +4790,21 @@ def send_voice_message():
         )
         return jsonify({"ok": False, "error": "voice upload is currently unavailable"}), 502
 
+    def cleanup_current_voice_upload():
+        if not audio_url:
+            return
+        try:
+            delete_vercel_blob(audio_url)
+        except Exception as exc:
+            log_tool_error(
+                sender_user_id,
+                recipient_user_id,
+                "voice_cleanup",
+                "send_voice_message",
+                type(exc).__name__,
+                request_id=request_id,
+            )
+
     try:
         sender_doc = client.collection("users").document(sender_user_id).get()
         sender_data = sender_doc.to_dict() if sender_doc.exists else {}
@@ -4808,12 +4865,15 @@ def send_voice_message():
                 receipt_data={"contact_id": recipient_user_id, "message_id": message_id, "ably_payload": payload, "published": False, "response": response_payload},
             )
             if not created:
+                cleanup_current_voice_upload()
                 return jsonify(replay_delivery_response(receipt, sender_user_id))
+            voice_blob_durable = True
         else:
             rollback_meta = persist_friend_delivery(
                 client, sender_user_id, recipient_user_id, message_id, "",
                 sender_extras, recipient_extras, transcript or "Voice message",
             )
+            voice_blob_durable = True
         if not confirm_friend_delivery_before_publish(
             client, sender_user_id, recipient_user_id, message_id,
             route_name if idempotent else "", request_id if idempotent else "",
@@ -4845,21 +4905,13 @@ def send_voice_message():
     except AcceptedFriendshipRequired:
         if delivery_owner:
             safe_release_delivery_request(sender_user_id, route_name, request_id, delivery_owner)
-        try:
-            delete_vercel_blob(audio_url)
-        except Exception as exc:
-            log_tool_error(
-                sender_user_id,
-                recipient_user_id,
-                "voice_cleanup",
-                "send_voice_message",
-                type(exc).__name__,
-                request_id=request_id,
-            )
+        cleanup_current_voice_upload()
         return jsonify(
             {"ok": False, "error": "accepted friendship required"}
         ), 403
     except Exception as exc:
+        if not voice_blob_durable:
+            cleanup_current_voice_upload()
         if delivery_owner:
             safe_release_delivery_request(sender_user_id, route_name, request_id, delivery_owner)
         log_tool_error(
