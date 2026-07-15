@@ -1250,6 +1250,81 @@ def test_concurrent_direct_replay_after_commit_does_not_duplicate_durable_state(
     assert firestore.read("users/user-b/chat_meta/user-a")["unread_count"].value == 1
 
 
+def test_unpublished_text_replay_does_not_publish_after_friendship_revoked(
+    signed_in_client, monkeypatch
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    request_id = "revoked-replay-1"
+    payload = {"message_id": "message-1", "sender_user_id": "user-a", "recipient_user_id": "user-b", "text": "stored"}
+    payload_hash = main.delivery_payload_hash("user-b", {"text": "stored", "image_url": "", "music_url": ""})
+    receipt_id = main.hashlib.sha256(f"direct_text:{request_id}".encode()).hexdigest()
+    firestore.seed(f"users/user-a/delivery_receipts/{receipt_id}", state="completed", payload_hash=payload_hash, published=False, ably_payload=payload, response={"ok": True, "message": payload})
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    published = []
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *args: published.append(args))
+    response = signed_in_client.post("/api/messages/send", json={"recipient_user_id": "user-b", "text": "stored", "request_id": request_id})
+    assert response.status_code == 200
+    assert response.get_json()["realtime_delivered"] is False
+    assert published == []
+
+
+@pytest.mark.parametrize("publish_succeeds", [True, False])
+def test_unpublished_text_replay_reports_and_records_republish_outcome(
+    signed_in_client, monkeypatch, publish_succeeds
+):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    firestore.seed("friendships/user-a_user-b", user_a_id="user-a", user_b_id="user-b", status="accepted")
+    request_id = f"republish-{publish_succeeds}"
+    payload = {"message_id": "message-1", "sender_user_id": "user-a", "recipient_user_id": "user-b", "text": "stored"}
+    payload_hash = main.delivery_payload_hash("user-b", {"text": "stored", "image_url": "", "music_url": ""})
+    receipt_id = main.hashlib.sha256(f"direct_text:{request_id}".encode()).hexdigest()
+    receipt_path = f"users/user-a/delivery_receipts/{receipt_id}"
+    firestore.seed(receipt_path, state="completed", payload_hash=payload_hash, published=False, ably_payload=payload, response={"ok": True, "message": payload})
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    def publish(*_args):
+        if not publish_succeeds:
+            raise RuntimeError("offline")
+    monkeypatch.setattr(main, "publish_user_channel_message", publish)
+    response = signed_in_client.post("/api/messages/send", json={"recipient_user_id": "user-b", "text": "stored", "request_id": request_id})
+    assert response.status_code == 200
+    assert response.get_json().get("realtime_delivered") is (None if publish_succeeds else False)
+    assert firestore.read(receipt_path)["published"] is publish_succeeds
+
+
+def test_idempotent_confirm_rollback_restores_own_metadata_and_preserves_newer_metadata(monkeypatch):
+    firestore = FakeFirestoreClient()
+    request_id = "rollback-1"
+    receipt_id = main.hashlib.sha256(f"direct_text:{request_id}".encode()).hexdigest()
+    firestore.seed("users/user-a/chats/user-b/messages/message-1", text="sent")
+    firestore.seed("users/user-b/chats/user-a/messages/message-1", text="sent")
+    firestore.seed("users/user-a/chat_meta/user-b", last_message_preview="sent", direct_delivery_guard="message-1")
+    firestore.seed("users/user-b/chat_meta/user-a", last_message_preview="newer", direct_delivery_guard="newer-message", unread_count=7)
+    firestore.seed(f"users/user-a/delivery_receipts/{receipt_id}", rollback_meta={"user-a:user-b": {"last_message_preview": "before"}, "user-b:user-a": {"last_message_preview": "before", "unread_count": 2}})
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    assert main.confirm_friend_delivery_before_publish(firestore, "user-a", "user-b", "message-1", "direct_text", request_id) is False
+    assert firestore.read("users/user-a/chat_meta/user-b") == {"last_message_preview": "before"}
+    assert firestore.read("users/user-b/chat_meta/user-a")["last_message_preview"] == "newer"
+    assert firestore.read(f"users/user-a/delivery_receipts/{receipt_id}") is None
+
+
+def test_direct_request_id_conflict_is_409_and_legacy_request_remains_supported(signed_in_client, monkeypatch):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Alice")
+    firestore.seed("users/user-b", display_name="Bob")
+    firestore.seed("friendships/user-a_user-b", user_a_id="user-a", user_b_id="user-b", status="accepted")
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *_args: None)
+    first = signed_in_client.post("/api/messages/send", json={"recipient_user_id": "user-b", "text": "one", "request_id": "same-id"})
+    conflict = signed_in_client.post("/api/messages/send", json={"recipient_user_id": "user-b", "text": "different", "request_id": "same-id"})
+    legacy = signed_in_client.post("/api/messages/send", json={"recipient_user_id": "user-b", "text": "legacy"})
+    assert first.status_code == legacy.status_code == 200
+    assert conflict.status_code == 409
+
+
 def test_delete_after_voice_persistence_before_publish_revokes_delivery(
     signed_in_client, monkeypatch
 ):

@@ -1450,6 +1450,20 @@ def persist_delivery_once(
                     friendship_snapshot, user_a_id, user_b_id
                 ):
                     raise AcceptedFriendshipRequired("accepted friendship required")
+            rollback_meta = {}
+            meta_refs = []
+            for write in meta_writes:
+                ref = (
+                    client.collection("users")
+                    .document(write["user_id"])
+                    .collection("chat_meta")
+                    .document(write["contact_id"])
+                )
+                prior = next(iter(tx.get(ref)))
+                rollback_meta[f'{write["user_id"]}:{write["contact_id"]}'] = (
+                    prior.to_dict() if prior.exists else None
+                )
+                meta_refs.append((write, ref))
             for write in message_writes:
                 ref = _chat_message_ref(
                     client,
@@ -1458,13 +1472,7 @@ def persist_delivery_once(
                     write["message_id"],
                 )
                 tx.set(ref, message_payload(write))
-            for write in meta_writes:
-                ref = (
-                    client.collection("users")
-                    .document(write["user_id"])
-                    .collection("chat_meta")
-                    .document(write["contact_id"])
-                )
+            for write, ref in meta_refs:
                 meta = {
                     "updated_at": firestore.SERVER_TIMESTAMP,
                     "last_message_at": firestore.SERVER_TIMESTAMP,
@@ -1474,10 +1482,13 @@ def persist_delivery_once(
                     meta["unread_count"] = firestore.Increment(
                         int(write["unread_increment"])
                     )
+                if receipt_data.get("message_id"):
+                    meta["direct_delivery_guard"] = receipt_data["message_id"]
                 tx.set(ref, meta, merge=True)
             receipt = {
                 **receipt_data,
                 "payload_hash": payload_hash,
+                "rollback_meta": rollback_meta,
                 **({"state": "completed"} if owner_token else {}),
                 "updated_at": firestore.SERVER_TIMESTAMP,
             }
@@ -2484,6 +2495,7 @@ def persist_friend_delivery(
         "updated_at": firestore.SERVER_TIMESTAMP,
         "last_message_at": firestore.SERVER_TIMESTAMP,
         "last_message_preview": (preview_text or "").strip()[:280],
+        "direct_delivery_guard": message_id,
     }
     recipient_meta = {
         **sender_meta,
@@ -2543,8 +2555,35 @@ def confirm_friend_delivery_before_publish(
             friendship_snapshot, user_a_id, user_b_id
         ):
             return True
+        receipt = {}
+        sender_meta_ref = (
+            client.collection("users").document(sender_user_id)
+            .collection("chat_meta").document(recipient_user_id)
+        )
+        recipient_meta_ref = (
+            client.collection("users").document(recipient_user_id)
+            .collection("chat_meta").document(sender_user_id)
+        )
+        sender_meta_snapshot = next(iter(tx.get(sender_meta_ref)))
+        recipient_meta_snapshot = next(iter(tx.get(recipient_meta_ref)))
+        if receipt_ref is not None:
+            receipt_snapshot = next(iter(tx.get(receipt_ref)))
+            receipt = receipt_snapshot.to_dict() if receipt_snapshot.exists else {}
         tx.delete(sender_message_ref)
         tx.delete(recipient_message_ref)
+        rollback_meta = receipt.get("rollback_meta") or {}
+        for user_id, contact_id, ref, snapshot in (
+            (sender_user_id, recipient_user_id, sender_meta_ref, sender_meta_snapshot),
+            (recipient_user_id, sender_user_id, recipient_meta_ref, recipient_meta_snapshot),
+        ):
+            current = snapshot.to_dict() if snapshot.exists else {}
+            if current.get("direct_delivery_guard") != message_id:
+                continue
+            prior = rollback_meta.get(f"{user_id}:{contact_id}")
+            if prior is None:
+                tx.delete(ref)
+            else:
+                tx.set(ref, prior)
         if receipt_ref is not None:
             tx.delete(receipt_ref)
         return False
@@ -2561,11 +2600,15 @@ def replay_direct_delivery(user_id, route_name, request_id, payload_hash, recipi
     response = replay_delivery_response(receipt, user_id)
     stored_payload = receipt.get("ably_payload") or {}
     if stored_payload and not receipt.get("published"):
-        try:
-            publish_user_channel_message(recipient_user_id, stored_payload)
-            save_delivery_receipt(user_id, route_name, request_id, {"published": True})
-        except Exception:
+        client = get_firestore_client()
+        if not accepted_friendship_exists(client, user_id, recipient_user_id):
             response["realtime_delivered"] = False
+        else:
+            try:
+                publish_user_channel_message(recipient_user_id, stored_payload)
+                save_delivery_receipt(user_id, route_name, request_id, {"published": True})
+            except Exception:
+                response["realtime_delivered"] = False
     return response
 
 
