@@ -1,103 +1,87 @@
-# Pisces
+# Convia
 
-**AI-First Communication App**
+**AI-first communication app**
 
-Pisces is a communication app where your AI is a first-class contact.
-It supports normal user-to-user chat and AI-assisted communication in the same interface.
+Convia combines person-to-person messaging with an AI contact and private AI assistance inside friend conversations. Users can relay messages, generate image or music attachments, transcribe recorded audio, hear AI-generated speech, and call the AI through a Realtime voice session.
 
-## What Pisces Is For
+## Architecture
 
-Pisces helps users:
-- Chat with their own AI as a communication partner
-- Ask AI for advice inside a friend conversation without leaving the chat flow
-- Let AI relay messages to friends (as AI, or in the user's name)
-- Generate media content (image / music) and attach it to chat
-- Use voice interactions (speech-to-text, text-to-speech, and Gemini Live call mode)
-
-## Current Architecture
-
-- Frontend: React (Vite), deployed on Vercel
-- Backend: Python Flask, deployed on Google Cloud Run
+- Frontend: React and Vite, deployed on Vercel
+- Backend: Python and Flask, deployed on Google Cloud Run
 - Database: Firestore
-- Realtime delivery: Ably channels (`user_<user_id>`)
+- Realtime message delivery: Ably channels (`user_<user_id>`)
 - Media storage: Vercel Blob
 
-### Service Endpoints
+The existing deployment URLs and internal service identifiers intentionally remain unchanged for compatibility:
+
 - Web: `https://pisces-plum.vercel.app/`
 - API: `https://pisces-315346868518.asia-east1.run.app`
+- AI contact identifier: `pisces-core`
 
-## AI Models and AI Services in Use
+## AI providers and models
 
-### Gemini (Google AI)
-- Chat / planning / tool decisions: `gemini-2.5-flash`
-- TTS: `gemini-2.5-pro-preview-tts`
-- Live voice call: `gemini-2.5-flash-native-audio-preview-12-2025`
-- Image generation (fallback candidates):
-  - `gemini-3.1-flash-image-preview`
-  - `gemini-3-pro-image-preview`
-  - `gemini-2.5-flash-image`
-  - `gemini-2.0-flash-exp-image-generation`
-- Music generation: `models/lyria-realtime-exp`
+OpenAI handles all text, routing, speech transcription, speech synthesis, and AI voice calls. The defaults can be overridden independently:
 
-### Google Cloud APIs
-- Speech-to-Text: Google Cloud Speech API (for recorded voice transcription)
+| Capability | Environment variable | Default |
+| --- | --- | --- |
+| Visible text replies | `OPENAI_TEXT_MODEL` | `gpt-5.6-terra` |
+| Routing and structured decisions | `OPENAI_ROUTER_MODEL` | `gpt-5.6-luna` |
+| AI Realtime calls | `OPENAI_REALTIME_MODEL` | `gpt-realtime-2.1` |
+| Recorded-audio transcription | `OPENAI_TRANSCRIBE_MODEL` | `gpt-4o-mini-transcribe` |
+| Text-to-speech | `OPENAI_TTS_MODEL` | `gpt-4o-mini-tts` |
 
-## Key Product Behaviors (Implemented)
+Set the OpenAI credential as `OPENAI_KEY`. `OPENAI_API_KEY` is supported as a fallback for standard OpenAI tooling and existing deployments.
 
-- AI-first contact list: first contact is always Pisces AI
-- AI Assist mode in friend chat:
-  - Creates private AI-assist exchange blocks
-  - Can relay final output to the friend when requested
-- Message relay identity:
-  - `as_user=true`: message is sent as user
-  - `as_user=false`: message is sent as AI proxy
-- Per-user AI settings:
-  - AI name/avatar
-  - Voice and global prompt
-  - History range (controls how much context AI can read)
-- Per-friend settings:
-  - Alias
-  - Special prompt
-  - Relationship label (private to current user)
+Google Gemini is retained only for image generation and for planning Lyria music requests. Lyria is retained only for music generation. Gemini chat, Gemini TTS, Gemini Live, and Google Cloud Speech-to-Text are not part of Convia's text or voice paths.
 
-## Data Model (High Level)
+Image generation tries these Gemini models in order:
 
-- `users`
-  - profile info, AI settings, identify code, history range
-- `users/<user_id>/chats/<contact_id>/messages`
-  - chat timeline (text/audio/image/music URL, sender role, visibility)
-- `friendships`
-  - accepted relationship, alias/special_prompt/relationship per side
-- `err_log`
-  - tool and runtime diagnostic logs
+- `gemini-3.1-flash-image-preview`
+- `gemini-3-pro-image-preview`
+- `gemini-2.5-flash-image`
+- `gemini-2.0-flash-exp-image-generation`
 
-## Environment Variables
+Music generation uses `models/lyria-realtime-exp`.
 
-Required (backend):
-- `GEMINI_API_KEY` (or `GOOGLE_API_KEY`)
+## Environment variables
+
+Backend credentials and service configuration:
+
+- `OPENAI_KEY` (or `OPENAI_API_KEY` fallback)
+- `OPENAI_SAFETY_SALT` in Cloud Run, unless a production `SESSION_SECRET` supplies the stable salt source
+- `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) for image and music only
 - `SESSION_SECRET`
 - `ABLY_KEY`
-- `BLOB_READ_WRITE_TOKEN` (or `spices_READ_WRITE_TOKEN` / `VITE_BLOB_READ_WRITE_TOKEN` fallback)
+- `BLOB_READ_WRITE_TOKEN` (with the existing `spices_READ_WRITE_TOKEN` and `VITE_BLOB_READ_WRITE_TOKEN` fallbacks)
+- `FIRESTORE_PROJECT_ID` and `FIRESTORE_DATABASE_ID` when overriding the existing internal project/database names
+- `GOOGLE_CLIENT_ID` for Google sign-in
 
-Optional / deployment-specific:
-- `FIRESTORE_PROJECT_ID`
-- `FIRESTORE_DATABASE_ID`
-- `GOOGLE_CLIENT_ID`
+## Local development
 
-## Local Development
-
-Run both frontend and backend:
+Run the frontend and backend together:
 
 ```bash
 ./dev.sh
 ```
 
 Default local URLs:
+
 - Web: `http://127.0.0.1:5173`
 - API: `http://127.0.0.1:8080`
 
-## Notes
+## Tests
 
-- AI tool orchestration is semantic (not keyword-only).
-- Live-call context and chat-assist context are intentionally separated.
-- In AI room, additional friend context can be injected via `about_friend` logic when user mentions a specific contact.
+Run the complete backend suite from the API directory:
+
+```bash
+cd api
+pytest -q
+```
+
+Run the complete frontend suite and production build from the web directory:
+
+```bash
+cd web
+npm test
+npm run build
+```

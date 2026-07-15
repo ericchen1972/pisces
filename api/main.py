@@ -3,12 +3,10 @@ import os
 import base64
 import io
 import re
-import struct
 import hashlib
 import asyncio
 import uuid
 import math
-import random
 import secrets
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
@@ -19,8 +17,6 @@ from flask import Flask, Response, jsonify, request as flask_request, session
 from werkzeug.exceptions import RequestEntityTooLarge
 from google.auth.transport import requests as google_requests
 from google.cloud import firestore
-from google import genai
-from google.genai import types as genai_types
 from google.oauth2 import id_token
 from google.oauth2 import service_account
 from ably import AblyRest
@@ -52,16 +48,6 @@ GOOGLE_CLIENT_ID = os.getenv(
     "GOOGLE_CLIENT_ID",
     "315346868518-os2tf8uc5282bggj40jbpkaltae1phi9.apps.googleusercontent.com",
 )
-CHAT_MODEL = "gemini-2.5-flash"
-LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
-IMAGE_MODEL_CANDIDATES = [
-    "gemini-3.1-flash-image-preview",
-    "gemini-3-pro-image-preview",
-    "gemini-2.5-flash-image",
-    "gemini-2.0-flash-exp-image-generation",
-]
-MUSIC_MODEL = "models/lyria-realtime-exp"
-MUSIC_DURATION_SECONDS = 30
 AI_DEFAULT_GLOBAL_PROMPT = (
     "You are a polite, warm, and thoughtful AI communication partner."
 )
@@ -187,45 +173,6 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 SESSION_COOKIE_SECURE = get_config_value("SESSION_COOKIE_SECURE").lower() in ("1", "true", "yes", "on")
 app.config["SESSION_COOKIE_SECURE"] = SESSION_COOKIE_SECURE
 app.config["SESSION_COOKIE_SAMESITE"] = "None" if SESSION_COOKIE_SECURE else "Lax"
-
-
-def call_gemini_generate_content(payload, model=CHAT_MODEL, timeout=30):
-    gemini_api_key = get_gemini_api_key()
-    if not gemini_api_key:
-        raise RuntimeError("GOOGLE_API_KEY/GEMINI_API_KEY is not configured")
-
-    endpoint = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model}:generateContent"
-        f"?key={gemini_api_key}"
-    )
-    req = request.Request(
-        endpoint,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Gemini request failed: {detail}") from exc
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError(f"Gemini request failed: {exc}") from exc
-
-
-def extract_text_from_response(data):
-    candidates = data.get("candidates") or []
-    if not candidates:
-        return ""
-    content = candidates[0].get("content") or {}
-    parts = content.get("parts") or []
-    for part in parts:
-        text = (part.get("text") or "").strip()
-        if text:
-            return text
-    return ""
 
 
 def extract_json_obj(text):
@@ -611,7 +558,7 @@ def _untrusted_context_items(extra_context_text):
 
 def _openai_text_request(user_message, global_prompt, history_messages, extra_context_text=""):
     instructions = (
-        "You are Pisces AI, a warm and thoughtful communication partner. "
+        "You are Convia AI, a warm and thoughtful communication partner. "
         "Follow the user's persona settings below while remaining accurate and helpful.\n\n"
         f"Persona settings:\n{global_prompt or AI_DEFAULT_GLOBAL_PROMPT}"
     )
@@ -699,68 +646,6 @@ def synthesize_tts_audio(text, language, voice_name, tone_prompt=""):
     )
     audio_bytes = extract_tts_audio_bytes(result)
     return base64.b64encode(audio_bytes).decode("ascii"), "audio/wav"
-
-
-def create_live_ephemeral_token():
-    gemini_api_key = get_gemini_api_key()
-    if not gemini_api_key:
-        raise RuntimeError("GOOGLE_API_KEY/GEMINI_API_KEY is not configured")
-
-    client = genai.Client(api_key=gemini_api_key, http_options={"api_version": "v1alpha"})
-    now = datetime.now(timezone.utc)
-    new_token = client.auth_tokens.create(
-        config={
-            "uses": 1,
-            "expire_time": (now + timedelta(minutes=30)).isoformat(),
-            "new_session_expire_time": (now + timedelta(minutes=2)).isoformat(),
-            "http_options": {"api_version": "v1alpha"},
-            "live_connect_constraints": {
-                "model": LIVE_MODEL,
-                "config": {
-                    "response_modalities": ["AUDIO"],
-                    "speech_config": {
-                        "voice_config": {
-                            "prebuilt_voice_config": {
-                                "voice_name": "Leda",
-                            }
-                        }
-                    },
-                },
-            },
-        }
-    )
-    return {
-        "token": new_token.name,
-        "expire_time": getattr(new_token, "expire_time", None),
-        "new_session_expire_time": getattr(new_token, "new_session_expire_time", None),
-    }
-
-
-def pcm16_to_wav_bytes(pcm_bytes, sample_rate=24000, channels=1):
-    bits_per_sample = 16
-    byte_rate = sample_rate * channels * (bits_per_sample // 8)
-    block_align = channels * (bits_per_sample // 8)
-    data_size = len(pcm_bytes)
-    riff_chunk_size = 36 + data_size
-
-    header = b"".join(
-        [
-            b"RIFF",
-            struct.pack("<I", riff_chunk_size),
-            b"WAVE",
-            b"fmt ",
-            struct.pack("<I", 16),
-            struct.pack("<H", 1),
-            struct.pack("<H", channels),
-            struct.pack("<I", sample_rate),
-            struct.pack("<I", byte_rate),
-            struct.pack("<H", block_align),
-            struct.pack("<H", bits_per_sample),
-            b"data",
-            struct.pack("<I", data_size),
-        ]
-    )
-    return header + pcm_bytes
 
 
 def get_gemini_api_key():
@@ -1163,33 +1048,9 @@ def upload_image_to_vercel_blob(user_id, image_bytes, mime_type="image/png"):
 
 
 def generate_image_with_gemini(prompt):
-    text_prompt = (prompt or "").strip() or "Create a beautiful illustration."
-    last_err = ""
-    for model_name in IMAGE_MODEL_CANDIDATES:
-        payload = {
-            "contents": [{"parts": [{"text": text_prompt}]}],
-            "generationConfig": {
-                "responseModalities": ["TEXT", "IMAGE"],
-            },
-        }
-        try:
-            data = call_gemini_generate_content(payload, model=model_name, timeout=90)
-            candidates = data.get("candidates") or []
-            if not candidates:
-                raise RuntimeError("no candidates")
-            content = candidates[0].get("content") or {}
-            parts = content.get("parts") or []
-            for part in parts:
-                inline_data = part.get("inlineData") or {}
-                image_b64 = (inline_data.get("data") or "").strip()
-                mime_type = (inline_data.get("mimeType") or "image/png").strip()
-                if image_b64:
-                    return base64.b64decode(image_b64), mime_type
-            raise RuntimeError("no inline image in response")
-        except Exception as exc:
-            last_err = f"{model_name}: {exc}"
-            continue
-    raise RuntimeError(last_err or "all image models failed")
+    from media_providers import generate_gemini_image
+
+    return generate_gemini_image(get_gemini_api_key(), prompt)
 
 
 def build_tool_status_reply(want_image, want_music, image_url, music_url, image_error="", music_error=""):
@@ -1209,132 +1070,14 @@ def build_tool_status_reply(want_image, want_music, image_url, music_url, image_
     return " ".join(parts).strip()
 
 
-def synthesize_music_wav_bytes_fallback(seed_text, duration_seconds=MUSIC_DURATION_SECONDS):
-    sample_rate = 24000
-    duration_seconds = max(4, min(int(duration_seconds), 30))
-    total_samples = sample_rate * duration_seconds
-    pcm = bytearray()
+def generate_music_with_lyria(seed_text, duration_seconds=30):
+    from media_providers import generate_lyria_music
 
-    seed_int = int(hashlib.sha1((seed_text or "pisces music").encode("utf-8")).hexdigest()[:8], 16)
-    rng = random.Random(seed_int)
-    scale_hz = [220.00, 246.94, 261.63, 293.66, 329.63, 369.99, 392.00, 440.00]
-    beat_samples = sample_rate // 2
-    t = 0
-    while t < total_samples:
-        freq = rng.choice(scale_hz) * (2 if rng.random() > 0.75 else 1)
-        note_len = beat_samples * (1 if rng.random() > 0.35 else 2)
-        note_end = min(total_samples, t + note_len)
-        for i in range(t, note_end):
-            dt = i / sample_rate
-            env = min(1.0, (i - t) / (sample_rate * 0.03))
-            tail = max(0.0, (note_end - i) / (sample_rate * 0.05))
-            amp = min(env, tail if tail > 0 else env) * 0.26
-            sample = amp * (math.sin(2 * math.pi * freq * dt) + 0.35 * math.sin(2 * math.pi * (freq * 2.0) * dt))
-            s16 = int(max(-1.0, min(1.0, sample)) * 32767)
-            pcm.extend(struct.pack("<h", s16))
-        t = note_end
-
-    return pcm16_to_wav_bytes(bytes(pcm), sample_rate=sample_rate, channels=1)
-
-
-def plan_music_request(seed_text):
-    default = {
-        "prompt": (seed_text or "instrumental electronic music").strip(),
-        "bpm": 110,
-        "temperature": 1.0,
-    }
-    if not (seed_text or "").strip():
-        return default
-    payload = {
-        "system_instruction": {
-            "parts": [{
-                "text": (
-                    "You convert a user's natural-language music request into a concise prompt for Lyria music generation. "
-                    "Return strict JSON only with keys: prompt (string), bpm (integer 60-180), temperature (number 0.4-1.4). "
-                    "Preserve requested genre/mood/instruments exactly when possible. "
-                    "Build a STYLE-LOCK prompt with concrete instrumentation + rhythm so output doesn't drift. "
-                    "If user asks electronic music, include synth bass, drum machine, arpeggiator, sidechain-like pumping feel. "
-                    "If user asks jazz, include jazz harmony/swing/brush drums or upright bass where appropriate. "
-                    "If user asks baroque/classical, include strings/harpsichord/counterpoint language."
-                )
-            }]
-        },
-        "contents": [{"parts": [{"text": seed_text}]}],
-        "generationConfig": {"responseMimeType": "application/json"},
-    }
-    try:
-        resp = call_gemini_generate_content(payload, model=CHAT_MODEL, timeout=20)
-        obj = json.loads(extract_text_from_response(resp) or "{}")
-        prompt = str(obj.get("prompt") or "").strip() or default["prompt"]
-        bpm = int(obj.get("bpm") or default["bpm"])
-        temperature = float(obj.get("temperature") or default["temperature"])
-        bpm = max(60, min(180, bpm))
-        temperature = max(0.4, min(1.4, temperature))
-        return {"prompt": prompt, "bpm": bpm, "temperature": temperature}
-    except Exception:
-        return default
-
-
-def generate_music_with_lyria(seed_text, duration_seconds=MUSIC_DURATION_SECONDS):
-    gemini_api_key = get_gemini_api_key()
-    if not gemini_api_key:
-        raise RuntimeError("GOOGLE_API_KEY/GEMINI_API_KEY is not configured")
-
-    async def _run():
-        client = genai.Client(api_key=gemini_api_key, http_options={"api_version": "v1alpha"})
-        pcm_chunks = []
-        duration_seconds_clamped = max(4, min(int(duration_seconds), 30))
-        plan = plan_music_request(seed_text)
-        sample_rate = 48000
-        channels = 2
-        target_bytes = None
-        async with client.aio.live.music.connect(model=MUSIC_MODEL) as session:
-            await session.set_weighted_prompts(
-                prompts=[
-                    genai_types.WeightedPrompt(text=(plan["prompt"] or "instrumental electronic music"), weight=1.25),
-                    genai_types.WeightedPrompt(
-                        text="STYLE LOCK: follow requested genre/mood/instrumentation strictly; avoid unrelated style drift.",
-                        weight=1.0,
-                    ),
-                    genai_types.WeightedPrompt(text="instrumental only, no spoken words, no vocal syllables", weight=0.45),
-                ]
-            )
-            await session.set_music_generation_config(
-                config=genai_types.LiveMusicGenerationConfig(
-                    bpm=int(plan["bpm"]),
-                    temperature=float(plan["temperature"]),
-                )
-            )
-            await session.play()
-            stream = session.receive()
-            while True:
-                message = await asyncio.wait_for(anext(stream), timeout=8.0)
-                server_content = getattr(message, "server_content", None)
-                audio_chunks = getattr(server_content, "audio_chunks", None) if server_content else None
-                if not audio_chunks:
-                    continue
-                for chunk in audio_chunks:
-                    data = getattr(chunk, "data", b"")
-                    mime_type = (getattr(chunk, "mime_type", "") or "").lower()
-                    match = re.search(r"rate=(\d+)", mime_type)
-                    if match:
-                        sample_rate = int(match.group(1))
-                    match = re.search(r"channels=(\d+)", mime_type)
-                    if match:
-                        channels = int(match.group(1))
-                    if target_bytes is None:
-                        # Lyria currently returns PCM16 (L16), bytes_per_sample = 2.
-                        target_bytes = sample_rate * channels * 2 * duration_seconds_clamped
-                    if data:
-                        pcm_chunks.append(data)
-                if target_bytes and sum(len(c) for c in pcm_chunks) >= target_bytes:
-                    break
-        return b"".join(pcm_chunks), sample_rate, channels
-
-    pcm_bytes, sample_rate, channels = asyncio.run(_run())
-    if not pcm_bytes:
-        raise RuntimeError("Lyria returned no audio chunks")
-    return pcm16_to_wav_bytes(pcm_bytes, sample_rate=sample_rate, channels=channels)
+    return generate_lyria_music(
+        get_gemini_api_key(),
+        seed_text,
+        duration_seconds=duration_seconds,
+    )
 
 
 def get_firestore_client():
@@ -2241,7 +1984,7 @@ def build_history_prompt(history_messages):
         return "No previous conversation."
     lines = []
     for msg in history_messages:
-        role = "User" if msg.get("role") == "user" else "Pisces AI"
+        role = "User" if msg.get("role") == "user" else "Convia AI"
         text = (msg.get("text") or "").strip()
         if not text:
             continue
@@ -2254,7 +1997,7 @@ def get_realtime_user_identity(user_id):
     user_doc = client.collection("users").document(user_id).get()
     user_data = user_doc.to_dict() if user_doc.exists else {}
     user_name = (user_data.get("display_name") or user_data.get("email") or "User").strip()
-    ai_name = (user_data.get("ai_name") or "Pisces").strip()
+    ai_name = (user_data.get("ai_name") or "Convia").strip()
     return user_name, ai_name
 
 
@@ -2549,7 +2292,7 @@ def delete_contact_group():
         return jsonify(error), status
 
 
-def generate_gemini_reply(
+def generate_ai_reply(
     user_message,
     ai_settings,
     history_messages,
@@ -2958,7 +2701,7 @@ def speech_synthesize():
 
 @app.route("/")
 def hello():
-    return "Hello Pisces!"
+    return "Hello Convia!"
 
 
 @app.after_request
@@ -3118,7 +2861,7 @@ def chat():
                 history_messages=friend_history,
                 user_name=(user_data.get("display_name") or user_data.get("email") or "User"),
                 friend_name=friend_ctx["friend_name"],
-                ai_name=(user_data.get("ai_name") or "Pisces"),
+                ai_name=(user_data.get("ai_name") or "Convia"),
                 style_prompt=style_prompt,
                 relationship=friend_ctx.get("relationship") or "",
                 user_id=user_id,
@@ -3326,7 +3069,7 @@ def chat():
             about_result = about_friend(user_id, about_plan.get("name"), history_range)
             extra_context_text = build_about_friend_context(user_name, about_result)
     try:
-        chat_result = generate_gemini_reply(
+        chat_result = generate_ai_reply(
             user_message,
             ai_settings,
             history_messages,
@@ -3715,7 +3458,7 @@ def voice_chat():
             about_result = about_friend(user_id, about_plan.get("name"), history_range)
             extra_context_text = build_about_friend_context(user_name, about_result)
     try:
-        chat_result = generate_gemini_reply(
+        chat_result = generate_ai_reply(
             transcript,
             ai_settings,
             history_messages,
@@ -4956,7 +4699,7 @@ def assist_message():
                 history_messages=history_messages,
                 user_name=(user_data.get("display_name") or user_data.get("email") or "User"),
                 friend_name=friend_ctx["friend_name"],
-                ai_name=(user_data.get("ai_name") or "Pisces"),
+                ai_name=(user_data.get("ai_name") or "Convia"),
                 style_prompt=style_prompt,
                 relationship=friend_ctx.get("relationship") or "",
                 user_id=user_id,
@@ -5402,7 +5145,7 @@ def parse_realtime_session_body(body):
     if mode not in {"ai", "assist", "peer"}:
         raise ValueError("mode is invalid")
     if mode == "ai" and contact_id != "pisces-core":
-        raise ValueError("AI mode requires the Pisces AI room")
+        raise ValueError("AI mode requires the Convia AI room")
     if mode == "assist" and contact_id == "pisces-core":
         raise ValueError("Assist mode requires an accepted contact")
     if mode == "peer" and contact_id == "pisces-core":

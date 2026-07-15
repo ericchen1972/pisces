@@ -1,4 +1,4 @@
-"""Narrow, testable wrapper around the OpenAI APIs used by Pisces."""
+"""Narrow, testable wrapper around the OpenAI APIs used by Convia."""
 
 from __future__ import annotations
 

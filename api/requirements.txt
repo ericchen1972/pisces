@@ -4,5 +4,4 @@ google-cloud-firestore
 google-genai
 ably
 cryptography
-websockets>=13.0,<15.1
 pytest

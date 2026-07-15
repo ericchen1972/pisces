@@ -397,11 +397,11 @@ function LoginHome() {
     accountOperationScopeRef.current = createAccountOperationScope(authRequestGuard)
   }
   const accountOperationScope = accountOperationScopeRef.current
-  const liveOperationScopeRef = useRef(null)
-  if (!liveOperationScopeRef.current) {
-    liveOperationScopeRef.current = createAccountOperationScope(authRequestGuard)
+  const realtimeOperationScopeRef = useRef(null)
+  if (!realtimeOperationScopeRef.current) {
+    realtimeOperationScopeRef.current = createAccountOperationScope(authRequestGuard)
   }
-  const liveOperationScope = liveOperationScopeRef.current
+  const realtimeOperationScope = realtimeOperationScopeRef.current
   const aiContactAvatar = contacts.find((c) => c.isAi)?.avatar || '/images/fish.png'
   const aiAvatarForCall = currentUser?.ai_avatar_url || aiContactAvatar || '/images/fish.png'
   const realtimeCall = useOpenAIRealtime({
@@ -409,7 +409,7 @@ function LoginHome() {
     apiBaseUrl,
     mode: activeCall?.mode || 'ai',
     contactId: activeCall?.contactId || 'pisces-core',
-    operationScope: liveOperationScope,
+    operationScope: realtimeOperationScope,
   })
 
   const buildViewMessages = (rawMessages = []) => {
@@ -457,7 +457,7 @@ function LoginHome() {
 
   const resetAccountScopedData = () => {
     accountOperationScope.invalidate()
-    liveOperationScope.invalidate()
+    realtimeOperationScope.invalidate()
     recordingOperationRef.current = null
     aiStreamOperationRef.current = null
     assistSendOperationRef.current = null

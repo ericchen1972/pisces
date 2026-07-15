@@ -197,7 +197,7 @@ def test_router_methods_use_strict_responses_schemas_and_validate_results():
         history_messages=history,
         user_name="Bo",
         friend_name="Amy",
-        ai_name="Pisces",
+        ai_name="Convia",
         style_prompt="casual",
         relationship="friends",
     )
@@ -322,7 +322,7 @@ def test_router_methods_use_strict_responses_schemas_and_validate_results():
         {
             "model": "gpt-5.6-luna",
             "instructions": (
-                "Compose an outbound message from Bo or Pisces to Amy. "
+                "Compose an outbound message from Bo or Convia to Amy. "
                 "Relationship: friends. Style: casual. "
                 "This is the outbound structured artifact, separate from the visible AI reply."
             ),

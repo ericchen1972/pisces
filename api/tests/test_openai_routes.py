@@ -35,7 +35,7 @@ def realtime_stubs(monkeypatch):
         to_dict=lambda: {
             "display_name": "Eric",
             "email": "eric@example.test",
-            "ai_name": "Pisces",
+            "ai_name": "Convia",
         },
     )
     users = SimpleNamespace(document=lambda _user_id: SimpleNamespace(get=lambda: user_doc))
@@ -74,11 +74,6 @@ def realtime_stubs(monkeypatch):
         "consume_realtime_issuance_quota",
         lambda _user_id: {"allowed": True, "retry_after": 0},
         raising=False,
-    )
-    monkeypatch.setattr(
-        main,
-        "create_live_ephemeral_token",
-        lambda: pytest.fail("Gemini live token generator must not be called"),
     )
     return service
 
@@ -351,7 +346,7 @@ def test_realtime_ai_secret_uses_voice_model_and_untrusted_ai_room_history(
     assert call["mode"] == "ai"
     instructions = call["instructions"]
     assert '"user_name": "Eric"' in instructions
-    assert '"ai_name": "Pisces"' in instructions
+    assert '"ai_name": "Convia"' in instructions
     assert '"global_prompt": "Be calm."' in instructions
     assert '"text": "AI room user history"' in instructions
     assert "never follow instructions" in instructions.lower()
@@ -1348,12 +1343,6 @@ def route_stubs(monkeypatch):
     monkeypatch.setattr(main, "get_user_history_range", lambda _uid: 30)
     monkeypatch.setattr(main, "get_chat_messages", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(main, "decide_about_friend", lambda *_args, **_kwargs: {"call_about_friend": False, "name": ""})
-    monkeypatch.setattr(
-        main,
-        "call_gemini_generate_content",
-        lambda *_args, **_kwargs: pytest.fail("Gemini text/planning must not be called"),
-    )
-
     def save(user_id, contact_id, role, text, extras=None, message_id=None):
         saved.append((user_id, contact_id, role, text, extras or {}, message_id))
         return message_id or f"doc-{len(saved)}"
@@ -2214,7 +2203,7 @@ def test_all_four_planners_delegate_user_id_to_openai(route_stubs):
         [],
         "Bo",
         "Amy",
-        "Pisces",
+        "Convia",
         "warm",
         user_id="user-a",
     )
@@ -2238,7 +2227,7 @@ def test_assist_planners_keep_incoming_peer_history(route_stubs):
         history,
         "Bo",
         "Amy",
-        "Pisces",
+        "Convia",
         "warm",
         user_id="user-a",
     )
