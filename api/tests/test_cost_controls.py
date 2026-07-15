@@ -6,6 +6,8 @@ import pytest
 
 import main
 
+pytestmark = pytest.mark.real_openai_quota
+
 
 def test_legacy_chat_requires_verified_session_before_openai(client, monkeypatch):
     monkeypatch.setattr(

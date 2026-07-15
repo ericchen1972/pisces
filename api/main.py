@@ -180,7 +180,23 @@ def is_tester_login_enabled():
     return not bool(os.getenv("K_SERVICE"))
 
 
-SESSION_SECRET = get_config_value("SESSION_SECRET", "FLASK_SECRET_KEY", "SECRET_KEY") or "pisces-dev-secret-key"
+def resolve_session_secret():
+    environment_value = os.getenv("SESSION_SECRET")
+    configured_secret = (
+        environment_value.strip()
+        if environment_value is not None
+        else get_config_value("SESSION_SECRET", "FLASK_SECRET_KEY", "SECRET_KEY")
+    )
+    if os.getenv("K_SERVICE") and (
+        not configured_secret or configured_secret == "pisces-dev-secret-key"
+    ):
+        raise RuntimeError(
+            "SESSION_SECRET must be configured to a non-default value on Cloud Run"
+        )
+    return configured_secret or "pisces-dev-secret-key"
+
+
+SESSION_SECRET = resolve_session_secret()
 app.secret_key = SESSION_SECRET
 app.config["SESSION_COOKIE_NAME"] = "pisces_session"
 app.config["SESSION_COOKIE_HTTPONLY"] = True
@@ -3153,10 +3169,6 @@ def chat():
         return jsonify({"ok": False, "error": "message is required"}), 400
     if len(user_message) > MAX_CHAT_TEXT_CHARS:
         return jsonify({"ok": False, "error": "message is too long"}), 413
-    quota_error = enforce_openai_quota(user_id, "text")
-    if quota_error:
-        return quota_error
-
     if contact_id == "pisces-core" and has_forward_intent_in_ai_room(user_message):
         if not user_id:
             return jsonify({"error": "Please sign in first."}), 401
@@ -3227,6 +3239,13 @@ def chat():
         if not acquired:
             return jsonify({"error": "request is already in progress"}), 409
         delivery_owner = reserved_receipt["owner_token"]
+
+        quota_error = enforce_openai_quota(user_id, "text")
+        if quota_error:
+            safe_release_delivery_request(
+                user_id, "chat_forward", request_id, delivery_owner
+            )
+            return quota_error
 
         try:
             user_doc = get_firestore_client().collection("users").document(user_id).get()
@@ -3540,6 +3559,9 @@ def chat():
             )
         )
 
+    quota_error = enforce_openai_quota(user_id, "text")
+    if quota_error:
+        return quota_error
     ai_settings = get_user_ai_settings(user_id)
     history_range = get_user_history_range(user_id)
     history_messages = get_chat_messages(user_id, contact_id, history_range=history_range)
@@ -3663,9 +3685,6 @@ def chat_stream():
         return jsonify({"error": "contact_id is required"}), 400
     if len(user_message) > MAX_CHAT_TEXT_CHARS:
         return jsonify({"ok": False, "error": "message is too long"}), 413
-    quota_error = enforce_openai_quota(user_id, "text")
-    if quota_error:
-        return quota_error
     try:
         request_id = validate_request_id(body.get("request_id"))
     except ValueError as exc:
@@ -3725,6 +3744,11 @@ def chat_stream():
     if not acquired:
         return jsonify({"error": "request is already in progress"}), 409
     owner_token = reserved_receipt["owner_token"]
+
+    quota_error = enforce_openai_quota(user_id, "text")
+    if quota_error:
+        safe_release_stream_request(user_id, request_id, owner_token)
+        return quota_error
 
     try:
         extra_context_text = ""
@@ -5103,10 +5127,6 @@ def send_voice_message():
     except AudioInputError as exc:
         return jsonify({"ok": False, "error": str(exc)}), exc.status
 
-    quota_error = enforce_openai_quota(sender_user_id, "transcription")
-    if quota_error:
-        return quota_error
-
     payload_hash = delivery_payload_hash(
         recipient_user_id,
         {
@@ -5139,6 +5159,14 @@ def send_voice_message():
         if not acquired:
             return jsonify({"ok": False, "error": "request is already in progress"}), 409
         delivery_owner = reserved["owner_token"]
+
+    quota_error = enforce_openai_quota(sender_user_id, "transcription")
+    if quota_error:
+        if delivery_owner:
+            safe_release_delivery_request(
+                sender_user_id, route_name, request_id, delivery_owner
+            )
+        return quota_error
 
     try:
         transcript = transcribe_audio_bytes(
@@ -5335,10 +5363,6 @@ def assist_message():
         return jsonify({"ok": False, "error": "assist mode is only for friend chats"}), 400
     if len(user_message) > MAX_CHAT_TEXT_CHARS:
         return jsonify({"ok": False, "error": "message is too long"}), 413
-    quota_error = enforce_openai_quota(user_id, "text")
-    if quota_error:
-        return quota_error
-
     try:
         request_id = validate_request_id(body.get("request_id"))
     except ValueError as exc:
@@ -5414,6 +5438,13 @@ def assist_message():
         if not acquired:
             return jsonify({"ok": False, "error": "request is already in progress"}), 409
         delivery_owner = reserved_receipt["owner_token"]
+
+        quota_error = enforce_openai_quota(user_id, "text")
+        if quota_error:
+            safe_release_delivery_request(
+                user_id, "assist_message", request_id, delivery_owner
+            )
+            return quota_error
 
         user_doc = get_firestore_client().collection("users").document(user_id).get()
         user_data = user_doc.to_dict() if user_doc.exists else {}

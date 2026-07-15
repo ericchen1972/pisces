@@ -69,9 +69,9 @@ Every OpenAI-backed route requires an authenticated server session and applies a
 | Text-to-speech | 20 | 120 |
 | Realtime session issuance | 3 | 20 |
 
-Rejected requests return HTTP `429`, a `Retry-After` header, and a stable JSON error. Quota storage failures fail closed with HTTP `503`. A provider attempt consumes quota even when the provider later fails.
+Rejected requests return HTTP `429`, a `Retry-After` header, and a stable JSON error. Quota storage failures fail closed with HTTP `503`. A provider owner consumes quota once immediately before its provider attempt, even when the provider later fails. Completed idempotent replays and concurrent request losers do not consume quota; a quota rejection releases the request lease so the same request can be retried later.
 
-Text chat and assist input is limited to 20,000 characters, direct TTS input is capped at 4,096 characters (with tighter product read-aloud limits where applicable), and decoded audio is capped at 10 MiB. Validation happens before quota consumption and provider calls.
+Text chat and assist input is limited to 20,000 characters, direct TTS input is capped at 4,096 characters (with tighter product read-aloud limits where applicable), and decoded audio is capped at 10 MiB. Authentication, schema/input checks, request-ID conflicts and completed replays, contact existence, and friendship validation happen before quota consumption and provider calls.
 
 ## Local development
 

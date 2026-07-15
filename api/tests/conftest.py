@@ -13,6 +13,13 @@ os.environ.setdefault("SESSION_SECRET", "test-secret")
 import main  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolate_openai_quota(monkeypatch, request):
+    if request.node.get_closest_marker("real_openai_quota"):
+        return
+    monkeypatch.setattr(main, "enforce_openai_quota", lambda *_args, **_kwargs: None)
+
+
 @pytest.fixture
 def app():
     main.app.config.update(TESTING=True, SECRET_KEY="test-secret")

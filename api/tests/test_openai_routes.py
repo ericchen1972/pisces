@@ -2012,6 +2012,8 @@ def test_assist_processing_duplicate_has_no_provider_or_blob_side_effects(
     signed_in_client, route_stubs, monkeypatch
 ):
     service, saved = route_stubs
+    quota_calls = []
+    monkeypatch.setattr(main, "enforce_openai_quota", lambda *args: quota_calls.append(args) or None)
     request_id = "assist-active-owner"
     message = "Send Amy a voice message"
     service.receipts[("user-a", "assist_message", request_id)] = {
@@ -2039,12 +2041,15 @@ def test_assist_processing_duplicate_has_no_provider_or_blob_side_effects(
     assert response.status_code == 409
     assert service.calls == []
     assert saved == []
+    assert quota_calls == []
 
 
 def test_ai_forward_processing_duplicate_has_no_provider_or_media_side_effects(
     signed_in_client, forwarding_stubs, monkeypatch
 ):
     service, saved, published = forwarding_stubs
+    quota_calls = []
+    monkeypatch.setattr(main, "enforce_openai_quota", lambda *args: quota_calls.append(args) or None)
     request_id = "forward-active-owner"
     message = "Tell Amy hello"
     service.receipts[("user-a", "chat_forward", request_id)] = {
@@ -2068,6 +2073,7 @@ def test_ai_forward_processing_duplicate_has_no_provider_or_media_side_effects(
     assert service.calls == []
     assert saved == []
     assert published == []
+    assert quota_calls == []
 
 
 def test_ai_forward_confirmation_upload_failure_is_text_only_and_replay_identical(
@@ -3291,9 +3297,11 @@ def test_chat_stream_long_reply_skips_tts_audio(
 
 
 def test_chat_stream_completed_retry_replays_done_and_mismatch_conflicts(
-    signed_in_client, route_stubs
+    signed_in_client, route_stubs, monkeypatch
 ):
     service, saved = route_stubs
+    quota_calls = []
+    monkeypatch.setattr(main, "enforce_openai_quota", lambda *args: quota_calls.append(args) or None)
     payload = {"message": "hello", "contact_id": "pisces-core", "request_id": "complete-1"}
     first = signed_in_client.post("/api/chat/stream", json=payload)
     first_lines = [json.loads(line) for line in first.get_data(as_text=True).splitlines()]
@@ -3318,6 +3326,33 @@ def test_chat_stream_completed_retry_replays_done_and_mismatch_conflicts(
     assert len(service.calls) == calls_after_first
     assert len(saved) == saved_after_first
     assert mismatch.status_code == 409
+    assert quota_calls == [("user-a", "text")]
+
+
+def test_chat_stream_quota_rejection_releases_owner_for_retry(
+    signed_in_client, route_stubs, monkeypatch
+):
+    service, _saved = route_stubs
+    attempts = []
+
+    def quota(*args):
+        attempts.append(args)
+        if len(attempts) == 1:
+            return main.jsonify({"ok": False, "error": "openai_rate_limit_exceeded"}), 429
+        return None
+
+    monkeypatch.setattr(main, "enforce_openai_quota", quota)
+    payload = {"message": "hello", "contact_id": "pisces-core", "request_id": "quota-retry-1"}
+
+    blocked = signed_in_client.post("/api/chat/stream", json=payload)
+    retry = signed_in_client.post("/api/chat/stream", json=payload)
+    retry_lines = [json.loads(line) for line in retry.get_data(as_text=True).splitlines()]
+
+    assert blocked.status_code == 429
+    assert retry.status_code == 200
+    assert retry_lines[-1]["type"] == "done"
+    assert attempts == [("user-a", "text"), ("user-a", "text")]
+    assert any(name == "stream_text" for name, _kwargs in service.calls)
 
 
 def test_chat_stream_completed_spoken_retry_replays_delta_audio_done(
