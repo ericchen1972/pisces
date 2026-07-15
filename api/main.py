@@ -711,6 +711,10 @@ def get_gemini_api_key():
     return get_config_value("GOOGLE_API_KEY", "GEMINI_API_KEY")
 
 
+def get_openai_api_key():
+    return get_config_value("OPENAI_KEY", "OPENAI_API_KEY")
+
+
 def get_blob_rw_token():
     return get_config_value("BLOB_READ_WRITE_TOKEN", "spices_READ_WRITE_TOKEN", "VITE_BLOB_READ_WRITE_TOKEN")
 

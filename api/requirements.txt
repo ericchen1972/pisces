@@ -1,6 +1,8 @@
 flask
+openai
 google-cloud-firestore
 google-cloud-speech
 google-genai
 ably
 websockets>=13.0,<15.1
+pytest
