@@ -10,7 +10,7 @@ afterEach(() => {
 describe('AiCallOverlay', () => {
   it('renders the AI voice disclosure and call controls', () => {
     const onHangUp = vi.fn()
-    render(<AiCallOverlay locale="en" name="Convia AI" avatar="/ai.png" status="connected" elapsedSeconds={62} onHangUp={onHangUp} />)
+    render(<AiCallOverlay locale="en" name="Convia" avatar="/ai.png" status="connected" elapsedSeconds={62} onHangUp={onHangUp} />)
     expect(screen.getByText('1:02')).toBeInTheDocument()
     expect(screen.getByText('AI-generated voice')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Hang up' }))
@@ -19,14 +19,14 @@ describe('AiCallOverlay', () => {
 
   it('offers an explicit retry after microphone permission denial', () => {
     const onRetry = vi.fn()
-    render(<AiCallOverlay locale="en" name="Convia AI" status="error" error={{ code: 'microphone_denied' }} onRetry={onRetry} />)
+    render(<AiCallOverlay locale="en" name="Convia" status="error" error={{ code: 'microphone_denied' }} onRetry={onRetry} />)
     expect(screen.getByText('Microphone access is required.')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Try again' }))
     expect(onRetry).toHaveBeenCalledOnce()
   })
 
   it('does not expose a raw English realtime error in zh-TW', () => {
-    render(<AiCallOverlay locale="zh-TW" name="Convia AI" status="error" error={new Error('Realtime transport failed')} />)
+    render(<AiCallOverlay locale="zh-TW" name="Convia" status="error" error={new Error('Realtime transport failed')} />)
     expect(screen.getByText('語音通話連線失敗。')).toBeInTheDocument()
     expect(screen.queryByText('Realtime transport failed')).not.toBeInTheDocument()
   })
@@ -40,7 +40,7 @@ describe('AiCallOverlay', () => {
     rerender(
       <>
         <button type="button">Before call</button>
-        <AiCallOverlay locale="en" name="Convia AI" status="connected" onHangUp={onHangUp} />
+        <AiCallOverlay locale="en" name="Convia" status="connected" onHangUp={onHangUp} />
       </>,
     )
 
@@ -68,12 +68,12 @@ describe('AiCallOverlay', () => {
 
   it('resets the call timer when a retry starts connecting', () => {
     vi.useFakeTimers()
-    const { rerender } = render(<AiCallOverlay locale="en" name="Convia AI" status="connected" />)
+    const { rerender } = render(<AiCallOverlay locale="en" name="Convia" status="connected" />)
     act(() => vi.advanceTimersByTime(2_000))
     expect(screen.getByText('0:02')).toBeInTheDocument()
 
-    rerender(<AiCallOverlay locale="en" name="Convia AI" status="connecting" />)
-    rerender(<AiCallOverlay locale="en" name="Convia AI" status="connected" />)
+    rerender(<AiCallOverlay locale="en" name="Convia" status="connecting" />)
+    rerender(<AiCallOverlay locale="en" name="Convia" status="connected" />)
 
     expect(screen.getByText('0:00')).toBeInTheDocument()
     act(() => vi.advanceTimersByTime(1_000))

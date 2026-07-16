@@ -43,7 +43,7 @@ export default function MessageRow({ message, locale = 'en', onImageClick, onRet
     <article className={`message-row message-row--${isUser ? 'outgoing' : 'incoming'} message-row--${message.role}`} data-status={message.status || undefined}>
       {isAssist ? (
         <div className="message-row__private-label">
-          {locale === 'zh-TW' ? 'Convia AI · 只有你看得到' : 'Convia AI · Only visible to you'}
+          {locale === 'zh-TW' ? 'Convia · 只有你看得到' : 'Convia · Only visible to you'}
         </div>
       ) : isAssistUser ? (
         <div className="message-row__private-label">{locale === 'zh-TW' ? '只有你看得到' : 'Only visible to you'}</div>

@@ -31,8 +31,8 @@ describe('MessageRow', () => {
   })
 
   it.each([
-    ['en', 'Convia AI · Only visible to you'],
-    ['zh-TW', 'Convia AI · 只有你看得到'],
+    ['en', 'Convia · Only visible to you'],
+    ['zh-TW', 'Convia · 只有你看得到'],
   ])('localizes the private Assist label for %s', (locale, label) => {
     render(<MessageRow locale={locale} message={{ id: '1', role: 'assist_ai', text: 'Private' }} />)
     expect(screen.getByText(label)).toBeInTheDocument()

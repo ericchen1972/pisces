@@ -4,8 +4,8 @@ import { groupContacts } from '../../lib/chatState.js'
 import ContactGroup, { ContactAvatar, UnreadBadge } from './ContactGroup.jsx'
 
 const COPY = {
-  en: { contacts: 'Contacts', add: 'Add friend', ai: 'Chat with Convia AI', settings: 'Settings' },
-  'zh-TW': { contacts: '聯絡人', add: '新增好友', ai: '與 Convia AI 聊天', settings: '設定' },
+  en: { contacts: 'Contacts', add: 'Add friend', ai: 'Chat with Convia', settings: 'Settings' },
+  'zh-TW': { contacts: '聯絡人', add: '新增好友', ai: '與 Convia 聊天', settings: '設定' },
 }
 
 function AiAvatar({ contact }) {
@@ -13,7 +13,7 @@ function AiAvatar({ contact }) {
   const configured = contact.avatar_url || contact.avatar || ''
   useEffect(() => setConfiguredFailed(false), [configured])
   const source = configured && !configuredFailed ? configured : '/images/fish.png'
-  return <img className="contact-avatar contact-avatar--ai" src={source} alt="Convia AI" onError={() => { if (configured) setConfiguredFailed(true) }} />
+  return <img className="contact-avatar contact-avatar--ai" src={source} alt="Convia" onError={() => { if (configured) setConfiguredFailed(true) }} />
 }
 
 export default function ContactSidebar({
@@ -36,7 +36,7 @@ export default function ContactSidebar({
   const orderedGroups = [...groups].sort((left, right) => (left.sort_order ?? 0) - (right.sort_order ?? 0))
   const grouped = groupContacts(orderedGroups, contacts, defaultGroupId)
   const aiUnread = unreadByContact['pisces-core'] || 0
-  const aiContact = contacts.find((contact) => contact.isAi || contact.id === 'pisces-core') || { id: 'pisces-core', name: 'Convia AI', isAi: true }
+  const aiContact = contacts.find((contact) => contact.isAi || contact.id === 'pisces-core') || { id: 'pisces-core', name: 'Convia', isAi: true }
 
   return (
     <nav className="contact-sidebar" aria-label={copy.contacts}>
@@ -56,8 +56,8 @@ export default function ContactSidebar({
         onClick={() => onSelectContact?.(aiContact)}
       >
         <AiAvatar contact={aiContact} />
-        <span className="contact-row__copy"><strong>Convia AI</strong></span>
-        <UnreadBadge count={aiUnread} label={locale === 'zh-TW' ? `Convia AI 有 ${aiUnread} 則未讀訊息` : `${aiUnread} unread messages from Convia AI`} />
+        <span className="contact-row__copy"><strong>Convia</strong></span>
+        <UnreadBadge count={aiUnread} label={locale === 'zh-TW' ? `Convia 有 ${aiUnread} 則未讀訊息` : `${aiUnread} unread messages from Convia`} />
       </button>
 
       <div className="contact-sidebar__groups">

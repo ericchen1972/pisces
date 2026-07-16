@@ -1702,10 +1702,7 @@ function LoginHome() {
               requireSuccessfulVoiceResponse(res, data)
               recordedObjectUrlsRef.current.release(audioUrl)
               const aiText = data.reply || t('AI returned an empty reply.', 'AI 沒有回傳內容。')
-              const aiAudioUrl =
-                data.audio_base64
-                  ? `data:${data.audio_mime_type || 'audio/wav'};base64,${data.audio_base64}`
-                  : ''
+              const aiAudioUrl = ''
               const aiImageUrl = data.image_url || ''
               const aiMusicUrl = data.music_url || ''
 
@@ -2301,10 +2298,10 @@ function ChatTestLab() {
     <main className="utility-page">
       <section className="utility-card">
         <button type="button" onClick={() => navigateTo('/')}>{t('Back to Convia', '返回 Convia')}</button>
-        <h1>{t('Convia AI test lab', 'Convia AI 測試頁')}</h1>
+        <h1>{t('Convia test lab', 'Convia 測試頁')}</h1>
         <p className="form-help">{t('Backend endpoint:', '後端端點：')} {apiBaseUrl}</p>
         <form className="form-stack" onSubmit={onSubmit}>
-          <label><span>{t('Message', '訊息')}</span><textarea rows={5} value={message} onChange={(event) => setMessage(event.target.value)} placeholder={t('Type a message for Convia AI…', '輸入要給 Convia AI 的訊息…')} /></label>
+          <label><span>{t('Message', '訊息')}</span><textarea rows={5} value={message} onChange={(event) => setMessage(event.target.value)} placeholder={t('Type a message for Convia…', '輸入要給 Convia 的訊息…')} /></label>
           <button type="submit" className="primary-button" disabled={isLoading}>{isLoading ? t('Sending…', '送出中…') : t('Send to AI', '送給 AI')}</button>
         </form>
         <section>

@@ -35,11 +35,11 @@ describe('ContactSidebar', () => {
 
     const navigation = screen.getByRole('navigation', { name: 'Contacts' })
     expect(navigation).toHaveTextContent('Convia')
-    expect(screen.getByRole('button', { name: 'Chat with Convia AI' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Chat with Convia' })).toBeInTheDocument()
     expect(screen.getByLabelText('Family, 5 unread messages')).toBeInTheDocument()
     expect(screen.getByLabelText('Ben, 3 unread messages')).toBeInTheDocument()
     const buttons = screen.getAllByRole('button')
-    expect(buttons.indexOf(screen.getByRole('button', { name: 'Chat with Convia AI' }))).toBeLessThan(
+    expect(buttons.indexOf(screen.getByRole('button', { name: 'Chat with Convia' }))).toBeLessThan(
       buttons.indexOf(screen.getByRole('button', { name: 'Ben, 3 unread messages' })),
     )
     expect(screen.getByText('Ben').compareDocumentPosition(screen.getByText('Amy Adams')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
@@ -60,19 +60,19 @@ describe('ContactSidebar', () => {
     expect(screen.getByRole('img', { name: 'Amy Adams' })).toHaveAttribute('src', 'https://lh3.googleusercontent.com/new')
   })
 
-  it('renders the configured Convia AI avatar and the bundled AI fallback', () => {
-    const configuredAi = { id: 'pisces-core', name: 'Convia AI', isAi: true, avatar: '/images/custom-ai.webp' }
+  it('renders the configured Convia avatar and the bundled AI fallback', () => {
+    const configuredAi = { id: 'pisces-core', name: 'Convia', isAi: true, avatar: '/images/custom-ai.webp' }
     const { rerender } = render(<ContactSidebar locale="en" groups={groups} contacts={[configuredAi]} defaultGroupId="friends" />)
-    const aiAvatar = screen.getByRole('img', { name: 'Convia AI' })
+    const aiAvatar = screen.getByRole('img', { name: 'Convia' })
     expect(aiAvatar).toHaveAttribute('src', '/images/custom-ai.webp')
     fireEvent.error(aiAvatar)
-    expect(screen.getByRole('img', { name: 'Convia AI' })).toHaveAttribute('src', '/images/fish.png')
+    expect(screen.getByRole('img', { name: 'Convia' })).toHaveAttribute('src', '/images/fish.png')
 
     rerender(<ContactSidebar locale="en" groups={groups} contacts={[{ ...configuredAi, avatar: '/images/new-ai.webp' }]} defaultGroupId="friends" />)
-    expect(screen.getByRole('img', { name: 'Convia AI' })).toHaveAttribute('src', '/images/new-ai.webp')
+    expect(screen.getByRole('img', { name: 'Convia' })).toHaveAttribute('src', '/images/new-ai.webp')
 
     rerender(<ContactSidebar locale="en" groups={groups} contacts={[]} defaultGroupId="friends" />)
-    expect(screen.getByRole('img', { name: 'Convia AI' })).toHaveAttribute('src', '/images/fish.png')
+    expect(screen.getByRole('img', { name: 'Convia' })).toHaveAttribute('src', '/images/fish.png')
   })
 
   it('uses initials, never the AI fish fallback, when a real contact has no Google avatar', () => {
@@ -104,7 +104,7 @@ describe('ContactSidebar', () => {
     const onDeleteContact = vi.fn().mockResolvedValue(true)
     render(<ContactSidebar locale="en" groups={groups} contacts={contacts.slice(0, 1)} defaultGroupId="friends" onEditContact={onEditContact} onMoveContact={() => {}} onDeleteContact={onDeleteContact} />)
 
-    expect(screen.queryByRole('button', { name: 'Contact options for Convia AI' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Contact options for Convia' })).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Contact options for Amy Adams' }))
     await user.click(screen.getByRole('menuitem', { name: 'Edit Amy Adams' }))
     expect(onEditContact).toHaveBeenCalledWith(expect.objectContaining({ id: 'a' }))
@@ -172,8 +172,8 @@ describe('ContactSidebar', () => {
   })
 
   it('localizes AI unread and avatar fallback accessibility copy in zh-TW', () => {
-    render(<ContactSidebar locale="zh-TW" groups={groups} contacts={[{ ...contacts[0], avatar_url: '' }, { id: 'pisces-core', name: 'Convia AI', isAi: true }]} unreadByContact={{ a: 1, 'pisces-core': 2 }} defaultGroupId="friends" />)
-    expect(screen.getByLabelText('Convia AI 有 2 則未讀訊息')).toBeInTheDocument()
+    render(<ContactSidebar locale="zh-TW" groups={groups} contacts={[{ ...contacts[0], avatar_url: '' }, { id: 'pisces-core', name: 'Convia', isAi: true }]} unreadByContact={{ a: 1, 'pisces-core': 2 }} defaultGroupId="friends" />)
+    expect(screen.getByLabelText('Convia 有 2 則未讀訊息')).toBeInTheDocument()
     expect(screen.getByLabelText('Amy Adams 頭像')).toHaveTextContent('AA')
     expect(screen.getByLabelText('Family，1 則未讀訊息')).toBeInTheDocument()
     expect(screen.getByLabelText('Amy Adams，1 則未讀訊息')).toBeInTheDocument()

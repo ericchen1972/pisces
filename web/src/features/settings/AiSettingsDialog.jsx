@@ -2,7 +2,7 @@ import { useEffect } from 'react'
 import Dialog from '../../components/Dialog.jsx'
 
 export const OPENAI_VOICE_OPTIONS = ['alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse', 'marin', 'cedar']
-export const VOICE_PREVIEW_TEXT = { en: 'Hello, I am your Convia AI voice.', 'zh-TW': '你好，我是 Convia 的 AI 語音。' }
+export const VOICE_PREVIEW_TEXT = { en: 'Hello, I am Convia.', 'zh-TW': '你好，我是 Convia。' }
 
 export default function AiSettingsDialog({ open, locale = 'en', form, error, saving, uploading, preparingAvatar = false, avatarInputRef, onFormChange, onAvatarPick, onSave, onClose }) {
   const zh = locale === 'zh-TW'
@@ -16,10 +16,10 @@ export default function AiSettingsDialog({ open, locale = 'en', form, error, sav
   const busy = Boolean(locked || preparingAvatar)
   const update = (key) => (event) => onFormChange({ ...form, [key]: event.target.value })
   return (
-    <Dialog open={open} title={zh ? 'Convia AI 設定' : 'Convia AI settings'} onClose={locked ? undefined : onClose} closeOnBackdrop={!locked} showCloseButton={!locked} closeLabel={zh ? '關閉 AI 設定' : 'Close AI settings'}>
+    <Dialog open={open} title={zh ? 'Convia 設定' : 'Convia settings'} onClose={locked ? undefined : onClose} closeOnBackdrop={!locked} showCloseButton={!locked} closeLabel={zh ? '關閉 Convia 設定' : 'Close Convia settings'}>
       <div className="form-stack">
         <div className="profile-editor profile-editor--ai">
-          <button type="button" className="avatar-picker" onClick={() => avatarInputRef?.current?.click()} disabled={busy} aria-label={zh ? '更換 AI 頭像' : 'Replace AI avatar'}><img src={form.avatar} alt={zh ? 'Convia AI 頭像' : 'Convia AI avatar'} /></button>
+          <button type="button" className="avatar-picker" onClick={() => avatarInputRef?.current?.click()} disabled={busy} aria-label={zh ? '更換 Convia 頭像' : 'Replace Convia avatar'}><img src={form.avatar} alt={zh ? 'Convia 頭像' : 'Convia avatar'} /></button>
           <strong>Convia</strong>
         </div>
         <label><span>{zh ? '全域提示' : 'Global prompt'}</span><textarea disabled={busy} rows="5" value={form.globalPrompt || ''} onChange={update('globalPrompt')} /></label>

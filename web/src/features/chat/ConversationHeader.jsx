@@ -15,7 +15,7 @@ export default function ConversationHeader({ contact, locale = 'en', onBack, onC
         <BackIcon size={22} />
       </button>
       <ContactAvatar contact={contact} />
-      <div><strong>{contact.name}</strong>{contact.isAi ? <span>Convia AI</span> : null}</div>
+      <div><strong>{contact.name}</strong>{contact.isAi ? <span>Convia</span> : null}</div>
       <button type="button" className="icon-button conversation-header__edit" onClick={() => onEdit?.(contact)} aria-label={zh ? `編輯 ${contact.name}` : `Edit ${contact.name}`}>
         <EditIcon size={19} />
       </button>

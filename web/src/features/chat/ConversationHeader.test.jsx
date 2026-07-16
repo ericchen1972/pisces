@@ -24,13 +24,13 @@ describe('ConversationHeader', () => {
 
   it('keeps the AI call enabled', () => {
     const onCall = vi.fn()
-    render(<ConversationHeader contact={{ id: 'pisces-core', name: 'Convia AI', isAi: true }} onCall={onCall} />)
+    render(<ConversationHeader contact={{ id: 'pisces-core', name: 'Convia', isAi: true }} onCall={onCall} />)
     fireEvent.click(screen.getByRole('button', { name: 'Voice call' }))
     expect(onCall).toHaveBeenCalledOnce()
   })
 
   it.each([
-    [{ id: 'pisces-core', name: 'Convia AI', isAi: true }, 'Edit Convia AI'],
+    [{ id: 'pisces-core', name: 'Convia', isAi: true }, 'Edit Convia'],
     [{ id: 'friend', name: 'Amy', isAi: false }, 'Edit Amy'],
   ])('opens settings for every contact type', (contact, label) => {
     const onEdit = vi.fn()

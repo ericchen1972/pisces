@@ -10,7 +10,7 @@ function formatDuration(seconds) {
 
 export default function AiCallOverlay({
   locale = 'en',
-  name = 'Convia AI',
+  name = 'Convia',
   avatar = '',
   status = 'connecting',
   error,
@@ -52,7 +52,7 @@ export default function AiCallOverlay({
 
   return createPortal(
     <div ref={modalRootRef} className="ai-call-overlay">
-      <section ref={dialogRef} className="ai-call-card" role="dialog" aria-modal="true" aria-label={zh ? 'Convia AI 語音通話' : 'Convia AI voice call'} tabIndex={-1} onKeyDown={onKeyDown}>
+      <section ref={dialogRef} className="ai-call-card" role="dialog" aria-modal="true" aria-label={zh ? 'Convia 語音通話' : 'Convia voice call'} tabIndex={-1} onKeyDown={onKeyDown}>
         <div className="ai-call-card__identity">
           {avatar ? <img src={avatar} alt="" className="ai-call-card__avatar" /> : <div className="ai-call-card__avatar ai-call-card__avatar--fallback" aria-hidden="true">C</div>}
           <h2>{name}</h2>
