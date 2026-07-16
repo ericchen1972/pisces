@@ -1986,11 +1986,11 @@ def test_shared_convia_wait_timeout_durably_wins_over_late_owner_success(
         owner_token="slow-owner",
         lease_expires_at=main.datetime.now(main.timezone.utc)
         + main.timedelta(seconds=300),
+        shared_wait_deadline_at=main.datetime.now(main.timezone.utc)
+        - main.timedelta(seconds=1),
         friendship_generation=generation,
         contact_id="user-b",
     )
-    monkeypatch.setattr(main, "SHARED_AI_WAIT_ATTEMPTS", 1)
-    monkeypatch.setattr(main, "SHARED_AI_WAIT_SECONDS", 0)
     monkeypatch.setattr(
         main,
         "enforce_openai_quota",
@@ -2111,6 +2111,214 @@ def test_shared_convia_fetches_enough_candidates_before_selecting_newest_50(
     assert selected[0]["text"] == "shared-20"
     assert selected[-1]["text"] == "shared-69"
     assert all(not item["text"].startswith("private-") for item in selected)
+
+
+@pytest.mark.parametrize("failure_stage", ["profile", "settings", "friendship"])
+def test_shared_convia_post_acquisition_read_failures_complete_generic_receipt(
+    signed_in_client, monkeypatch, failure_stage
+):
+    firestore = _shared_convia_firestore(monkeypatch)
+    private_detail = f"private-{failure_stage}-read-detail"
+    provider_calls = []
+    monkeypatch.setattr(
+        main,
+        "generate_shared_convia_text",
+        lambda **kwargs: provider_calls.append(kwargs) or "generated before recheck",
+    )
+    if failure_stage == "profile":
+        monkeypatch.setattr(
+            main,
+            "get_shared_ai_participant_names",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError(private_detail)),
+            raising=False,
+        )
+    elif failure_stage == "settings":
+        monkeypatch.setattr(
+            main,
+            "get_user_ai_settings",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError(private_detail)),
+        )
+    else:
+        real_generation = main.current_friendship_generation
+        calls = []
+
+        def fail_second_generation_read(*args):
+            calls.append(True)
+            if len(calls) > 1:
+                raise RuntimeError(private_detail)
+            return real_generation(*args)
+
+        monkeypatch.setattr(
+            main, "current_friendship_generation", fail_second_generation_read
+        )
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *_args: None)
+    payload = {
+        "recipient_user_id": "user-b",
+        "text": f"Convia fail {failure_stage} safely",
+        "request_id": f"mention-read-failure-{failure_stage}",
+    }
+
+    first = signed_in_client.post("/api/messages/send", json=payload)
+    second = signed_in_client.post("/api/messages/send", json=payload)
+
+    assert first.status_code == second.status_code == 200
+    assert first.get_json() == second.get_json()
+    assert first.get_json()["convia_error"] == "convia_unavailable"
+    assert private_detail not in first.get_data(as_text=True)
+    receipt_id = main.hashlib.sha256(
+        f"shared_ai_mention:{payload['request_id']}".encode()
+    ).hexdigest()
+    receipt = firestore.read(
+        f"users/user-a/delivery_receipts/{receipt_id}"
+    )
+    assert receipt["state"] == "completed"
+    assert private_detail not in repr(receipt)
+    assert len(provider_calls) == (1 if failure_stage == "friendship" else 0)
+
+
+@pytest.mark.parametrize("failure_stage", ["claim", "finalize"])
+def test_shared_convia_publication_storage_failure_keeps_durable_success_replayable(
+    signed_in_client, monkeypatch, failure_stage
+):
+    firestore = _shared_convia_firestore(monkeypatch)
+    monkeypatch.setattr(
+        main,
+        "generate_shared_convia_text",
+        lambda **_kwargs: "durable despite publication storage failure",
+    )
+    published = []
+    monkeypatch.setattr(
+        main,
+        "publish_user_channel_message",
+        lambda uid, payload: published.append((uid, payload)),
+    )
+    private_detail = f"private-{failure_stage}-firestore-detail"
+    if failure_stage == "claim":
+        real_claim = main._claim_shared_ai_publish_target
+        failures = []
+
+        def fail_first_claim(*args, **kwargs):
+            if not failures:
+                failures.append(True)
+                raise RuntimeError(private_detail)
+            return real_claim(*args, **kwargs)
+
+        monkeypatch.setattr(main, "_claim_shared_ai_publish_target", fail_first_claim)
+    else:
+        real_finish = main._finish_shared_ai_publish_target
+        failures = []
+
+        def fail_first_finalize(*args, **kwargs):
+            if not failures:
+                failures.append(True)
+                raise RuntimeError(private_detail)
+            return real_finish(*args, **kwargs)
+
+        monkeypatch.setattr(main, "_finish_shared_ai_publish_target", fail_first_finalize)
+    logged = []
+    monkeypatch.setattr(
+        main,
+        "log_tool_error",
+        lambda *args, **kwargs: logged.append((args, kwargs)),
+    )
+    payload = {
+        "recipient_user_id": "user-b",
+        "text": f"Convia publication {failure_stage}",
+        "request_id": f"mention-publication-{failure_stage}",
+    }
+
+    first = signed_in_client.post("/api/messages/send", json=payload)
+
+    assert first.status_code == 200
+    assert first.get_json()["convia_message"]["text"].startswith("durable")
+    assert first.get_json()["realtime_delivered"] is False
+    assert private_detail not in first.get_data(as_text=True)
+    ai_id = first.get_json()["convia_message"]["message_id"]
+    assert firestore.read(f"users/user-a/chats/user-b/messages/{ai_id}") is not None
+    assert firestore.read(f"users/user-b/chats/user-a/messages/{ai_id}") is not None
+    assert logged and private_detail not in repr(logged)
+
+    receipt_id = main.hashlib.sha256(
+        f"shared_ai_mention:{payload['request_id']}".encode()
+    ).hexdigest()
+    receipt_path = f"users/user-a/delivery_receipts/{receipt_id}"
+    receipt = firestore.read(receipt_path)
+    for target in ("caller", "recipient"):
+        lease_field = f"publish_{target}_lease_expires_at"
+        if lease_field in receipt:
+            receipt[lease_field] = main.datetime.now(main.timezone.utc) - main.timedelta(seconds=1)
+
+    replay = signed_in_client.post("/api/messages/send", json=payload)
+    assert replay.status_code == 200
+    assert replay.get_json()["convia_message"]["message_id"] == ai_id
+    assert firestore.read(receipt_path)["published_to_caller"] is True
+    assert firestore.read(receipt_path)["published_to_recipient"] is True
+
+
+def test_shared_convia_active_duplicate_returns_pending_with_bounded_reads(
+    monkeypatch
+):
+    firestore = _shared_convia_firestore(monkeypatch)
+    request_id = "mention-active-pending"
+    generation = "accepted_at:generation-1"
+    original_text = "Convia still working"
+    human_response = {
+        "ok": True,
+        "message": {"message_id": "human-pending", "text": original_text},
+    }
+    direct_receipt_id = main.hashlib.sha256(
+        f"direct_text:{request_id}".encode()
+    ).hexdigest()
+    firestore.seed(
+        f"users/user-a/delivery_receipts/{direct_receipt_id}",
+        state="completed",
+        friendship_generation=generation,
+        response=human_response,
+    )
+    payload_hash = main.shared_ai_payload_hash(
+        "user-a", "user-b", request_id, original_text, generation
+    )
+    mention_receipt_id = main.hashlib.sha256(
+        f"shared_ai_mention:{request_id}".encode()
+    ).hexdigest()
+    mention_receipt_path = f"users/user-a/delivery_receipts/{mention_receipt_id}"
+    firestore.seed(
+        mention_receipt_path,
+        state="processing",
+        payload_hash=payload_hash,
+        owner_token="active-owner",
+        lease_expires_at=main.datetime.now(main.timezone.utc) + main.timedelta(seconds=300),
+        shared_wait_deadline_at=main.datetime.now(main.timezone.utc) + main.timedelta(seconds=30),
+        friendship_generation=generation,
+        contact_id="user-b",
+    )
+    real_get = main.get_delivery_receipt
+    shared_reads = []
+
+    def counted_get(user_id, route_name, replay_request_id):
+        if route_name == main.SHARED_AI_ROUTE:
+            shared_reads.append(True)
+        return real_get(user_id, route_name, replay_request_id)
+
+    monkeypatch.setattr(main, "get_delivery_receipt", counted_get)
+    monkeypatch.setattr(
+        main,
+        "enforce_openai_quota",
+        lambda *_args: pytest.fail("duplicate must not consume quota"),
+    )
+
+    response = main.complete_shared_convia_invocation(
+        sender_user_id="user-a",
+        recipient_user_id="user-b",
+        request_id=request_id,
+        original_text=original_text,
+        human_response=human_response,
+        idempotent=True,
+    )
+
+    assert response == {**human_response, "convia_error": "convia_in_progress"}
+    assert len(shared_reads) <= 1
+    assert firestore.read(mention_receipt_path)["state"] == "processing"
 
 
 def test_two_shared_convia_callers_use_their_own_prompts(app, monkeypatch):

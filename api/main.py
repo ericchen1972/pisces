@@ -8,7 +8,6 @@ import asyncio
 import uuid
 import math
 import secrets
-import time
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
 from urllib import error, request
@@ -5344,8 +5343,8 @@ def ably_token():
 
 SHARED_AI_ROUTE = "shared_ai_mention"
 SHARED_AI_ERROR = "convia_unavailable"
-SHARED_AI_WAIT_ATTEMPTS = 1500
-SHARED_AI_WAIT_SECONDS = 0.02
+SHARED_AI_PENDING = "convia_in_progress"
+SHARED_AI_WAIT_DEADLINE_SECONDS = 30
 MAX_SHARED_AI_HISTORY_CANDIDATES = 500
 
 
@@ -5438,6 +5437,27 @@ def _complete_shared_ai_failure(
     return replay_delivery_response(receipt, sender_user_id)
 
 
+def _safe_complete_shared_ai_failure(
+    *, sender_user_id, recipient_user_id, request_id, payload_hash, owner_token,
+    friendship_generation, human_response
+):
+    try:
+        return _complete_shared_ai_failure(
+            sender_user_id=sender_user_id,
+            recipient_user_id=recipient_user_id,
+            request_id=request_id,
+            payload_hash=payload_hash,
+            owner_token=owner_token,
+            friendship_generation=friendship_generation,
+            human_response=human_response,
+        )
+    except Exception:
+        safe_release_delivery_request(
+            sender_user_id, SHARED_AI_ROUTE, request_id, owner_token
+        )
+        return _shared_ai_failure_response(human_response)
+
+
 def finalize_shared_ai_wait_timeout(
     *, sender_user_id, recipient_user_id, request_id, payload_hash,
     friendship_generation, human_response
@@ -5474,6 +5494,11 @@ def finalize_shared_ai_wait_timeout(
                 )
             if _delivery_receipt_is_completed(receipt):
                 return receipt
+            deadline = receipt.get("shared_wait_deadline_at")
+            if not isinstance(deadline, datetime) or deadline > datetime.now(
+                timezone.utc
+            ):
+                return receipt
             canonical = completed_values(receipt)
             tx.set(
                 receipt_ref,
@@ -5489,6 +5514,9 @@ def finalize_shared_ai_wait_timeout(
     if not receipt or receipt.get("payload_hash") != payload_hash:
         raise ValueError("request_id was already used for a different delivery")
     if _delivery_receipt_is_completed(receipt):
+        return receipt
+    deadline = receipt.get("shared_wait_deadline_at")
+    if not isinstance(deadline, datetime) or deadline > datetime.now(timezone.utc):
         return receipt
     canonical = completed_values(receipt)
     save_delivery_receipt(
@@ -5591,13 +5619,25 @@ def publish_shared_ai_receipt(
     for target, channel_user_id, payload in targets:
         if not payload:
             continue
-        _claimed_receipt, owner_token, status = _claim_shared_ai_publish_target(
-            sender_user_id,
-            request_id,
-            payload_hash,
-            recipient_user_id,
-            target,
-        )
+        try:
+            _claimed_receipt, owner_token, status = _claim_shared_ai_publish_target(
+                sender_user_id,
+                request_id,
+                payload_hash,
+                recipient_user_id,
+                target,
+            )
+        except Exception as exc:
+            all_delivered = False
+            log_tool_error(
+                sender_user_id,
+                recipient_user_id,
+                "ably_publish_state",
+                f"shared_ai_claim_{target}",
+                type(exc).__name__,
+                request_id=request_id,
+            )
+            continue
         if status == "published":
             continue
         if status != "claimed":
@@ -5615,16 +5655,35 @@ def publish_shared_ai_receipt(
                     owner_token,
                     published=False,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                log_tool_error(
+                    sender_user_id,
+                    recipient_user_id,
+                    "ably_publish_state",
+                    f"shared_ai_release_{target}",
+                    type(exc).__name__,
+                    request_id=request_id,
+                )
         else:
-            if not _finish_shared_ai_publish_target(
-                sender_user_id,
-                request_id,
-                target,
-                owner_token,
-                published=True,
-            ):
+            try:
+                finalized = _finish_shared_ai_publish_target(
+                    sender_user_id,
+                    request_id,
+                    target,
+                    owner_token,
+                    published=True,
+                )
+            except Exception as exc:
+                finalized = False
+                log_tool_error(
+                    sender_user_id,
+                    recipient_user_id,
+                    "ably_publish_state",
+                    f"shared_ai_finalize_{target}",
+                    type(exc).__name__,
+                    request_id=request_id,
+                )
+            if not finalized:
                 all_delivered = False
     return all_delivered
 
@@ -5634,15 +5693,30 @@ def _replay_shared_ai_receipt(
 ):
     response = replay_delivery_response(receipt, sender_user_id)
     if receipt.get("convia_message") or response.get("convia_message"):
-        if not publish_shared_ai_receipt(
-            sender_user_id,
-            recipient_user_id,
-            request_id,
-            payload_hash,
-            receipt,
-        ):
+        try:
+            published = publish_shared_ai_receipt(
+                sender_user_id,
+                recipient_user_id,
+                request_id,
+                payload_hash,
+                receipt,
+            )
+        except Exception:
+            published = False
+        if not published:
             response["realtime_delivered"] = False
     return response
+
+
+def get_shared_ai_participant_names(client, sender_user_id, recipient_user_id):
+    sender_doc = client.collection("users").document(sender_user_id).get()
+    recipient_doc = client.collection("users").document(recipient_user_id).get()
+    sender_data = sender_doc.to_dict() if sender_doc.exists else {}
+    recipient_data = recipient_doc.to_dict() if recipient_doc.exists else {}
+    return (
+        sender_data.get("display_name") or "User",
+        recipient_data.get("display_name") or "Contact",
+    )
 
 
 def complete_shared_convia_invocation(
@@ -5660,9 +5734,13 @@ def complete_shared_convia_invocation(
         sender_user_id, "direct_text", request_id
     ) or {}
     generation = (human_receipt.get("friendship_generation") or "").strip()
-    if not generation or current_friendship_generation(
-        client, sender_user_id, recipient_user_id
-    ) != generation:
+    try:
+        friendship_matches = bool(generation) and current_friendship_generation(
+            client, sender_user_id, recipient_user_id
+        ) == generation
+    except Exception:
+        friendship_matches = False
+    if not friendship_matches:
         return _shared_ai_failure_response(human_response)
     payload_hash = shared_ai_payload_hash(
         sender_user_id,
@@ -5680,6 +5758,8 @@ def complete_shared_convia_invocation(
             receipt_data={
                 "contact_id": recipient_user_id,
                 "friendship_generation": generation,
+                "shared_wait_deadline_at": datetime.now(timezone.utc)
+                + timedelta(seconds=SHARED_AI_WAIT_DEADLINE_SECONDS),
             },
         )
     except ValueError:
@@ -5693,11 +5773,27 @@ def complete_shared_convia_invocation(
             receipt=receipt,
         )
     if not acquired:
-        for _attempt in range(SHARED_AI_WAIT_ATTEMPTS):
-            time.sleep(SHARED_AI_WAIT_SECONDS)
-            receipt = get_delivery_receipt(
-                sender_user_id, SHARED_AI_ROUTE, request_id
-            ) or {}
+        receipt = get_delivery_receipt(
+            sender_user_id, SHARED_AI_ROUTE, request_id
+        ) or receipt
+        if _delivery_receipt_is_completed(receipt):
+            return _replay_shared_ai_receipt(
+                sender_user_id=sender_user_id,
+                recipient_user_id=recipient_user_id,
+                request_id=request_id,
+                payload_hash=payload_hash,
+                receipt=receipt,
+            )
+        deadline = receipt.get("shared_wait_deadline_at")
+        if isinstance(deadline, datetime) and deadline <= datetime.now(timezone.utc):
+            receipt = finalize_shared_ai_wait_timeout(
+                sender_user_id=sender_user_id,
+                recipient_user_id=recipient_user_id,
+                request_id=request_id,
+                payload_hash=payload_hash,
+                friendship_generation=generation,
+                human_response=human_response,
+            )
             if _delivery_receipt_is_completed(receipt):
                 return _replay_shared_ai_receipt(
                     sender_user_id=sender_user_id,
@@ -5706,26 +5802,11 @@ def complete_shared_convia_invocation(
                     payload_hash=payload_hash,
                     receipt=receipt,
                 )
-        receipt = finalize_shared_ai_wait_timeout(
-            sender_user_id=sender_user_id,
-            recipient_user_id=recipient_user_id,
-            request_id=request_id,
-            payload_hash=payload_hash,
-            friendship_generation=generation,
-            human_response=human_response,
-        )
-        return _replay_shared_ai_receipt(
-            sender_user_id=sender_user_id,
-            recipient_user_id=recipient_user_id,
-            request_id=request_id,
-            payload_hash=payload_hash,
-            receipt=receipt,
-        )
+        return {**human_response, "convia_error": SHARED_AI_PENDING}
 
     owner_token = receipt["owner_token"]
-    quota_error = enforce_openai_quota(sender_user_id, "text")
-    if quota_error is not None:
-        return _complete_shared_ai_failure(
+    def fail_owned_invocation():
+        return _safe_complete_shared_ai_failure(
             sender_user_id=sender_user_id,
             recipient_user_id=recipient_user_id,
             request_id=request_id,
@@ -5735,12 +5816,22 @@ def complete_shared_convia_invocation(
             human_response=human_response,
         )
 
-    sender_doc = client.collection("users").document(sender_user_id).get()
-    recipient_doc = client.collection("users").document(recipient_user_id).get()
-    sender_data = sender_doc.to_dict() if sender_doc.exists else {}
-    recipient_data = recipient_doc.to_dict() if recipient_doc.exists else {}
-    caller_name = sender_data.get("display_name") or "User"
-    contact_name = recipient_data.get("display_name") or "Contact"
+    try:
+        quota_error = enforce_openai_quota(sender_user_id, "text")
+    except Exception:
+        return fail_owned_invocation()
+    if quota_error is not None:
+        return fail_owned_invocation()
+
+    try:
+        caller_name, contact_name = get_shared_ai_participant_names(
+            client, sender_user_id, recipient_user_id
+        )
+        global_prompt = (
+            get_user_ai_settings(sender_user_id).get("global_prompt") or ""
+        )
+    except Exception:
+        return fail_owned_invocation()
     try:
         history = get_chat_messages(
             sender_user_id,
@@ -5750,7 +5841,6 @@ def complete_shared_convia_invocation(
     except Exception:
         history = []
     shared_history = select_shared_history(history, caller_name, contact_name)
-    global_prompt = get_user_ai_settings(sender_user_id).get("global_prompt") or ""
     try:
         ai_text = generate_shared_convia_text(
             user_id=sender_user_id,
@@ -5762,28 +5852,16 @@ def complete_shared_convia_invocation(
             raise RuntimeError("empty shared AI response")
         ai_text = ai_text.strip()[:MAX_CHAT_TEXT_CHARS]
     except Exception:
-        return _complete_shared_ai_failure(
-            sender_user_id=sender_user_id,
-            recipient_user_id=recipient_user_id,
-            request_id=request_id,
-            payload_hash=payload_hash,
-            owner_token=owner_token,
-            friendship_generation=generation,
-            human_response=human_response,
-        )
+        return fail_owned_invocation()
 
-    if current_friendship_generation(
-        client, sender_user_id, recipient_user_id
-    ) != generation:
-        return _complete_shared_ai_failure(
-            sender_user_id=sender_user_id,
-            recipient_user_id=recipient_user_id,
-            request_id=request_id,
-            payload_hash=payload_hash,
-            owner_token=owner_token,
-            friendship_generation=generation,
-            human_response=human_response,
-        )
+    try:
+        friendship_still_matches = current_friendship_generation(
+            client, sender_user_id, recipient_user_id
+        ) == generation
+    except Exception:
+        return fail_owned_invocation()
+    if not friendship_still_matches:
+        return fail_owned_invocation()
 
     message_id = deterministic_message_id(
         sender_user_id,
@@ -5876,16 +5954,8 @@ def complete_shared_convia_invocation(
                 "response": response,
             },
         )
-    except AcceptedFriendshipRequired:
-        return _complete_shared_ai_failure(
-            sender_user_id=sender_user_id,
-            recipient_user_id=recipient_user_id,
-            request_id=request_id,
-            payload_hash=payload_hash,
-            owner_token=owner_token,
-            friendship_generation=generation,
-            human_response=human_response,
-        )
+    except Exception:
+        return fail_owned_invocation()
     return _replay_shared_ai_receipt(
         sender_user_id=sender_user_id,
         recipient_user_id=recipient_user_id,
