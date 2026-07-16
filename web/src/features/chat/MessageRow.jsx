@@ -47,7 +47,7 @@ export default function MessageRow({ message, locale = 'en', onImageClick, onRet
         </div>
       ) : isAssistUser ? (
         <div className="message-row__private-label">{locale === 'zh-TW' ? '只有你看得到' : 'Only visible to you'}</div>
-      ) : showAiLabel ? <div className="message-row__ai-label">Convia AI</div> : null}
+      ) : showAiLabel ? <div className="message-row__ai-label">Convia</div> : null}
       <div className={isHuman ? 'message-row__bubble' : 'message-row__plain'} {...(isHuman ? { 'data-bubble': true } : {})}>
         {(message.role === 'ai-typing' || message.status === 'streaming') && !(message.text || '').trim() ? (
           <span className="message-row__typing" aria-label={locale === 'zh-TW' ? '正在回覆' : 'Responding'}><i /><i /><i /></span>

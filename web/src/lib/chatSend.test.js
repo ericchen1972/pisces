@@ -87,7 +87,7 @@ describe('sendPersonRequest', () => {
         sender_avatar_url: 'https://google/avatar',
       },
     }))
-    const message = await sendPersonRequest({
+    const result = await sendPersonRequest({
       fetchImpl,
       url: '/api/messages/send',
       contactId: 'friend-1',
@@ -101,7 +101,38 @@ describe('sendPersonRequest', () => {
       image_url: 'https://store.public.blob.vercel-storage.com/image.png',
       request_id: 'person-stable-1',
     })
-    expect(message).toMatchObject({ id: 'server-message', requestId: 'person-stable-1', role: 'user', imageUrl: 'https://store.public.blob.vercel-storage.com/image.png', avatarUrl: 'https://google/avatar' })
+    expect(result.message).toMatchObject({ id: 'server-message', requestId: 'person-stable-1', role: 'user', imageUrl: 'https://store.public.blob.vercel-storage.com/image.png', avatarUrl: 'https://google/avatar' })
+    expect(result.conviaMessage).toBeNull()
+    expect(result.conviaError).toBe('')
+  })
+
+  it('returns shared Convia reply and caller-only Convia errors from the send response', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({
+      ok: true,
+      message: {
+        message_id: 'human-message',
+        client_request_id: 'person-stable-2',
+        sender_mode: 'user',
+        text: 'Convia, help',
+      },
+      convia_message: {
+        message_id: 'convia-message',
+        client_request_id: 'person-stable-2:ai',
+        sender_mode: 'ai_proxy',
+        text: 'Shared reply',
+      },
+      convia_error: 'convia_unavailable',
+    }))
+    const result = await sendPersonRequest({
+      fetchImpl,
+      url: '/api/messages/send',
+      contactId: 'friend-1',
+      text: 'Convia, help',
+      requestId: 'person-stable-2',
+    })
+    expect(result.message).toMatchObject({ id: 'human-message', role: 'user', text: 'Convia, help' })
+    expect(result.conviaMessage).toMatchObject({ id: 'convia-message', role: 'ai_proxy', senderMode: 'ai_proxy', text: 'Shared reply' })
+    expect(result.conviaError).toBe('convia_unavailable')
   })
 
   it('reuses one request id for a failed draft retry and allocates after content or success changes', () => {

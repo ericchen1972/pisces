@@ -1,8 +1,8 @@
 import { useId } from 'react'
-import { AiVoiceIcon, BackIcon, EditIcon, PhoneIcon } from '../../components/icons.jsx'
+import { BackIcon, EditIcon, PhoneIcon } from '../../components/icons.jsx'
 import { ContactAvatar } from './ContactGroup.jsx'
 
-export default function ConversationHeader({ contact, locale = 'en', onBack, onCall, onEdit, aiAssistMode = false, onAssistCall }) {
+export default function ConversationHeader({ contact, locale = 'en', onBack, onCall, onEdit }) {
   const callDescriptionId = useId()
   if (!contact) return null
   const zh = locale === 'zh-TW'
@@ -19,11 +19,6 @@ export default function ConversationHeader({ contact, locale = 'en', onBack, onC
       <button type="button" className="icon-button conversation-header__edit" onClick={() => onEdit?.(contact)} aria-label={zh ? `編輯 ${contact.name}` : `Edit ${contact.name}`}>
         <EditIcon size={19} />
       </button>
-      {aiAssistMode && !contact.isAi ? (
-        <button type="button" className="icon-button conversation-header__assist-call" onClick={onAssistCall} aria-label={zh ? '開始私人 AI 語音協助' : 'Start private AI voice assist'}>
-          <AiVoiceIcon size={20} />
-        </button>
-      ) : null}
       <button type="button" className="icon-button conversation-header__call" onClick={onCall} disabled={personCallDisabled} aria-label={personCallDisabled ? personCallDescription : (zh ? '語音通話' : 'Voice call')} aria-describedby={personCallDisabled ? callDescriptionId : undefined} title={personCallDisabled ? personCallLongDescription : undefined}>
         <PhoneIcon size={20} />
       </button>

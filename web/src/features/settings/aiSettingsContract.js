@@ -30,7 +30,7 @@ export function mergeAiSettingsUser(user, form, avatarUrl) {
 export function applyAiContactSettings(contacts, contactId, form, avatarUrl) {
   return contacts.map((contact) => contact.id === contactId ? {
     ...contact,
-    name: form.alias,
+    name: 'Convia',
     avatar: avatarUrl,
     gender: form.gender,
     voice: form.voice,

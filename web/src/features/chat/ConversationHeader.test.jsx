@@ -39,20 +39,10 @@ describe('ConversationHeader', () => {
     expect(onEdit).toHaveBeenCalledWith(contact)
   })
 
-  it('keeps person phone disabled and enables AI Assist voice', () => {
-    const onAssistCall = vi.fn()
-    render(
-      <ConversationHeader
-        contact={{ id: 'friend', name: 'Amy', isAi: false }}
-        aiAssistMode
-        onAssistCall={onAssistCall}
-      />,
-    )
+  it('keeps person phone disabled without exposing private AI Assist voice', () => {
+    render(<ConversationHeader contact={{ id: 'friend', name: 'Amy', isAi: false }} />)
 
     expect(screen.getByRole('button', { name: 'Person-to-person calls coming later' })).toBeDisabled()
-    const assistButton = screen.getByRole('button', { name: 'Start private AI voice assist' })
-    expect(assistButton).toBeEnabled()
-    fireEvent.click(assistButton)
-    expect(onAssistCall).toHaveBeenCalledOnce()
+    expect(screen.queryByRole('button', { name: 'Start private AI voice assist' })).not.toBeInTheDocument()
   })
 })

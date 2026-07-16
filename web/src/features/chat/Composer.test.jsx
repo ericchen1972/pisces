@@ -24,17 +24,13 @@ describe('Composer', () => {
     expect(onSend).toHaveBeenCalledTimes(1)
   })
 
-  it('shows recording state, attachment action, Assist toggle, and disabled send state', () => {
-    const onAttachment = vi.fn()
-    const onToggleAssist = vi.fn()
+  it('shows recording state, keeps mic, hides attachment and Assist controls, and disables sending while busy', () => {
     const { rerender } = render(
       <Composer
         value=""
         onChange={() => {}}
         onSend={() => {}}
-        onAttachment={onAttachment}
-        onToggleAssist={onToggleAssist}
-        showAssist
+        canRecord
         isRecording
         recordingElapsedMs={15000}
         maxRecordMs={30000}
@@ -44,65 +40,34 @@ describe('Composer', () => {
     expect(screen.getByText('Recording 0:15')).toBeInTheDocument()
     rerender(
       <Composer
-        value=""
+        value="hello"
         onChange={() => {}}
         onSend={() => {}}
-        onAttachment={onAttachment}
-        onToggleAssist={onToggleAssist}
-        showAssist
+        canRecord
       />,
     )
-    fireEvent.click(screen.getByRole('button', { name: 'Add attachment' }))
-    expect(screen.getByRole('textbox', { name: 'Attachment URL' })).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'AI Assist' }))
-    expect(onToggleAssist).toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Start recording' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Add attachment' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'AI Assist' })).not.toBeInTheDocument()
     rerender(<Composer value="hello" onChange={() => {}} onSend={() => {}} isSending />)
     expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
   })
 
-  it('disables attachment when the current conversation has no attachment action', () => {
+  it('does not render attachment controls', () => {
     render(<Composer value="" onChange={() => {}} onSend={() => {}} />)
-    expect(screen.getByRole('button', { name: 'Add attachment' })).toBeDisabled()
-  })
-
-  it('localizes the AI Assist control in zh-TW', () => {
-    render(<Composer value="" onChange={() => {}} onSend={() => {}} onToggleAssist={() => {}} showAssist locale="zh-TW" />)
-    expect(screen.getByRole('button', { name: 'AI 協助' })).toBeInTheDocument()
-  })
-
-  it('attaches a supported HTTPS image URL and allows attachment-only sending', () => {
-    const onAttachment = vi.fn()
-    const onSend = vi.fn()
-    const { rerender } = render(<Composer value="" onChange={() => {}} onSend={onSend} onAttachment={onAttachment} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Add attachment' }))
-    fireEvent.change(screen.getByRole('textbox', { name: 'Attachment URL' }), { target: { value: 'https://store.public.blob.vercel-storage.com/image.png' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Attach image' }))
-    expect(onAttachment).toHaveBeenCalledWith({ kind: 'image', url: 'https://store.public.blob.vercel-storage.com/image.png' })
-    rerender(
-      <Composer
-        value=""
-        onChange={() => {}}
-        onSend={onSend}
-        onAttachment={onAttachment}
-        attachment={{ kind: 'image', url: 'https://store.public.blob.vercel-storage.com/image.png' }}
-      />,
-    )
-    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
-    expect(onSend).toHaveBeenCalledWith('')
-  })
-
-  it('closes and resets attachment state when the callback becomes unavailable', () => {
-    const onAttachment = vi.fn()
-    const { rerender } = render(<Composer value="" onChange={() => {}} onSend={() => {}} onAttachment={onAttachment} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Add attachment' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Music' }))
-    fireEvent.change(screen.getByRole('textbox', { name: 'Attachment URL' }), { target: { value: 'https://store.public.blob.vercel-storage.com/music.wav' } })
-    rerender(<Composer value="" onChange={() => {}} onSend={() => {}} />)
+    expect(screen.queryByRole('button', { name: 'Add attachment' })).not.toBeInTheDocument()
     expect(screen.queryByRole('textbox', { name: 'Attachment URL' })).not.toBeInTheDocument()
+  })
 
-    rerender(<Composer value="" onChange={() => {}} onSend={() => {}} onAttachment={onAttachment} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Add attachment' }))
-    expect(screen.getByRole('textbox', { name: 'Attachment URL' })).toHaveValue('')
-    expect(screen.getByRole('button', { name: 'Image' })).toHaveAttribute('aria-pressed', 'true')
+  it('does not render the AI Assist control in zh-TW', () => {
+    render(<Composer value="" onChange={() => {}} onSend={() => {}} locale="zh-TW" />)
+    expect(screen.queryByRole('button', { name: 'AI 協助' })).not.toBeInTheDocument()
+  })
+
+  it('requires text before sending', () => {
+    const onSend = vi.fn()
+    render(<Composer value="" onChange={() => {}} onSend={onSend} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(onSend).not.toHaveBeenCalled()
   })
 })

@@ -43,9 +43,9 @@ describe('MessageRow', () => {
     expect(screen.getByLabelText('Responding')).toBeInTheDocument()
   })
 
-  it.each(['ai', 'ai_proxy', 'ai-typing'])('labels %s as Convia AI without adding a bubble', (role) => {
+  it.each(['ai', 'ai_proxy', 'ai-typing'])('labels %s as Convia without adding a bubble', (role) => {
     const { container } = render(<MessageRow message={{ id: role, role, text: role === 'ai-typing' ? '' : 'AI text', status: role === 'ai-typing' ? 'streaming' : undefined }} />)
-    expect(screen.getByText('Convia AI')).toBeInTheDocument()
+    expect(screen.getByText('Convia')).toBeInTheDocument()
     expect(container.querySelector('[data-bubble]')).toBeNull()
   })
 

@@ -117,7 +117,11 @@ export async function sendPersonRequest({ fetchImpl = fetch, url, contactId, tex
   })
   const message = canonicalOutboundMessage(data.message)
   if (!message) throw new Error('Message response did not include a canonical identity')
-  return message
+  return {
+    message,
+    conviaMessage: canonicalOutboundMessage(data.convia_message),
+    conviaError: data.convia_error || '',
+  }
 }
 
 export async function sendPersonVoiceRequest({ fetchImpl = fetch, url, contactId, audioBase64, mimeType, durationSeconds, requestId, signal }) {

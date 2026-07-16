@@ -24,8 +24,6 @@ import {
   canonicalIncomingMessage,
   createClientRequestId,
   effectiveMessageRole,
-  restoreAssistDraft,
-  sendAssistRequest,
   sendPersonRequest,
   sendPersonVoiceRequest,
   stablePersonSendIdentity,
@@ -328,7 +326,6 @@ function LoginHome() {
   const [currentUser, setCurrentUser] = useState(null)
   const [selectedContact, setSelectedContact] = useState(null)
   const [chatInput, setChatInput] = useState('')
-  const [pendingAttachment, setPendingAttachment] = useState(null)
   const [messagesByContact, setMessagesByContact] = useState({})
   const [unreadByContact, setUnreadByContact] = useState({})
   const [contactGroups, setContactGroups] = useState([])
@@ -338,12 +335,11 @@ function LoginHome() {
   const [micAllowed, setMicAllowed] = useState(() => Boolean(navigator.mediaDevices?.getUserMedia))
   const [isRecording, setIsRecording] = useState(false)
   const [isAwaitingReply, setIsAwaitingReply] = useState(false)
-  const [isAiAssistMode, setIsAiAssistMode] = useState(false)
   const [activeCall, setActiveCall] = useState(null)
   const [contacts, setContacts] = useState([
     {
       id: 'pisces-core',
-      name: 'Convia AI',
+      name: 'Convia',
       avatar: '/images/fish.png',
       snippet: '',
       isAi: true,
@@ -391,7 +387,6 @@ function LoginHome() {
   const recordTimeoutRef = useRef(null)
   const recordingOperationRef = useRef(null)
   const aiStreamOperationRef = useRef(null)
-  const assistSendOperationRef = useRef(null)
   const personSendOperationRef = useRef(null)
   const personSendIdentityRef = useRef(null)
   const deleteContactOperationRef = useRef(null)
@@ -485,7 +480,6 @@ function LoginHome() {
     realtimeOperationScope.invalidate()
     recordingOperationRef.current = null
     aiStreamOperationRef.current = null
-    assistSendOperationRef.current = null
     personSendOperationRef.current = null
     personSendIdentityRef.current = null
     deleteContactOperationRef.current = null
@@ -521,13 +515,11 @@ function LoginHome() {
     selectedContactIdRef.current = ''
     setSelectedContact(null)
     setMessagesByContact({})
-    setPendingAttachment(null)
     setUnreadByContact({})
     setContactGroups([])
     setDefaultContactGroupId('')
     setChatInput('')
     chatDraftVersionRef.current = 0
-    setIsAiAssistMode(false)
     setIsHistoryLoading(false)
     setIsAwaitingReply(false)
     setIsRecording(false)
@@ -631,7 +623,7 @@ function LoginHome() {
     setContacts([
       {
         id: 'pisces-core',
-        name: 'Convia AI',
+        name: 'Convia',
         avatar: nextAvatar,
         snippet: '',
         isAi: true,
@@ -1527,12 +1519,6 @@ function LoginHome() {
     recordedObjectUrlsRef.current.releaseAll()
   }, [])
 
-  useEffect(() => {
-    if (!selectedContact || selectedContact.isAi) {
-      setIsAiAssistMode(false)
-    }
-  }, [selectedContact?.id, selectedContact?.isAi])
-
   const clearRecordingTimers = () => {
     if (recordIntervalRef.current) {
       clearInterval(recordIntervalRef.current)
@@ -1549,17 +1535,7 @@ function LoginHome() {
     setActiveCall({
       mode: 'ai',
       contactId: selectedContact.id || 'pisces-core',
-      name: selectedContact.name || 'Convia AI',
-      avatar: aiAvatarForCall,
-    })
-  }
-
-  const openAssistCall = () => {
-    if (!selectedContact || selectedContact.isAi || !isAiAssistMode) return
-    setActiveCall({
-      mode: 'assist',
-      contactId: selectedContact.id,
-      name: 'Convia AI',
+      name: selectedContact.name || 'Convia',
       avatar: aiAvatarForCall,
     })
   }
@@ -1649,13 +1625,9 @@ function LoginHome() {
           const audioUrl = URL.createObjectURL(blob)
           const audioMessageId = `ua-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
           recordedObjectUrlsRef.current.own(audioUrl, { contactId, messageId: audioMessageId })
-          const shouldUseAiVoiceFlow = contactId === 'pisces-core' || isAiAssistMode
-          const isAssistVoiceFlow = isAiAssistMode && contactId !== 'pisces-core'
+          const shouldUseAiVoiceFlow = contactId === 'pisces-core'
           const personVoiceRequestId = shouldUseAiVoiceFlow ? '' : createClientRequestId('person-voice')
           const typingId = `vt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
-          const assistRequestId = createClientRequestId('assist-voice')
-          const assistTempId = `assist-v-${assistRequestId}`
-          let assistTranscript = ''
           runIfRecordingCurrent(() => {
             setMessagesByContact((prev) => {
               const current = prev[contactId] || []
@@ -1664,22 +1636,7 @@ function LoginHome() {
                 [contactId]: [
                   ...current,
                   { id: audioMessageId, role: 'user', requestId: personVoiceRequestId, audioUrl, audioDuration: recordedDurationSeconds },
-                  ...(isAssistVoiceFlow
-                    ? [
-                        {
-                          id: assistTempId,
-                          role: 'assist_group',
-                          groupId: assistTempId,
-                          requestId: assistRequestId,
-                          userText: '',
-                          aiText: '',
-                          aiAudioUrl: '',
-                          status: 'streaming',
-                        },
-                      ]
-                    : shouldUseAiVoiceFlow
-                      ? [{ id: typingId, role: 'ai-typing', text: '...' }]
-                      : []),
+                  ...(shouldUseAiVoiceFlow ? [{ id: typingId, role: 'ai-typing', text: '...' }] : []),
                 ],
               }
             })
@@ -1726,61 +1683,6 @@ function LoginHome() {
                 return {
                   ...prev,
                   [contactId]: reconcileCanonicalMessage(current, audioMessageId, canonicalVoiceMessage),
-                }
-              }))
-            } else if (isAssistVoiceFlow) {
-              const sttRes = await fetch(`${apiBaseUrl}/api/speech/transcribe`, {
-                method: 'POST',
-                credentials: 'include',
-                signal: recordingOperation.signal,
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  audio_base64: audioBase64,
-                  mime_type: blob.type || recorder.mimeType || 'audio/webm',
-                }),
-              })
-              const sttData = await sttRes.json()
-              if (!accountOperationScope.isOwner(recordingOperation, recordingOperationRef)) return
-              if (!sttRes.ok || !sttData.ok || !sttData.transcript) {
-                throw new Error(sttData.error || `Speech-to-text failed (${sttRes.status})`)
-              }
-              assistTranscript = sttData.transcript
-
-              const { assistGroup: assist, outboundMessage } = await sendAssistRequest({
-                url: `${apiBaseUrl}/api/assist/message`,
-                contactId,
-                message: assistTranscript,
-                requestId: assistRequestId,
-                signal: recordingOperation.signal,
-              })
-              if (!accountOperationScope.isOwner(recordingOperation, recordingOperationRef)) return
-              recordedObjectUrlsRef.current.release(audioUrl)
-              const assistAudioUrl = assist.audio_url
-                ? assist.audio_url
-                : assist.audio_base64 && assist.audio_mime_type
-                  ? `data:${assist.audio_mime_type};base64,${assist.audio_base64}`
-                  : ''
-              runIfRecordingCurrent(() => setMessagesByContact((prev) => {
-                const current = prev[contactId] || []
-                const assistMessage = {
-                  id: assist.id || assistTempId,
-                  role: 'assist_group',
-                  groupId: assist.id || assistTempId,
-                  requestId: assistRequestId,
-                  userText: assist.user_text || assistTranscript,
-                  aiText: assist.ai_text || '',
-                  aiAudioUrl: assistAudioUrl,
-                  status: 'complete',
-                }
-                const withTranscript = current.map((message) => message.id === audioMessageId
-                  ? { ...message, text: assistTranscript, audioUrl: '' }
-                  : message)
-                const replaced = reconcileCanonicalMessage(withTranscript, assistTempId, assistMessage)
-                return {
-                  ...prev,
-                  [contactId]: outboundMessage
-                    ? reconcileCanonicalMessage(replaced, '', outboundMessage)
-                    : replaced,
                 }
               }))
             } else {
@@ -1833,28 +1735,6 @@ function LoginHome() {
             recordedObjectUrlsRef.current.release(audioUrl)
             runIfRecordingCurrent(() => setMessagesByContact((prev) => {
               const current = discardRecordedMessage(prev[contactId] || [], audioMessageId)
-              if (isAssistVoiceFlow) {
-                return {
-                  ...prev,
-                  [contactId]: current.map((m) =>
-                    m.id === assistTempId
-                      ? {
-                          ...m,
-                          userText: assistTranscript,
-                          aiText: errText,
-                          status: 'incomplete',
-                          retry: assistTranscript
-                            ? () => sendAssistText(assistTranscript, {
-                                requestId: assistRequestId,
-                                temporaryId: assistTempId,
-                                clearDraft: false,
-                              })
-                            : undefined,
-                        }
-                      : m,
-                  ),
-                }
-              }
               if (shouldUseAiVoiceFlow) {
                 return {
                   ...prev,
@@ -1942,7 +1822,6 @@ function LoginHome() {
 
   const selectContactFromSidebar = (contact) => {
     if (!contact?.id) return
-    setPendingAttachment(null)
     selectedContactIdRef.current = contact.id
     setSelectedContact(contact)
     markContactAsRead(contact.id)
@@ -2025,105 +1904,13 @@ function LoginHome() {
     }
   }
 
-  const sendAssistText = (input, {
-    requestId = createClientRequestId('assist'),
-    temporaryId = `assist-${requestId}`,
-    clearDraft = true,
-  } = {}) => {
+  const sendPersonText = (input) => {
     const contactId = selectedContact?.id
-    if (!contactId || selectedContact?.isAi) return false
-    const submittedDraftVersion = chatDraftVersionRef.current
-
-    const send = startExclusiveSend({
-      scope: accountOperationScope,
-      ownerRef: assistSendOperationRef,
-      request: (operation) => sendAssistRequest({
-        url: `${apiBaseUrl}/api/assist/message`,
-        contactId,
-        message: input,
-        requestId,
-        signal: operation.signal,
-      }),
-      onSuccess: ({ assistGroup, outboundMessage }) => {
-        const audioUrl = assistGroup.audio_url || (
-          assistGroup.audio_base64 && assistGroup.audio_mime_type
-            ? `data:${assistGroup.audio_mime_type};base64,${assistGroup.audio_base64}`
-            : ''
-        )
-        setMessagesByContact((previous) => {
-          const current = previous[contactId] || []
-          const assistMessage = {
-            id: assistGroup.id || temporaryId,
-            role: 'assist_group',
-            groupId: assistGroup.id || temporaryId,
-            requestId,
-            userText: assistGroup.user_text || input,
-            aiText: assistGroup.ai_text || '',
-            aiAudioUrl: audioUrl,
-            status: 'complete',
-          }
-          const replaced = reconcileCanonicalMessage(current, temporaryId, assistMessage)
-          const withCanonicalOutbound = outboundMessage
-            ? reconcileCanonicalMessage(replaced, '', outboundMessage)
-            : replaced
-          return { ...previous, [contactId]: withCanonicalOutbound }
-        })
-        if (chatDraftVersionRef.current === submittedDraftVersion) {
-          setChatInput((current) => current === input ? '' : current)
-        }
-      },
-      onError: (error) => {
-        const retry = () => sendAssistText(input, { requestId, temporaryId, clearDraft: false })
-        replaceConversationMessage(contactId, temporaryId, {
-          id: temporaryId,
-          role: 'assist_group',
-          groupId: temporaryId,
-          requestId,
-          userText: input,
-          aiText: visibleErrorMessage(error, isZh ? 'zh-TW' : 'en', 'AI Assist failed.', 'AI 協助失敗。'),
-          aiAudioUrl: '',
-          status: 'incomplete',
-          retry,
-        })
-        setChatInput((current) => restoreAssistDraft(
-          current,
-          input,
-          chatDraftVersionRef.current,
-          submittedDraftVersion,
-          selectedContactIdRef.current,
-          contactId,
-        ))
-      },
-      onSettled: () => setIsAwaitingReply(false),
-    })
-    if (!send.started) return false
-
-    setMessagesByContact((previous) => {
-      const current = previous[contactId] || []
-      const optimistic = {
-        id: temporaryId,
-        role: 'assist_group',
-        groupId: temporaryId,
-        requestId,
-        userText: input,
-        aiText: '',
-        aiAudioUrl: '',
-        status: 'streaming',
-      }
-      return { ...previous, [contactId]: mergeStreamMessage(current, temporaryId, optimistic) }
-    })
-    if (clearDraft) setChatInput('')
-    setIsAwaitingReply(true)
-    return true
-  }
-
-  const sendPersonText = (input, attachment = pendingAttachment) => {
-    const contactId = selectedContact?.id
-    if (!contactId || selectedContact?.isAi || (!input && !attachment)) return false
+    if (!contactId || selectedContact?.isAi || !input) return false
 
     const identity = stablePersonSendIdentity(
       personSendIdentityRef.current,
-      { contactId, text: input, attachment },
+      { contactId, text: input },
     )
     personSendIdentityRef.current = identity
     const send = startExclusiveSend({
@@ -2133,21 +1920,34 @@ function LoginHome() {
         url: `${apiBaseUrl}/api/messages/send`,
         contactId,
         text: input,
-        attachment,
         requestId: identity.requestId,
         signal: operation.signal,
       }),
-      onSuccess: (message) => {
+      onSuccess: ({ message, conviaMessage, conviaError }) => {
         if (personSendIdentityRef.current?.requestId === identity.requestId) personSendIdentityRef.current = null
         setMessagesByContact((previous) => {
           const current = previous[contactId] || []
+          const withMessage = reconcileCanonicalMessage(current, '', message)
           return {
             ...previous,
-            [contactId]: reconcileCanonicalMessage(current, '', message),
+            [contactId]: conviaMessage
+              ? reconcileCanonicalMessage(withMessage, '', conviaMessage)
+              : withMessage,
           }
         })
+        if (conviaError) {
+          const text = conviaError === 'convia_in_progress'
+            ? t('Convia is still replying.', 'Convia 還在回覆中。')
+            : t('Convia could not reply right now.', 'Convia 暫時無法回覆。')
+          setMessagesByContact((previous) => ({
+            ...previous,
+            [contactId]: [
+              ...(previous[contactId] || []),
+              { id: `convia-error-${Date.now()}`, role: 'system', text, status: 'incomplete' },
+            ],
+          }))
+        }
         setChatInput((current) => current.trim() === input ? '' : current)
-        setPendingAttachment((current) => current === attachment ? null : current)
       },
       onError: (error) => {
         setMessagesByContact((previous) => ({
@@ -2173,25 +1973,11 @@ function LoginHome() {
   const sendComposerText = (input) => {
     if (!selectedContact || isRecording || isAwaitingReply) return
     if (selectedContact.isAi) return sendAiStream(input)
-    if (isAiAssistMode) return sendAssistText(input)
-    return sendPersonText(input, pendingAttachment)
+    return sendPersonText(input)
   }
 
   const conversationMessages = selectedContact
-    ? (messagesByContact[selectedContact.id] || []).flatMap((message) => {
-        if (message.role !== 'assist_group') return [message]
-        return [
-          { id: `${message.id}-user`, role: 'assist_user', text: message.userText || '' },
-          {
-            id: `${message.id}-ai`,
-            role: 'assist_ai',
-            text: message.aiText || '',
-            audioUrl: message.aiAudioUrl || '',
-            status: message.status === 'streaming' ? 'streaming' : message.status,
-            retry: message.retry,
-          },
-        ]
-      })
+    ? (messagesByContact[selectedContact.id] || []).filter((message) => message.role !== 'assist_group')
     : []
 
   const conversationPanel = selectedContact ? (
@@ -2206,8 +1992,6 @@ function LoginHome() {
       }}
       onCall={openAiCall}
       onEdit={onEditContact}
-      aiAssistMode={isAiAssistMode && !selectedContact.isAi}
-      onAssistCall={openAssistCall}
       onImageClick={setImageViewerUrl}
       renderAudio={({ url, kind, message }) => (
         <AudioMessagePlayer
@@ -2226,15 +2010,6 @@ function LoginHome() {
             setChatInput(value)
           }}
           onSend={sendComposerText}
-          attachment={pendingAttachment}
-          onAttachment={!selectedContact.isAi && !isAiAssistMode ? setPendingAttachment : undefined}
-          onRemoveAttachment={() => setPendingAttachment(null)}
-          showAssist={!selectedContact.isAi}
-          assistActive={isAiAssistMode && !selectedContact.isAi}
-          onToggleAssist={() => {
-            setPendingAttachment(null)
-            setIsAiAssistMode((value) => !value)
-          }}
           canRecord={micAllowed}
           isRecording={isRecording}
           recordingElapsedMs={recordElapsedMs}
