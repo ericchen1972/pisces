@@ -5346,6 +5346,7 @@ SHARED_AI_ROUTE = "shared_ai_mention"
 SHARED_AI_ERROR = "convia_unavailable"
 SHARED_AI_WAIT_ATTEMPTS = 1500
 SHARED_AI_WAIT_SECONDS = 0.02
+MAX_SHARED_AI_HISTORY_CANDIDATES = 500
 
 
 def generate_shared_convia_text(*, user_id, command, global_prompt, shared_history):
@@ -5435,6 +5436,65 @@ def _complete_shared_ai_failure(
         },
     )
     return replay_delivery_response(receipt, sender_user_id)
+
+
+def finalize_shared_ai_wait_timeout(
+    *, sender_user_id, recipient_user_id, request_id, payload_hash,
+    friendship_generation, human_response
+):
+    """Atomically choose one canonical result when a concurrent owner runs long."""
+    client = get_firestore_client()
+    receipt_ref = _delivery_receipt_ref(
+        sender_user_id, SHARED_AI_ROUTE, request_id
+    )
+    response = _shared_ai_failure_response(human_response)
+
+    def completed_values(receipt):
+        return {
+            **receipt,
+            "state": "completed",
+            "contact_id": recipient_user_id,
+            "friendship_generation": friendship_generation,
+            "published": True,
+            "owner_token": "",
+            "lease_expires_at": datetime.now(timezone.utc),
+            "response": response,
+        }
+
+    if hasattr(client, "transaction"):
+        transaction = client.transaction()
+
+        @firestore.transactional
+        def commit(tx):
+            snapshot = receipt_ref.get(transaction=tx)
+            receipt = snapshot.to_dict() if snapshot.exists else {}
+            if not receipt or receipt.get("payload_hash") != payload_hash:
+                raise ValueError(
+                    "request_id was already used for a different delivery"
+                )
+            if _delivery_receipt_is_completed(receipt):
+                return receipt
+            canonical = completed_values(receipt)
+            tx.set(
+                receipt_ref,
+                {**canonical, "updated_at": firestore.SERVER_TIMESTAMP},
+            )
+            return canonical
+
+        return commit(transaction)
+
+    receipt = get_delivery_receipt(
+        sender_user_id, SHARED_AI_ROUTE, request_id
+    ) or {}
+    if not receipt or receipt.get("payload_hash") != payload_hash:
+        raise ValueError("request_id was already used for a different delivery")
+    if _delivery_receipt_is_completed(receipt):
+        return receipt
+    canonical = completed_values(receipt)
+    save_delivery_receipt(
+        sender_user_id, SHARED_AI_ROUTE, request_id, canonical
+    )
+    return canonical
 
 
 def _claim_shared_ai_publish_target(
@@ -5646,7 +5706,21 @@ def complete_shared_convia_invocation(
                     payload_hash=payload_hash,
                     receipt=receipt,
                 )
-        return _shared_ai_failure_response(human_response)
+        receipt = finalize_shared_ai_wait_timeout(
+            sender_user_id=sender_user_id,
+            recipient_user_id=recipient_user_id,
+            request_id=request_id,
+            payload_hash=payload_hash,
+            friendship_generation=generation,
+            human_response=human_response,
+        )
+        return _replay_shared_ai_receipt(
+            sender_user_id=sender_user_id,
+            recipient_user_id=recipient_user_id,
+            request_id=request_id,
+            payload_hash=payload_hash,
+            receipt=receipt,
+        )
 
     owner_token = receipt["owner_token"]
     quota_error = enforce_openai_quota(sender_user_id, "text")
@@ -5669,7 +5743,9 @@ def complete_shared_convia_invocation(
     contact_name = recipient_data.get("display_name") or "Contact"
     try:
         history = get_chat_messages(
-            sender_user_id, recipient_user_id, history_range=200
+            sender_user_id,
+            recipient_user_id,
+            history_range=MAX_SHARED_AI_HISTORY_CANDIDATES,
         )
     except Exception:
         history = []

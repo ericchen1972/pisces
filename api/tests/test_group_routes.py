@@ -1946,6 +1946,173 @@ def test_shared_convia_concurrent_loser_replays_completed_receipt_without_cost(
     assert response == completed["response"]
 
 
+def test_shared_convia_wait_timeout_durably_wins_over_late_owner_success(
+    monkeypatch
+):
+    firestore = _shared_convia_firestore(monkeypatch)
+    request_id = "mention-timeout-canonical"
+    generation = "accepted_at:generation-1"
+    original_text = "Convia wait beyond loser bound"
+    human_response = {
+        "ok": True,
+        "message": {
+            "message_id": "human-timeout",
+            "text": original_text,
+            "client_request_id": request_id,
+        },
+    }
+    direct_receipt_id = main.hashlib.sha256(
+        f"direct_text:{request_id}".encode()
+    ).hexdigest()
+    firestore.seed(
+        f"users/user-a/delivery_receipts/{direct_receipt_id}",
+        state="completed",
+        friendship_generation=generation,
+        response=human_response,
+    )
+    payload_hash = main.shared_ai_payload_hash(
+        "user-a", "user-b", request_id, original_text, generation
+    )
+    mention_receipt_id = main.hashlib.sha256(
+        f"shared_ai_mention:{request_id}".encode()
+    ).hexdigest()
+    mention_receipt_path = (
+        f"users/user-a/delivery_receipts/{mention_receipt_id}"
+    )
+    firestore.seed(
+        mention_receipt_path,
+        state="processing",
+        payload_hash=payload_hash,
+        owner_token="slow-owner",
+        lease_expires_at=main.datetime.now(main.timezone.utc)
+        + main.timedelta(seconds=300),
+        friendship_generation=generation,
+        contact_id="user-b",
+    )
+    monkeypatch.setattr(main, "SHARED_AI_WAIT_ATTEMPTS", 1)
+    monkeypatch.setattr(main, "SHARED_AI_WAIT_SECONDS", 0)
+    monkeypatch.setattr(
+        main,
+        "enforce_openai_quota",
+        lambda *_args: pytest.fail("loser must not consume quota"),
+    )
+    monkeypatch.setattr(
+        main,
+        "generate_shared_convia_text",
+        lambda **_kwargs: pytest.fail("loser must not call provider"),
+    )
+
+    loser_response = main.complete_shared_convia_invocation(
+        sender_user_id="user-a",
+        recipient_user_id="user-b",
+        request_id=request_id,
+        original_text=original_text,
+        human_response=human_response,
+        idempotent=True,
+    )
+
+    canonical = firestore.read(mention_receipt_path)
+    assert canonical["state"] == "completed"
+    assert canonical["response"] == loser_response
+    assert loser_response["convia_error"] == "convia_unavailable"
+
+    late_receipt, created = main.persist_delivery_once(
+        user_id="user-a",
+        route_name=main.SHARED_AI_ROUTE,
+        request_id=request_id,
+        payload_hash=payload_hash,
+        owner_token="slow-owner",
+        friendship_user_ids=("user-a", "user-b"),
+        expected_friendship_generation=generation,
+        message_writes=[
+            {
+                "user_id": "user-a",
+                "contact_id": "user-b",
+                "role": "ai_proxy",
+                "text": "late divergent success",
+                "message_id": "late-ai",
+            }
+        ],
+        meta_writes=[],
+        receipt_data={
+            "response": {
+                **human_response,
+                "convia_message": {"text": "late divergent success"},
+            }
+        },
+    )
+
+    assert created is False
+    assert late_receipt["response"] == loser_response
+    assert firestore.read("users/user-a/chats/user-b/messages/late-ai") is None
+
+    replay = main.complete_shared_convia_invocation(
+        sender_user_id="user-a",
+        recipient_user_id="user-b",
+        request_id=request_id,
+        original_text=original_text,
+        human_response=human_response,
+        idempotent=True,
+    )
+    assert replay == loser_response
+
+
+def test_shared_convia_fetches_enough_candidates_before_selecting_newest_50(
+    signed_in_client, monkeypatch
+):
+    _shared_convia_firestore(monkeypatch)
+    records = [
+        {
+            "id": f"shared-{index}",
+            "role": "user" if index % 2 == 0 else "peer",
+            "text": f"shared-{index}",
+            "visibility": "shared",
+        }
+        for index in range(70)
+    ]
+    records.extend(
+        {
+            "id": f"private-{index}",
+            "role": "assist_ai",
+            "text": f"private-{index}",
+            "visibility": "private_to_user",
+        }
+        for index in range(15)
+    )
+    records.extend([None, "malformed", {"role": "peer", "text": ""}])
+    fetched_ranges = []
+    monkeypatch.setattr(
+        main,
+        "get_chat_messages",
+        lambda _uid, _cid, history_range: fetched_ranges.append(history_range)
+        or records,
+    )
+    generated = []
+    monkeypatch.setattr(
+        main,
+        "generate_shared_convia_text",
+        lambda **kwargs: generated.append(kwargs) or "bounded answer",
+    )
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *_args: None)
+
+    response = signed_in_client.post(
+        "/api/messages/send",
+        json={
+            "recipient_user_id": "user-b",
+            "text": "Convia bounded context",
+            "request_id": "mention-context-candidates",
+        },
+    )
+
+    assert response.status_code == 200
+    assert fetched_ranges == [main.MAX_SHARED_AI_HISTORY_CANDIDATES]
+    selected = generated[0]["shared_history"]
+    assert len(selected) == 50
+    assert selected[0]["text"] == "shared-20"
+    assert selected[-1]["text"] == "shared-69"
+    assert all(not item["text"].startswith("private-") for item in selected)
+
+
 def test_two_shared_convia_callers_use_their_own_prompts(app, monkeypatch):
     _shared_convia_firestore(monkeypatch)
     prompts = []
