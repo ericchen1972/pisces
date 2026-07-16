@@ -1901,6 +1901,63 @@ def test_send_voice_route_uses_openai_transcription_and_preserves_shared_deliver
     assert response.get_json()["message"] == published[0][1]
 
 
+def test_send_voice_route_convia_transcript_stays_human_voice_message(
+    signed_in_client, route_stubs, monkeypatch
+):
+    service, saved = route_stubs
+    service.transcription_text = "Convia, summarize this for Amy"
+    monkeypatch.setattr(main, "accepted_friendship_exists", lambda *_args: True)
+    monkeypatch.setattr(
+        main,
+        "complete_shared_convia_invocation",
+        lambda **_kwargs: pytest.fail("voice transcripts must not invoke shared AI"),
+    )
+    monkeypatch.setattr(
+        main,
+        "get_firestore_client",
+        lambda: SimpleNamespace(
+            collection=lambda _name: SimpleNamespace(
+                document=lambda _uid: SimpleNamespace(
+                    get=lambda: SimpleNamespace(
+                        exists=True,
+                        to_dict=lambda: {"display_name": "Bo", "avatar_url": ""},
+                    )
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(main, "persist_friend_delivery", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        main, "confirm_friend_delivery_before_publish", lambda *_args: True
+    )
+    monkeypatch.setattr(
+        main, "upload_audio_to_vercel_blob", lambda *_args: "https://blob/voice.webm"
+    )
+    published = []
+    monkeypatch.setattr(
+        main,
+        "publish_user_channel_message",
+        lambda user_id, payload: published.append((user_id, payload)),
+    )
+
+    response = signed_in_client.post(
+        "/api/messages/send-voice",
+        json={
+            "recipient_user_id": "user-b",
+            "audio_base64": base64.b64encode(b"voice").decode("ascii"),
+            "mime_type": "audio/webm",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()["message"]
+    assert payload["text"] == ""
+    assert payload["audio_url"] == "https://blob/voice.webm"
+    assert published == [("user-b", payload)]
+    assert "convia_message" not in response.get_json()
+    assert saved == []
+
+
 @pytest.mark.parametrize(
     ("failure_stage", "expected_status"),
     [("blob", 502), ("firestore", 500), ("ably", 200)],
@@ -2012,6 +2069,41 @@ def test_voice_chat_routes_openai_transcription_into_openai_text_reply(
     assert [name for name, _kwargs in service.calls].count("transcribe") == 1
     assert any(name == "generate_text" for name, _kwargs in service.calls)
     assert [item[2] for item in saved][-2:] == ["user", "ai"]
+
+
+def test_voice_chat_never_synthesizes_ai_audio_response(
+    signed_in_client, route_stubs, monkeypatch
+):
+    service, _saved = route_stubs
+    service.transcription_text = "Read this aloud"
+    service.chat_decision = {
+        "should_read_aloud": True,
+        "language": "en-US",
+        "tone_prompt": "warm",
+        "reason": "requested",
+    }
+    monkeypatch.setattr(
+        main,
+        "synthesize_tts_audio",
+        lambda *_args, **_kwargs: pytest.fail("voice-chat must return text only"),
+    )
+
+    response = signed_in_client.post(
+        "/api/voice-chat",
+        json={
+            "audio_base64": base64.b64encode(b"voice-bytes").decode("ascii"),
+            "mime_type": "audio/webm",
+            "locale": "en-US",
+            "contact_id": "pisces-core",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["reply"] == "OpenAI reply"
+    assert payload["audio_base64"] == ""
+    assert payload["audio_mime_type"] == ""
+    assert payload["tts"]["should_read_aloud"] is False
 
 
 def test_assist_outbound_voice_uses_saved_openai_voice_and_preserves_delivery(

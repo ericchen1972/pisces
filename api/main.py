@@ -2507,6 +2507,7 @@ def generate_ai_reply(
     history_messages,
     extra_context_text="",
     user_id="",
+    allow_synthesized_audio=True,
 ):
     global_prompt = ai_settings.get("global_prompt") or AI_DEFAULT_GLOBAL_PROMPT
     voice_name = ai_settings.get("openai_voice") or DEFAULT_AI_SETTINGS["openai_voice"]
@@ -2540,6 +2541,13 @@ def generate_ai_reply(
             )
     audio_b64 = ""
     audio_mime_type = ""
+
+    if not allow_synthesized_audio:
+        decision.update(
+            should_read_aloud=False,
+            tone_prompt="",
+            reason="audio_disabled",
+        )
 
     if decision["should_read_aloud"]:
         try:
@@ -4453,6 +4461,7 @@ def voice_chat():
             history_messages,
             extra_context_text=extra_context_text,
             user_id=user_id,
+            allow_synthesized_audio=False,
         )
     except Exception as exc:
         return jsonify({"error": "AI reply is currently unavailable.", "transcript": transcript}), 502
