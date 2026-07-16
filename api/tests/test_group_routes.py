@@ -1567,6 +1567,424 @@ def test_direct_request_id_conflict_is_409_and_legacy_request_remains_supported(
     assert conflict.status_code == 409
 
 
+def _shared_convia_firestore(monkeypatch):
+    firestore = FakeFirestoreClient()
+    firestore.seed("users/user-a", display_name="Alice", ai_global_prompt="Alice style")
+    firestore.seed("users/user-b", display_name="Bob", ai_global_prompt="Bob style")
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        status="accepted",
+        accepted_at="generation-1",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    return firestore
+
+
+def test_ordinary_text_never_calls_shared_convia_provider(
+    signed_in_client, monkeypatch
+):
+    _shared_convia_firestore(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        main,
+        "generate_shared_convia_text",
+        lambda **kwargs: calls.append(kwargs) or "unexpected",
+        raising=False,
+    )
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *_args: None)
+
+    response = signed_in_client.post(
+        "/api/messages/send",
+        json={
+            "recipient_user_id": "user-b",
+            "text": "hello Convia later",
+            "request_id": "ordinary-1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == []
+    assert "convia_message" not in response.get_json()
+
+
+def test_shared_convia_uses_caller_prompt_and_writes_identical_shared_ai_copies(
+    signed_in_client, monkeypatch
+):
+    firestore = _shared_convia_firestore(monkeypatch)
+    generated = []
+    monkeypatch.setattr(
+        main,
+        "generate_shared_convia_text",
+        lambda **kwargs: generated.append(kwargs) or "Weekend weather looks good.",
+        raising=False,
+    )
+    published = []
+    monkeypatch.setattr(
+        main,
+        "publish_user_channel_message",
+        lambda uid, payload: published.append((uid, payload)),
+    )
+
+    response = signed_in_client.post(
+        "/api/messages/send",
+        json={
+            "recipient_user_id": "user-b",
+            "text": "Convia, check the weekend",
+            "request_id": "mention-1",
+            "global_prompt": "CLIENT MUST BE IGNORED",
+            "convia": True,
+        },
+    )
+
+    body = response.get_json()
+    assert response.status_code == 200
+    assert body["message"]["text"] == "Convia, check the weekend"
+    assert body["convia_message"]["text"] == "Weekend weather looks good."
+    assert body["convia_message"]["sender_mode"] == "ai_proxy"
+    assert generated[0]["global_prompt"] == "Alice style"
+    assert "CLIENT MUST BE IGNORED" not in repr(generated)
+    ai_id = body["convia_message"]["message_id"]
+    caller_copy = firestore.read(f"users/user-a/chats/user-b/messages/{ai_id}")
+    recipient_copy = firestore.read(f"users/user-b/chats/user-a/messages/{ai_id}")
+    assert caller_copy["role"] == recipient_copy["role"] == "ai_proxy"
+    assert caller_copy["text"] == recipient_copy["text"]
+    assert caller_copy["created_at"] == recipient_copy["created_at"]
+    assert caller_copy["visibility"] == recipient_copy["visibility"] == "shared"
+    assert caller_copy["sender_mode"] == recipient_copy["sender_mode"] == "ai_proxy"
+    assert firestore.read("users/user-a/chat_meta/user-b")["last_message_preview"] == "Weekend weather looks good."
+    recipient_meta = firestore.read("users/user-b/chat_meta/user-a")
+    assert recipient_meta["last_message_preview"] == "Weekend weather looks good."
+    assert getattr(recipient_meta["unread_count"], "value", recipient_meta["unread_count"]) == 2
+    assert {uid for uid, _payload in published} == {"user-a", "user-b"}
+    caller_payload = next(
+        payload
+        for uid, payload in published
+        if uid == "user-a" and payload.get("sender_mode") == "ai_proxy"
+    )
+    recipient_payload = next(
+        payload
+        for uid, payload in published
+        if uid == "user-b" and payload.get("sender_mode") == "ai_proxy"
+    )
+    assert caller_payload["sender_user_id"] == "user-b"
+    assert recipient_payload["sender_user_id"] == "user-a"
+    assert caller_payload["message_id"] == recipient_payload["message_id"] == ai_id
+    assert caller_payload["visibility"] == recipient_payload["visibility"] == "shared"
+    assert caller_payload["client_request_id"] == recipient_payload["client_request_id"] == "mention-1"
+    mention_receipt_id = main.hashlib.sha256(
+        b"shared_ai_mention:mention-1"
+    ).hexdigest()
+    mention_receipt = firestore.read(
+        f"users/user-a/delivery_receipts/{mention_receipt_id}"
+    )
+    serialized_receipt = repr(mention_receipt)
+    assert "Alice style" not in serialized_receipt
+    assert "CLIENT MUST BE IGNORED" not in serialized_receipt
+
+
+def test_shared_convia_replay_calls_provider_once_and_does_not_duplicate_unread(
+    signed_in_client, monkeypatch
+):
+    firestore = _shared_convia_firestore(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        main,
+        "generate_shared_convia_text",
+        lambda **kwargs: calls.append(kwargs) or "One answer",
+        raising=False,
+    )
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *_args: None)
+    payload = {
+        "recipient_user_id": "user-b",
+        "text": "Convia: answer once",
+        "request_id": "mention-replay-1",
+    }
+
+    first = signed_in_client.post("/api/messages/send", json=payload)
+    second = signed_in_client.post("/api/messages/send", json=payload)
+
+    assert first.status_code == second.status_code == 200
+    assert first.get_json() == second.get_json()
+    assert len(calls) == 1
+    ai_id = first.get_json()["convia_message"]["message_id"]
+    assert len([path for path in firestore.data if path[-2:] == ("messages", ai_id)]) == 2
+    unread = firestore.read("users/user-b/chat_meta/user-a")["unread_count"]
+    assert getattr(unread, "value", unread) == 2
+
+
+def test_shared_convia_provider_failure_is_generic_durable_and_replayable(
+    signed_in_client, monkeypatch
+):
+    firestore = _shared_convia_firestore(monkeypatch)
+    calls = []
+
+    def fail_provider(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("private provider body")
+
+    monkeypatch.setattr(main, "generate_shared_convia_text", fail_provider, raising=False)
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *_args: None)
+    payload = {
+        "recipient_user_id": "user-b",
+        "text": "Convia: fail safely",
+        "request_id": "mention-failure-1",
+    }
+
+    first = signed_in_client.post("/api/messages/send", json=payload)
+    second = signed_in_client.post("/api/messages/send", json=payload)
+
+    assert first.status_code == second.status_code == 200
+    assert first.get_json() == second.get_json()
+    assert first.get_json()["convia_error"] == "convia_unavailable"
+    assert "private provider body" not in repr(first.get_json())
+    assert len(calls) == 1
+    assert not any(
+        values.get("role") == "ai_proxy" for values in firestore.data.values()
+    )
+
+
+def test_legacy_shared_convia_persists_human_without_provider(
+    signed_in_client, monkeypatch
+):
+    firestore = _shared_convia_firestore(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        main,
+        "generate_shared_convia_text",
+        lambda **kwargs: calls.append(kwargs) or "must not run",
+        raising=False,
+    )
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *_args: None)
+
+    response = signed_in_client.post(
+        "/api/messages/send",
+        json={"recipient_user_id": "user-b", "text": "Convia legacy"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["convia_error"] == "convia_unavailable"
+    assert calls == []
+    human_id = response.get_json()["message"]["message_id"]
+    assert firestore.read(f"users/user-a/chats/user-b/messages/{human_id}") is not None
+    assert firestore.read(f"users/user-b/chats/user-a/messages/{human_id}") is not None
+
+
+def test_shared_convia_generation_change_after_provider_keeps_only_human(
+    signed_in_client, monkeypatch
+):
+    firestore = _shared_convia_firestore(monkeypatch)
+
+    def change_generation(**_kwargs):
+        firestore.data[("friendships", "user-a_user-b")]["accepted_at"] = "generation-2"
+        return "must be discarded"
+
+    monkeypatch.setattr(main, "generate_shared_convia_text", change_generation, raising=False)
+    published = []
+    monkeypatch.setattr(
+        main,
+        "publish_user_channel_message",
+        lambda uid, payload: published.append((uid, payload)),
+    )
+
+    response = signed_in_client.post(
+        "/api/messages/send",
+        json={
+            "recipient_user_id": "user-b",
+            "text": "Convia generation race",
+            "request_id": "mention-generation-1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["convia_error"] == "convia_unavailable"
+    assert "convia_message" not in response.get_json()
+    assert not any(values.get("role") == "ai_proxy" for values in firestore.data.values())
+    assert [uid for uid, payload in published if payload.get("sender_mode") == "ai_proxy"] == []
+
+
+def test_human_publish_failure_does_not_skip_shared_convia_phase(
+    signed_in_client, monkeypatch
+):
+    _shared_convia_firestore(monkeypatch)
+    monkeypatch.setattr(
+        main,
+        "generate_shared_convia_text",
+        lambda **_kwargs: "Durable AI answer",
+    )
+    ai_published = []
+
+    def publish(uid, payload):
+        if payload.get("sender_mode") == "user":
+            raise RuntimeError("human realtime offline")
+        ai_published.append((uid, payload))
+
+    monkeypatch.setattr(main, "publish_user_channel_message", publish)
+
+    response = signed_in_client.post(
+        "/api/messages/send",
+        json={
+            "recipient_user_id": "user-b",
+            "text": "Convia keep going",
+            "request_id": "mention-human-publish-fail",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["realtime_delivered"] is False
+    assert response.get_json()["convia_message"]["text"] == "Durable AI answer"
+    assert {uid for uid, _payload in ai_published} == {"user-a", "user-b"}
+
+
+def test_shared_convia_publish_replay_retries_only_missing_target_without_rewrites(
+    signed_in_client, monkeypatch
+):
+    firestore = _shared_convia_firestore(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        main,
+        "generate_shared_convia_text",
+        lambda **_kwargs: "Publish once",
+    )
+    recipient_ai_attempts = []
+    caller_ai_deliveries = []
+
+    def flaky_publish(uid, payload):
+        if payload.get("sender_mode") != "ai_proxy":
+            return
+        if uid == "user-b":
+            recipient_ai_attempts.append(payload["message_id"])
+            if len(recipient_ai_attempts) == 1:
+                raise RuntimeError("recipient realtime offline")
+        else:
+            caller_ai_deliveries.append(payload["message_id"])
+        calls.append((uid, payload["message_id"]))
+
+    monkeypatch.setattr(main, "publish_user_channel_message", flaky_publish)
+    payload = {
+        "recipient_user_id": "user-b",
+        "text": "Convia publish retry",
+        "request_id": "mention-publish-retry",
+    }
+
+    first = signed_in_client.post("/api/messages/send", json=payload)
+    ai_id = first.get_json()["convia_message"]["message_id"]
+    durable_before = {
+        path: dict(values)
+        for path, values in firestore.data.items()
+        if path[-2:] == ("messages", ai_id)
+    }
+    second = signed_in_client.post("/api/messages/send", json=payload)
+
+    assert first.status_code == second.status_code == 200
+    assert caller_ai_deliveries == [ai_id]
+    assert recipient_ai_attempts == [ai_id, ai_id]
+    assert calls.count(("user-b", ai_id)) == 1
+    assert {
+        path: dict(values)
+        for path, values in firestore.data.items()
+        if path[-2:] == ("messages", ai_id)
+    } == durable_before
+    unread = firestore.read("users/user-b/chat_meta/user-a")["unread_count"]
+    assert getattr(unread, "value", unread) == 2
+
+
+def test_shared_convia_concurrent_loser_replays_completed_receipt_without_cost(
+    monkeypatch
+):
+    human_response = {"ok": True, "message": {"message_id": "human-1"}}
+    generation = "accepted_at:generation-1"
+    payload_hash = main.shared_ai_payload_hash(
+        "user-a", "user-b", "mention-loser", "Convia wait", generation
+    )
+    completed = {
+        "state": "completed",
+        "payload_hash": payload_hash,
+        "friendship_generation": generation,
+        "published": True,
+        "response": {**human_response, "convia_error": "convia_unavailable"},
+    }
+    monkeypatch.setattr(main, "get_firestore_client", lambda: object())
+    monkeypatch.setattr(
+        main, "current_friendship_generation", lambda *_args: generation
+    )
+    monkeypatch.setattr(
+        main,
+        "reserve_delivery_request",
+        lambda **_kwargs: (
+            {
+                "state": "processing",
+                "payload_hash": payload_hash,
+                "lease_expires_at": main.datetime.now(main.timezone.utc)
+                + main.timedelta(seconds=30),
+            },
+            False,
+        ),
+    )
+    monkeypatch.setattr(main, "get_delivery_receipt", lambda *_args: completed)
+    monkeypatch.setattr(
+        main,
+        "enforce_openai_quota",
+        lambda *_args: pytest.fail("loser must not consume quota"),
+    )
+    monkeypatch.setattr(
+        main,
+        "generate_shared_convia_text",
+        lambda **_kwargs: pytest.fail("loser must not call provider"),
+    )
+
+    response = main.complete_shared_convia_invocation(
+        sender_user_id="user-a",
+        recipient_user_id="user-b",
+        request_id="mention-loser",
+        original_text="Convia wait",
+        human_response=human_response,
+        idempotent=True,
+    )
+
+    assert response == completed["response"]
+
+
+def test_two_shared_convia_callers_use_their_own_prompts(app, monkeypatch):
+    _shared_convia_firestore(monkeypatch)
+    prompts = []
+    monkeypatch.setattr(
+        main,
+        "generate_shared_convia_text",
+        lambda **kwargs: prompts.append((kwargs["user_id"], kwargs["global_prompt"]))
+        or f"reply for {kwargs['user_id']}",
+    )
+    monkeypatch.setattr(main, "publish_user_channel_message", lambda *_args: None)
+    user_a = app.test_client()
+    user_b = app.test_client()
+    for client, user_id in ((user_a, "user-a"), (user_b, "user-b")):
+        with client.session_transaction() as session:
+            session["user_id"] = user_id
+            session["provider"] = "tester"
+            session["email"] = f"{user_id}@example.com"
+
+    first = user_a.post(
+        "/api/messages/send",
+        json={
+            "recipient_user_id": "user-b",
+            "text": "Convia from Alice",
+            "request_id": "mention-alice",
+        },
+    )
+    second = user_b.post(
+        "/api/messages/send",
+        json={
+            "recipient_user_id": "user-a",
+            "text": "Convia from Bob",
+            "request_id": "mention-bob",
+        },
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert prompts == [("user-a", "Alice style"), ("user-b", "Bob style")]
+
+
 def test_delete_after_voice_persistence_before_publish_revokes_delivery(
     signed_in_client, monkeypatch
 ):

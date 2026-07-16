@@ -252,3 +252,54 @@ def test_every_paid_route_has_server_quota_wiring():
         next_starts = [source.find(marker, start + len(function_marker)) for marker in route_categories if source.find(marker, start + len(function_marker)) >= 0]
         end = min(next_starts) if next_starts else len(source)
         assert quota_marker in source[start:end], function_marker
+
+
+@pytest.mark.parametrize("text", [123, ["Convia", "bad"], {"text": "Convia bad"}])
+def test_messages_send_rejects_non_string_text_before_quota_or_provider(
+    signed_in_client, monkeypatch, text
+):
+    monkeypatch.setattr(
+        main,
+        "enforce_openai_quota",
+        lambda *_a, **_k: pytest.fail("invalid input must not consume quota"),
+    )
+    monkeypatch.setattr(
+        main,
+        "get_openai_service",
+        lambda: pytest.fail("invalid input must not reach OpenAI"),
+    )
+
+    response = signed_in_client.post(
+        "/api/messages/send",
+        json={"recipient_user_id": "user-b", "text": text, "request_id": "bad-text"},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {"ok": False, "error": "text must be a string"}
+
+
+def test_messages_send_rejects_oversize_text_before_quota_or_provider(
+    signed_in_client, monkeypatch
+):
+    monkeypatch.setattr(
+        main,
+        "enforce_openai_quota",
+        lambda *_a, **_k: pytest.fail("invalid input must not consume quota"),
+    )
+    monkeypatch.setattr(
+        main,
+        "get_openai_service",
+        lambda: pytest.fail("invalid input must not reach OpenAI"),
+    )
+
+    response = signed_in_client.post(
+        "/api/messages/send",
+        json={
+            "recipient_user_id": "user-b",
+            "text": "Convia " + "x" * main.MAX_CHAT_TEXT_CHARS,
+            "request_id": "too-long-text",
+        },
+    )
+
+    assert response.status_code == 413
+    assert response.get_json() == {"ok": False, "error": "text is too long"}
