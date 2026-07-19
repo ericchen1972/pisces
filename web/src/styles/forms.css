@@ -5,6 +5,9 @@
 .login-card > p { margin: 0; color: var(--muted); line-height: 1.5; }
 .google-signin { width: 100%; min-height: 46px; display: flex; align-items: center; justify-content: center; }
 .google-signin__target { min-width: 210px; min-height: 36px; }
+.login-card__demo-actions { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.login-card__demo-actions .secondary-button { min-height: 42px; padding: 9px 12px; border: 1px solid #565656; border-radius: 10px; background: #2f2f2f; color: var(--text); cursor: pointer; }
+.login-card__demo-actions .secondary-button:hover { border-color: #777; background: #383838; }
 .text-button { border: 0; background: transparent; color: #d5d5d5; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
 .form-stack { display: grid; gap: 16px; }
 .form-stack textarea { width: 100%; padding: 10px; border: 1px solid #565656; border-radius: 8px; background: #2f2f2f; color: var(--text); resize: vertical; }
@@ -35,6 +38,7 @@
 .utility-card summary { cursor: pointer; color: var(--muted); }
 @media (max-width: 520px) {
   .login-card { padding: 34px 20px; }
+  .login-card__demo-actions { grid-template-columns: 1fr; }
   .profile-editor { grid-template-columns: 1fr; justify-items: start; }
   .profile-editor--ai { justify-items: center; text-align: center; }
   .voice-preview-row { align-items: stretch; flex-direction: column; }

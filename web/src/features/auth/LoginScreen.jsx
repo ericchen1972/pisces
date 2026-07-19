@@ -1,4 +1,13 @@
-export default function LoginScreen({ locale = 'en', googleButtonRef, isLoggingIn = false, error = '', testerLoginEnabled = false, judyLoginEnabled = false, onOpenTesterLogin, onJudyLogin }) {
+export default function LoginScreen({
+  locale = 'en',
+  googleButtonRef,
+  isLoggingIn = false,
+  error = '',
+  testerLoginEnabled = false,
+  demoLoginError = '',
+  onOpenTesterLogin,
+  onOpenDemoAccount,
+}) {
   const zh = locale === 'zh-TW'
   return (
     <main className="login-screen">
@@ -11,19 +20,19 @@ export default function LoginScreen({ locale = 'en', googleButtonRef, isLoggingI
         </div>
         {isLoggingIn ? <p className="form-status" role="status">{zh ? '登入中…' : 'Signing in…'}</p> : null}
         {error ? <p className="form-error" role="alert">{error}</p> : null}
-        {testerLoginEnabled || judyLoginEnabled ? (
-          <div className="login-card__tester-links">
-            {testerLoginEnabled ? (
-            <button type="button" className="text-button" onClick={onOpenTesterLogin}>
-              {zh ? '測試帳號登入' : 'Tester login'}
-            </button>
-            ) : null}
-            {judyLoginEnabled ? (
-            <button type="button" className="text-button" onClick={onJudyLogin}>
-              {zh ? 'Judy 登入' : 'Sign in as Judy'}
-            </button>
-            ) : null}
-          </div>
+        <div className="login-card__demo-actions" aria-label={zh ? '黑客松測試帳號' : 'Hackathon demo accounts'}>
+          <button type="button" className="secondary-button" onClick={() => onOpenDemoAccount('judy')}>
+            {zh ? '用 Judy 登入' : 'Sign in as Judy'}
+          </button>
+          <button type="button" className="secondary-button" onClick={() => onOpenDemoAccount('haland')}>
+            {zh ? '用 Haland 登入' : 'Sign in as Haland'}
+          </button>
+        </div>
+        {demoLoginError ? <p className="form-error" role="alert">{demoLoginError}</p> : null}
+        {testerLoginEnabled ? (
+          <button type="button" className="text-button" onClick={onOpenTesterLogin}>
+            {zh ? '測試帳號登入' : 'Tester login'}
+          </button>
         ) : null}
       </section>
     </main>
