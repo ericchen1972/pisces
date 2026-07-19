@@ -132,27 +132,33 @@ def test_session_capability_and_disabled_tester_route(client, monkeypatch):
     )
 
     me = client.get("/api/session/me")
-    allowed_me = client.get(
-        "/api/session/me",
-        headers={"X-Forwarded-For": f"{main.JUDY_LOGIN_ALLOWED_IP}, 10.0.0.1"},
+    arbitrary = client.post("/api/auth/tester", json={"email": "a@example.com"})
+    spoofed_ip = client.post(
+        "/api/auth/tester",
+        json={"email": "eric@gods.tw"},
+        headers={"X-Forwarded-For": "220.135.118.126"},
     )
-    login = client.post("/api/auth/tester", json={"email": "a@example.com"})
-    judy_blocked = client.post("/api/auth/tester", json={"email": main.JUDY_TESTER_EMAIL})
     judy_login = client.post(
         "/api/auth/tester",
-        json={"email": main.JUDY_TESTER_EMAIL},
-        headers={"X-Forwarded-For": main.JUDY_LOGIN_ALLOWED_IP},
+        json={"email": " JUDY@GODS.TW "},
+    )
+    haland_login = client.post(
+        "/api/auth/tester",
+        json={"email": "haland@gods.tw"},
     )
 
     assert me.status_code == 200
     assert me.get_json()["tester_login_enabled"] is False
-    assert me.get_json()["judy_login_enabled"] is False
-    assert allowed_me.get_json()["judy_login_enabled"] is True
-    assert login.status_code == 404
-    assert login.get_json() == {"ok": False, "error": "not found"}
-    assert judy_blocked.status_code == 404
+    assert "judy_login_enabled" not in me.get_json()
+    assert arbitrary.status_code == 404
+    assert arbitrary.get_json() == {"ok": False, "error": "not found"}
+    assert spoofed_ip.status_code == 404
     assert judy_login.status_code == 200
-    assert judy_login.get_json()["user"]["email"] == main.JUDY_TESTER_EMAIL
+    assert judy_login.get_json()["user"]["email"] == "judy@gods.tw"
+    assert judy_login.get_json()["user"]["display_name"] == "Judy"
+    assert haland_login.status_code == 200
+    assert haland_login.get_json()["user"]["email"] == "haland@gods.tw"
+    assert haland_login.get_json()["user"]["display_name"] == "Haland"
 
 
 def test_tester_login_environment_flag_overrides_config(monkeypatch):

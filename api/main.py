@@ -26,6 +26,7 @@ from openai import OpenAI
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from contact_groups import ContactGroupError, ContactGroupService
+from demo_accounts import demo_account_for_email, is_public_demo_email
 from openai_service import OpenAIService
 from shared_convia import parse_convia_invocation, select_shared_history
 
@@ -183,30 +184,6 @@ def is_tester_login_enabled():
     if raw:
         return raw in {"1", "true", "yes", "on"}
     return not bool(os.getenv("K_SERVICE"))
-
-
-JUDY_TESTER_EMAIL = "judy@gods.tw"
-JUDY_LOGIN_ALLOWED_IP = "220.135.118.126"
-
-
-def is_judy_tester_email(email):
-    return (email or "").strip().lower() == JUDY_TESTER_EMAIL
-
-
-def request_client_ips():
-    forwarded_for = flask_request.headers.get("X-Forwarded-For", "")
-    ips = [
-        item.strip()
-        for item in forwarded_for.split(",")
-        if item.strip()
-    ]
-    if flask_request.remote_addr:
-        ips.append(flask_request.remote_addr)
-    return ips
-
-
-def is_judy_login_allowed():
-    return JUDY_LOGIN_ALLOWED_IP in request_client_ips()
 
 
 def resolve_session_secret():
@@ -5131,9 +5108,7 @@ def auth_tester():
     email = (body.get("email") or "").strip().lower()
     avatar_url = (body.get("avatar_url") or "").strip()
 
-    if not is_tester_login_enabled() and not (
-        is_judy_tester_email(email) and is_judy_login_allowed()
-    ):
+    if not is_tester_login_enabled() and not is_public_demo_email(email):
         return jsonify({"ok": False, "error": "not found"}), 404
 
     if not email:
@@ -5144,7 +5119,12 @@ def auth_tester():
         return jsonify({"ok": False, "error": "avatar_url must be a valid https URL"}), 400
 
     user_id = build_tester_user_id(email)
-    display_name = email.split("@", 1)[0] or "tester"
+    demo_account = demo_account_for_email(email)
+    display_name = (
+        demo_account["display_name"]
+        if demo_account
+        else (email.split("@", 1)[0] or "tester")
+    )
 
     try:
         client = get_firestore_client()
@@ -5208,7 +5188,6 @@ def session_me():
             "authenticated": False,
             "user": None,
             "tester_login_enabled": is_tester_login_enabled(),
-            "judy_login_enabled": is_judy_login_allowed(),
         })
     try:
         client = get_firestore_client()
@@ -5220,7 +5199,6 @@ def session_me():
                 "authenticated": False,
                 "user": None,
                 "tester_login_enabled": is_tester_login_enabled(),
-                "judy_login_enabled": is_judy_login_allowed(),
             })
         data = doc.to_dict() or {}
         user = {
@@ -5245,7 +5223,6 @@ def session_me():
             "authenticated": True,
             "user": user,
             "tester_login_enabled": is_tester_login_enabled(),
-            "judy_login_enabled": is_judy_login_allowed(),
         })
     except Exception as exc:
         return jsonify({"ok": False, "error": f"failed to load session user: {exc}"}), 500
