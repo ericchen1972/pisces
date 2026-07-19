@@ -1,26 +1,84 @@
 # Convia
 
-**AI-first communication app**
+**AI belongs in human conversation, not bolted onto a coding workspace.**
 
-Convia combines person-to-person messaging with an AI contact and private AI assistance inside friend conversations. Users can relay messages, generate image or music attachments, transcribe recorded audio, hear AI-generated speech, and call the AI through a Realtime voice session.
+ChatGPT Desktop's attempt to merge everyday conversation and Codex into one product is a failure of product shape. Coding work and daily human communication do not share the same rhythm, context, or purpose. Codex deserves a focused workspace. ChatGPT is better suited to becoming a messenger: a place where AI participates in real relationships and finally becomes the everyday life entry point OpenAI has repeatedly said it wants to build.
+
+Convia is a working version of that argument. It combines person-to-person messaging with an AI participant that can join a shared conversation, understand contact context, and relay messages without pretending to be either person.
+
+This project is submitted to **OpenAI Build Week — Apps for Your Life**.
+
+## Try the working project
+
+- Main app: [https://pisces-plum.vercel.app/](https://pisces-plum.vercel.app/)
+- Judy demo window: [https://convia-judy.vercel.app](https://convia-judy.vercel.app)
+- Haland demo window: [https://convia-haland.vercel.app](https://convia-haland.vercel.app)
+- Repository: [https://github.com/ericchen1972/pisces](https://github.com/ericchen1972/pisces)
+
+The two demo hostnames serve the same application but keep separate host-scoped Flask session cookies. This lets judges use Judy and Haland at the same time in one browser without weakening the normal authentication rules.
+
+### Judge walkthrough
+
+1. Open the main app.
+2. Click **Sign in as Judy**. Judy opens in a new window.
+3. Return to the main app and click **Sign in as Haland**. Haland opens on a different hostname.
+4. Keep both windows open. Judy and Haland are already mutual friends.
+5. Send a message from Judy to Haland and reply from Haland.
+6. In their shared conversation, invoke Convia and verify that both people can see the AI response.
+7. Open the fixed Convia contact to try private AI chat, media generation, recorded voice, or a Realtime voice call.
+
+Browser locales normalized to Traditional Chinese (`zh-TW` and supported Hant forms) receive Traditional Chinese labels. Every other locale, including Simplified Chinese, receives English.
+
+## What changed during Build Week
+
+Convia existed before the submission period as an experimental Pisces messaging application. Work added after the submission period began on July 13, 2026 is documented by dated commits and Codex task history.
+
+The largest meaningful extension is the complete **ChatGPT-like interface redesign**:
+
+- the previous purple, phone-shaped interface became a coherent dark desktop and mobile messaging product;
+- the conversation surface gained a centered composer, white user bubbles, and unbubbled Convia responses;
+- responsive contact groups and settings were integrated into the product instead of remaining separate experiments;
+- login, mobile navigation, conversation defaults, unread state, and account-scoped UI behavior were rebuilt and regression-tested.
+
+The eligible extension also includes:
+
+- migration of visible text and structured decisions to OpenAI Responses;
+- migration of transcription and speech synthesis to OpenAI Audio APIs;
+- migration of AI calls to OpenAI Realtime over WebRTC;
+- shared Convia mentions inside real-person conversations;
+- context-aware third-person message forwarding;
+- request idempotency, friendship-generation validation, delivery reconciliation, quotas, and bounded inputs;
+- two isolated judge accounts and a reproducible public demo flow.
+
+Gemini remains only for image generation and for planning Lyria music requests. It is not a fallback for Convia text, routing, speech, or calls.
+
+## What Convia does
+
+- Real-time person-to-person messaging with Firestore persistence and Ably delivery.
+- A fixed Convia contact for private AI conversation.
+- Shared Convia participation in a conversation between two real people.
+- Context-aware forwarding that keeps Convia in its own third-person role unless the user explicitly asks otherwise.
+- OpenAI Responses streaming and structured routing.
+- OpenAI transcription, text-to-speech, and Realtime voice calls.
+- Gemini image generation and Lyria music generation as independent media tools.
+- Account-synchronized contact groups, settings, unread state, and responsive desktop/mobile behavior.
 
 ## Architecture
 
-- Frontend: React and Vite, deployed on Vercel
-- Backend: Python and Flask, deployed on Google Cloud Run
+- Frontend: React 18 and Vite 5 on Vercel
+- Backend: Python and Flask on Google Cloud Run
 - Database: Firestore
-- Realtime message delivery: Ably channels (`user_<user_id>`)
+- Realtime delivery: Ably channels named `user_<user_id>`
 - Media storage: Vercel Blob
+- OpenAI: Responses, Audio, and Realtime APIs
 
-The existing deployment URLs and internal service identifiers intentionally remain unchanged for compatibility:
+Production keeps existing internal identifiers for compatibility:
 
-- Web: `https://pisces-plum.vercel.app/`
 - API: `https://pisces-315346868518.asia-east1.run.app`
-- AI contact identifier: `pisces-core`
+- AI contact ID: `pisces-core`
+- Repository and service name: `pisces`
 
-## AI providers and models
-
-OpenAI handles all text, routing, speech transcription, speech synthesis, and AI voice calls. The defaults can be overridden independently:
+## AI models
 
 | Capability | Environment variable | Default |
 | --- | --- | --- |
@@ -30,75 +88,142 @@ OpenAI handles all text, routing, speech transcription, speech synthesis, and AI
 | Recorded-audio transcription | `OPENAI_TRANSCRIBE_MODEL` | `gpt-4o-mini-transcribe` |
 | Text-to-speech | `OPENAI_TTS_MODEL` | `gpt-4o-mini-tts` |
 
-Set the OpenAI credential as `OPENAI_KEY`. `OPENAI_API_KEY` is supported as a fallback for standard OpenAI tooling and existing deployments.
+## Local setup
 
-Google Gemini is retained only for image generation and for planning Lyria music requests. Lyria is retained only for music generation. Gemini chat, Gemini TTS, Gemini Live, and Google Cloud Speech-to-Text are not part of Convia's text or voice paths.
+### Requirements
 
-Image generation tries these Gemini models in order:
+- Node.js 20
+- Python 3.12 or newer
+- A Firestore project or configured Google service-account credentials
+- OpenAI, Ably, and Vercel Blob credentials for their corresponding features
+- A Gemini key only if image or music generation is required
 
-- `gemini-3.1-flash-image-preview`
-- `gemini-3-pro-image-preview`
-- `gemini-2.5-flash-image`
-- `gemini-2.0-flash-exp-image-generation`
+### Backend
 
-Music generation uses `models/lyria-realtime-exp`.
+```bash
+cd api
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+cp config.example.json config.json
+```
 
-## Environment variables
+Replace the example values in the untracked `api/config.json`, then start Flask:
 
-Backend credentials and service configuration:
+```bash
+FLASK_APP=main flask run --debug --host 127.0.0.1 --port 8080
+```
 
-- `OPENAI_KEY` (or `OPENAI_API_KEY` fallback)
-- `OPENAI_SAFETY_SALT` in Cloud Run, unless a production `SESSION_SECRET` supplies the stable salt source
-- `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) for image and music only
-- `SESSION_SECRET`
-- `ABLY_KEY`
-- `BLOB_READ_WRITE_TOKEN` (with the existing `spices_READ_WRITE_TOKEN` and `VITE_BLOB_READ_WRITE_TOKEN` fallbacks)
-- `FIRESTORE_PROJECT_ID` and `FIRESTORE_DATABASE_ID` when overriding the existing internal project/database names
-- `GOOGLE_CLIENT_ID` for Google sign-in
-- `ENABLE_TESTER_LOGIN`: local development defaults to enabled; Cloud Run defaults to disabled. Set explicitly to `true` only for a controlled test deployment.
+### Frontend
 
-## OpenAI cost controls
+```bash
+cd web
+npm ci
+npm run dev -- --host 127.0.0.1 --port 5173
+```
 
-Every OpenAI-backed route requires an authenticated server session and applies a Firestore transaction quota keyed by the verified account ID and capability. Current limits are:
-
-| Capability | Per minute | Per hour |
-| --- | ---: | ---: |
-| Text chat and private assist | 20 | 200 |
-| Recorded AI voice chat | 6 | 40 |
-| Transcription | 12 | 100 |
-| Text-to-speech | 20 | 120 |
-| Realtime session issuance | 3 | 20 |
-
-Rejected requests return HTTP `429`, a `Retry-After` header, and a stable JSON error. Quota storage failures fail closed with HTTP `503`. A provider owner consumes quota once immediately before its provider attempt, even when the provider later fails. Completed idempotent replays and concurrent request losers do not consume quota; a quota rejection releases the request lease so the same request can be retried later.
-
-Text chat and assist input is limited to 20,000 characters, direct TTS input is capped at 4,096 characters (with tighter product read-aloud limits where applicable), and decoded audio is capped at 10 MiB. Authentication, schema/input checks, request-ID conflicts and completed replays, contact existence, and friendship validation happen before quota consumption and provider calls.
-
-## Local development
-
-Run the frontend and backend together:
+Or run both services from the repository root after the backend environment is prepared:
 
 ```bash
 ./dev.sh
 ```
 
-Default local URLs:
+### Environment variables
 
-- Web: `http://127.0.0.1:5173`
-- API: `http://127.0.0.1:8080`
+Backend credentials and configuration:
 
-## Tests
+- `OPENAI_KEY`, with `OPENAI_API_KEY` supported as a fallback
+- `OPENAI_SAFETY_SALT`
+- `GEMINI_API_KEY`, with `GOOGLE_API_KEY` supported as a fallback for media only
+- `SESSION_SECRET`
+- `ABLY_KEY`
+- `BLOB_READ_WRITE_TOKEN`
+- `FIRESTORE_PROJECT_ID` and `FIRESTORE_DATABASE_ID`
+- `GOOGLE_CLIENT_ID`
+- `ENABLE_TESTER_LOGIN`: defaults to enabled locally and disabled on Cloud Run
 
-Run the complete backend suite from the API directory:
+Frontend build configuration:
+
+- `VITE_DEMO_JUDY_URL=https://convia-judy.vercel.app`
+- `VITE_DEMO_HALAND_URL=https://convia-haland.vercel.app`
+
+The production tester exception accepts exactly `judy@gods.tw` and `haland@gods.tw`. It does not enable arbitrary tester email login, bypass friendship checks, or bypass OpenAI quotas.
+
+## Demo data
+
+Run the idempotent seed command with Firestore credentials configured:
 
 ```bash
 cd api
-pytest -q
+.venv/bin/python scripts/seed_build_week_demo.py
 ```
 
-Run the complete frontend suite and production build from the web directory:
+It creates or normalizes Judy and Haland, creates their default contact groups when absent, establishes one accepted mutual friendship, and places each friend in the other's default group. Re-running it does not duplicate accounts, groups, friendships, or chat metadata and does not delete judge conversations.
+
+## Tests
+
+Backend:
+
+```bash
+cd api
+.venv/bin/pytest -q
+```
+
+Frontend and production build:
 
 ```bash
 cd web
-npm test
+npm test -- --run
 npm run build
 ```
+
+GitHub Actions runs the same backend, frontend, and build checks on pushes and pull requests.
+
+## Cost and security boundaries
+
+Every OpenAI-backed route requires an authenticated server session. Firestore transactions enforce per-account capability quotas. Authentication, schema limits, request conflicts, completed replays, contact existence, and friendship validation occur before provider calls.
+
+Current limits:
+
+| Capability | Per minute | Per hour |
+| --- | ---: | ---: |
+| Text chat and shared Convia | 20 | 200 |
+| Recorded AI voice chat | 6 | 40 |
+| Transcription | 12 | 100 |
+| Text-to-speech | 20 | 120 |
+| Realtime session issuance | 3 | 20 |
+
+The public demo accounts are an authentication allowlist, not an authorization bypass. All normal data ownership, friendship, delivery, input-size, media, and quota checks still apply.
+
+## How Codex and GPT-5.6 were used
+
+The primary Codex task for the eligible core implementation is:
+
+```text
+019f6400-da42-7353-abc6-a45ecca1e4f1
+```
+
+Use `/feedback` in that task if the Devpost field requires the generated feedback identifier rather than the task UUID.
+
+Codex and GPT-5.6 accelerated:
+
+- repository-wide migration planning and dependency tracing;
+- the ChatGPT-like React redesign across desktop and mobile;
+- OpenAI Responses, Audio, and Realtime integration;
+- shared-conversation and forwarding data-flow implementation;
+- test-first regression fixes for authentication, messaging, mobile event order, replay, quotas, and delivery;
+- Cloud Run and Vercel deployment verification;
+- preparation of judge access and reproducible submission materials.
+
+The human decisions were the product thesis, the rejection of the current ChatGPT Desktop/Codex product shape, the Messenger direction, the rule that Convia keeps its own identity, the two-person shared-AI experience, the visible design criteria, and the final scope.
+
+## Known limitations
+
+- Google sign-in requires a configured client ID and authorized origins.
+- Realtime delivery depends on Ably; persisted messages reconcile after refresh if realtime delivery is interrupted.
+- Image and music generation use separate experimental Google providers and may have provider availability limits.
+- The two demo aliases must continue pointing to the same verified Vercel production deployment for the documented judge flow.
+
+## License
+
+[MIT](LICENSE)

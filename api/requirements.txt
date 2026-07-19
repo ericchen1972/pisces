@@ -1,7 +1,7 @@
-flask
-openai
-google-cloud-firestore
-google-genai
-ably
-cryptography
-pytest
+Flask==3.1.3
+openai==2.45.0
+google-cloud-firestore==2.23.0
+google-genai==1.65.0
+ably==2.0.12
+cryptography==46.0.5
+pytest==9.1.1
