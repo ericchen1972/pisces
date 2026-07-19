@@ -1,6 +1,6 @@
 .login-screen { min-height: 100dvh; display: grid; place-items: center; padding: 24px; background: #212121; color: var(--text); }
 .login-card { width: min(100%, 420px); display: grid; justify-items: center; gap: 16px; padding: 42px 32px; border: 1px solid #3f3f3f; border-radius: 18px; background: #171717; box-shadow: 0 24px 70px rgba(0,0,0,.4); text-align: center; }
-.login-wordmark { width: 54px; height: 54px; display: grid; place-items: center; border-radius: 14px; background: #ececec; color: #171717; font-size: 28px; font-weight: 700; }
+.login-wordmark { width: 54px; height: 54px; display: grid; place-items: center; border-radius: 14px; color: #171717; font-size: 28px; font-weight: 700; }
 .login-card h1 { margin: 0; font-size: 30px; letter-spacing: -.03em; }
 .login-card > p { margin: 0; color: var(--muted); line-height: 1.5; }
 .google-signin { width: 100%; min-height: 46px; display: flex; align-items: center; justify-content: center; }

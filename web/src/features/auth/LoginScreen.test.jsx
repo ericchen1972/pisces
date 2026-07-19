@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import LoginScreen from './LoginScreen.jsx'
@@ -75,5 +76,12 @@ describe('LoginScreen', () => {
 
     expect(container.querySelector('.google-signin__target')).toBeInTheDocument()
     expect(container.querySelector('.google-signin > svg')).not.toBeInTheDocument()
+  })
+
+  it('keeps the transparent login logo free of a painted background', () => {
+    const styles = readFileSync(`${process.cwd()}/src/styles/forms.css`, 'utf8')
+    const rule = styles.match(/\.login-wordmark\s*\{([^}]*)\}/)?.[1] ?? ''
+
+    expect(rule).not.toMatch(/background\s*:/)
   })
 })
