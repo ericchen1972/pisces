@@ -63,14 +63,16 @@ describe('remaining visible interface policy', () => {
     const restore = source.slice(source.indexOf('const restore = async () =>'), source.indexOf('const rawUi = localStorage'))
     const settingsSave = source.slice(source.indexOf('const saveUserSettings = async'), source.indexOf('const openAddFriendModal'))
     expect(restore).toContain('setTesterLoginEnabled(data?.tester_login_enabled === true)')
-    expect(restore).toContain('setJudyLoginEnabled(data?.judy_login_enabled === true)')
+    expect(source).not.toContain('judy_login_enabled')
+    expect(source).not.toContain('JUDY_LOGIN_ALLOWED_IP')
     expect(settingsSave).not.toContain('setTesterLoginEnabled')
   })
 
-  it('keeps Judy login pointed at the existing tester account with Eric relation', () => {
+  it('routes both public demo accounts through isolated windows', () => {
     const source = readFileSync(`${process.cwd()}/src/App.jsx`, 'utf8')
-    expect(source).toContain("email: 'judy@gods.tw'")
-    expect(source).not.toContain("email: 'judy@example.com'")
+    expect(source).toContain('openDemoWindow(key)')
+    expect(source).toContain('onOpenDemoAccount={openDemoAccount}')
+    expect(source).not.toContain('loginAsJudy')
   })
 
   it('uses same-origin API calls on the production host', () => {

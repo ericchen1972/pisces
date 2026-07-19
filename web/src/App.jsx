@@ -2,6 +2,12 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import * as Ably from 'ably'
 import { localeFromLanguage, visibleErrorMessage } from './lib/i18n.js'
 import {
+  DEMO_ACCOUNT_EMAILS,
+  demoAccountFromUrl,
+  openDemoWindow,
+  stripDemoLoginQuery,
+} from './lib/demoAccounts.js'
+import {
   applyContactGroupAssignment,
   applyDeletedContactGroup,
   applyLocalThenRefresh,
@@ -336,11 +342,12 @@ function LoginHome() {
   const isZh = useMemo(() => detectIsZhLocale(), [])
   const t = (enText, zhText) => tr(isZh, enText, zhText)
   const googleButtonRef = useRef(null)
+  const demoBootstrapStartedRef = useRef(false)
   const [googleError, setGoogleError] = useState('')
+  const [demoLoginError, setDemoLoginError] = useState('')
   const [isLoggingIn, setIsLoggingIn] = useState(false)
   const [isSignedIn, setIsSignedIn] = useState(false)
   const [testerLoginEnabled, setTesterLoginEnabled] = useState(false)
-  const [judyLoginEnabled, setJudyLoginEnabled] = useState(false)
   const [currentUser, setCurrentUser] = useState(null)
   const [selectedContact, setSelectedContact] = useState(null)
   const [chatInput, setChatInput] = useState('')
@@ -777,7 +784,7 @@ function LoginHome() {
     if (!email) {
       if (modal) setTesterError(t('Email is required.', '請輸入 Email。'))
       else setGoogleError(t('Email is required.', '請輸入 Email。'))
-      return
+      return false
     }
     const authTransition = authTransitionCoordinator.begin()
     try {
@@ -800,16 +807,18 @@ function LoginHome() {
         throw new Error(data.error || t(`Tester login failed (HTTP ${res.status})`, `測試帳號登入失敗（HTTP ${res.status}）`))
       }
       const authContext = applySignedInUser(data.user || null, authTransition)
-      if (!authContext) return
+      if (!authContext) return false
       initializeContactData(data.user || null, { authContext })
       setTesterModalOpen(false)
       setTesterEmail('')
       setTesterAvatarUrl('')
+      return true
     } catch (err) {
-      if (err?.name === 'AbortError') return
+      if (err?.name === 'AbortError') return false
       const message = visibleErrorMessage(err, isZh ? 'zh-TW' : 'en', 'Tester login failed.', '測試帳號登入失敗。')
       if (modal) setTesterError(message)
       else setGoogleError(message)
+      return false
     } finally {
       if (!authTransition.signal.aborted) {
         if (modal) setTesterSubmitting(false)
@@ -823,7 +832,14 @@ function LoginHome() {
     await loginTesterAccount({ email: testerEmail, avatarUrl: testerAvatarUrl, modal: true })
   }
 
-  const loginAsJudy = () => loginTesterAccount({ email: 'judy@gods.tw', modal: false })
+  const openDemoAccount = (key) => {
+    setDemoLoginError('')
+    if (openDemoWindow(key)) return
+    setDemoLoginError(t(
+      'Please allow pop-ups to open the demo account.',
+      '請允許彈出式視窗以開啟測試帳號。',
+    ))
+  }
 
   const openSettingsModal = () => {
     if (!isSignedIn || !currentUser?.id) return
@@ -1267,6 +1283,19 @@ function LoginHome() {
 
   useEffect(() => {
     const restore = async () => {
+      const demoAccountKey = demoAccountFromUrl(window.location.href)
+      if (demoAccountKey) {
+        if (demoBootstrapStartedRef.current) return
+        demoBootstrapStartedRef.current = true
+        const authenticated = await loginTesterAccount({
+          email: DEMO_ACCOUNT_EMAILS[demoAccountKey],
+          modal: false,
+        })
+        if (authenticated) {
+          window.history.replaceState({}, '', stripDemoLoginQuery(window.location.href))
+        }
+        return
+      }
       const authTransition = authTransitionCoordinator.begin()
       let activeRestoreContext = authTransition.context
       try {
@@ -1277,7 +1306,6 @@ function LoginHome() {
         })
         const data = await res.json()
         setTesterLoginEnabled(data?.tester_login_enabled === true)
-        setJudyLoginEnabled(data?.judy_login_enabled === true)
         if (res.ok && data?.ok && data?.authenticated && data?.user?.id) {
           const authContext = applySignedInUser(data.user, authTransition)
           if (authContext) {
@@ -2149,12 +2177,12 @@ function LoginHome() {
           isLoggingIn={isLoggingIn}
           error={googleError}
           testerLoginEnabled={testerLoginEnabled}
-          judyLoginEnabled={judyLoginEnabled}
+          demoLoginError={demoLoginError}
           onOpenTesterLogin={() => {
             setTesterError('')
             setTesterModalOpen(true)
           }}
-          onJudyLogin={loginAsJudy}
+          onOpenDemoAccount={openDemoAccount}
         />
         <TesterLoginDialog
           open={testerModalOpen}
