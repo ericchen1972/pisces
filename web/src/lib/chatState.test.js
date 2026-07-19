@@ -6,6 +6,8 @@ import {
   contactGroupStateFromResponse,
   groupContacts,
   normalizeGroupName,
+  shouldAutoMarkIncomingRead,
+  unreadStateFromFriendsResponse,
   unreadTotal,
 } from './chatState.js'
 
@@ -60,6 +62,43 @@ describe('unreadTotal', () => {
   it('sums only non-negative integer unread values for the supplied contacts', () => {
     const contacts = [{ id: 'old' }, { id: 'new' }, { id: 'invalid' }, { id: 'negative' }]
     expect(unreadTotal(contacts, { old: 2, new: 3, invalid: 1.5, negative: -4, unrelated: 9 })).toBe(5)
+  })
+})
+
+describe('shouldAutoMarkIncomingRead', () => {
+  it('only marks the selected conversation as read when the window is focused', () => {
+    expect(shouldAutoMarkIncomingRead({
+      selectedContactId: 'pisces-core',
+      conversationId: 'pisces-core',
+      windowFocused: true,
+    })).toBe(true)
+
+    expect(shouldAutoMarkIncomingRead({
+      selectedContactId: 'pisces-core',
+      conversationId: 'pisces-core',
+      windowFocused: false,
+    })).toBe(false)
+
+    expect(shouldAutoMarkIncomingRead({
+      selectedContactId: 'judy',
+      conversationId: 'pisces-core',
+      windowFocused: true,
+    })).toBe(false)
+  })
+})
+
+describe('unreadStateFromFriendsResponse', () => {
+  it('hydrates durable Convia unread state together with friend unread counts', () => {
+    const contacts = [
+      { id: 'judy', unreadCount: 2 },
+      { id: 'eric', unreadCount: 0 },
+    ]
+
+    expect(unreadStateFromFriendsResponse(contacts, { convia: { unread_count: 3 } })).toEqual({
+      'pisces-core': 3,
+      judy: 2,
+      eric: 0,
+    })
   })
 })
 

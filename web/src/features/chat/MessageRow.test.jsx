@@ -49,6 +49,25 @@ describe('MessageRow', () => {
     expect(container.querySelector('[data-bubble]')).toBeNull()
   })
 
+  it('shows who Convia is asking for on forwarded proxy messages', () => {
+    render(
+      <MessageRow
+        locale="zh-TW"
+        message={{
+          id: 'forwarded',
+          role: 'ai_proxy',
+          text: '週末要不要一起去看電影？',
+          forwardedByName: 'Eric',
+          forwardedByAvatarUrl: 'https://lh3.googleusercontent.com/a/eric',
+        }}
+      />,
+    )
+    expect(screen.getByText('我幫')).toBeInTheDocument()
+    expect(screen.getByText('Eric')).toBeInTheDocument()
+    expect(screen.getByText('來問你')).toBeInTheDocument()
+    expect(screen.getByRole('img', { name: 'Eric' })).toHaveAttribute('src', 'https://lh3.googleusercontent.com/a/eric')
+  })
+
   it.each([
     ['en', 'Only visible to you'],
     ['zh-TW', '只有你看得到'],

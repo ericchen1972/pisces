@@ -69,6 +69,26 @@ describe('sendAssistRequest', () => {
       imageUrl: '/image',
       musicUrl: '/music',
       avatarUrl: '/avatar',
+      forwardedByName: '',
+      forwardedByAvatarUrl: '',
+    })
+  })
+})
+
+describe('canonicalIncomingMessage', () => {
+  it('keeps forwarded-by attribution for Convia proxy deliveries', () => {
+    expect(canonicalIncomingMessage({
+      message_id: 'forward-1',
+      sender_mode: 'ai_proxy',
+      text: 'Want to see a movie?',
+      forwarded_by_name: 'Eric',
+      forwarded_by_avatar_url: 'https://lh3.googleusercontent.com/a/eric',
+    })).toMatchObject({
+      id: 'forward-1',
+      role: 'ai_proxy',
+      text: 'Want to see a movie?',
+      forwardedByName: 'Eric',
+      forwardedByAvatarUrl: 'https://lh3.googleusercontent.com/a/eric',
     })
   })
 })

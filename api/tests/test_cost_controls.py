@@ -103,14 +103,56 @@ def test_session_capability_and_disabled_tester_route(client, monkeypatch):
     monkeypatch.setenv("K_SERVICE", "convia-api")
     monkeypatch.delenv("ENABLE_TESTER_LOGIN", raising=False)
     monkeypatch.setattr(main.os.path, "exists", lambda _path: False)
+    records = {}
+
+    class Snapshot:
+        exists = False
+
+        def to_dict(self):
+            return {}
+
+    class UserRef:
+        def __init__(self, user_id):
+            self.user_id = user_id
+
+        def get(self):
+            return Snapshot()
+
+        def set(self, payload, merge=False):
+            records[self.user_id] = dict(payload)
+
+    monkeypatch.setattr(
+        main,
+        "get_firestore_client",
+        lambda: SimpleNamespace(
+            collection=lambda _name: SimpleNamespace(
+                document=lambda user_id: UserRef(user_id)
+            )
+        ),
+    )
 
     me = client.get("/api/session/me")
+    allowed_me = client.get(
+        "/api/session/me",
+        headers={"X-Forwarded-For": f"{main.JUDY_LOGIN_ALLOWED_IP}, 10.0.0.1"},
+    )
     login = client.post("/api/auth/tester", json={"email": "a@example.com"})
+    judy_blocked = client.post("/api/auth/tester", json={"email": main.JUDY_TESTER_EMAIL})
+    judy_login = client.post(
+        "/api/auth/tester",
+        json={"email": main.JUDY_TESTER_EMAIL},
+        headers={"X-Forwarded-For": main.JUDY_LOGIN_ALLOWED_IP},
+    )
 
     assert me.status_code == 200
     assert me.get_json()["tester_login_enabled"] is False
+    assert me.get_json()["judy_login_enabled"] is False
+    assert allowed_me.get_json()["judy_login_enabled"] is True
     assert login.status_code == 404
     assert login.get_json() == {"ok": False, "error": "not found"}
+    assert judy_blocked.status_code == 404
+    assert judy_login.status_code == 200
+    assert judy_login.get_json()["user"]["email"] == main.JUDY_TESTER_EMAIL
 
 
 def test_tester_login_environment_flag_overrides_config(monkeypatch):

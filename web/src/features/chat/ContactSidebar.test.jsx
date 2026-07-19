@@ -36,6 +36,7 @@ describe('ContactSidebar', () => {
     const navigation = screen.getByRole('navigation', { name: 'Contacts' })
     expect(navigation).toHaveTextContent('Convia')
     expect(screen.getByRole('button', { name: 'Chat with Convia' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Manage groups' })).not.toBeInTheDocument()
     expect(screen.getByLabelText('Family, 5 unread messages')).toBeInTheDocument()
     expect(screen.getByLabelText('Ben, 3 unread messages')).toBeInTheDocument()
     const buttons = screen.getAllByRole('button')
@@ -181,6 +182,27 @@ describe('ContactSidebar', () => {
 })
 
 describe('ChatShell', () => {
+  it('commits mobile contact selection before closing and restoring drawer focus', async () => {
+    const order = []
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      order.push('close-drawer')
+      callback()
+      return 1
+    })
+    const user = userEvent.setup()
+    render(
+      <ChatShell sidebar={<button type="button" data-close-drawer onClick={() => order.push('select-contact')}>Judy</button>}>
+        <p>Convia conversation</p>
+      </ChatShell>,
+    )
+
+    await user.click(screen.getByRole('button', { name: 'Open contacts' }))
+    order.length = 0
+    await user.click(within(screen.getByTestId('mobile-drawer')).getByRole('button', { name: 'Judy' }))
+
+    expect(order.slice(0, 2)).toEqual(['select-contact', 'close-drawer'])
+  })
+
   it('opens its mobile drawer, closes after selection, and restores focus to the menu button', async () => {
     const user = userEvent.setup()
     render(

@@ -93,7 +93,7 @@ export default function ChatShell({ sidebar, children, locale = 'en' }) {
           aria-modal={modalDrawerOpen ? 'true' : undefined}
           aria-label={locale === 'zh-TW' ? '聯絡人' : 'Contacts'}
           onKeyDown={trapDrawerFocus}
-          onClickCapture={(event) => {
+          onClick={(event) => {
             if (event.target.closest('[data-close-drawer]')) closeDrawer()
           }}
         >

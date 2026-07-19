@@ -12,7 +12,7 @@ const COPY = {
   },
 }
 
-export default function GroupManagerDialog({ open, locale = 'en', groups = [], onClose, onCreate, onRename, onReorder, onDelete, onRefresh }) {
+export function GroupManagerPanel({ active = true, locale = 'en', groups = [], onCreate, onRename, onReorder, onDelete, onRefresh, onBusyChange }) {
   const copy = COPY[locale] || COPY.en
   const ordered = useMemo(() => [...groups].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0)), [groups])
   const [newName, setNewName] = useState('')
@@ -24,14 +24,14 @@ export default function GroupManagerDialog({ open, locale = 'en', groups = [], o
   const [error, setError] = useState('')
 
   useEffect(() => {
-    if (!open) return
+    if (!active) return
     setNewName('')
     setEditingId('')
     setRenameValue('')
     setDeleteId('')
     setDestinationId('')
     setError('')
-  }, [open])
+  }, [active])
 
   const duplicate = (value, ignoredId = '') => {
     const normalized = normalizeGroupName(value)
@@ -40,6 +40,7 @@ export default function GroupManagerDialog({ open, locale = 'en', groups = [], o
 
   const run = async (operation) => {
     setBusy(true)
+    onBusyChange?.(true)
     setError('')
     try {
       const authoritativeGroups = await operation()
@@ -50,6 +51,7 @@ export default function GroupManagerDialog({ open, locale = 'en', groups = [], o
       return false
     } finally {
       setBusy(false)
+      onBusyChange?.(false)
     }
   }
 
@@ -58,7 +60,7 @@ export default function GroupManagerDialog({ open, locale = 'en', groups = [], o
   const deleteGroup = ordered.find((group) => group.id === deleteId)
 
   return (
-    <Dialog open={open} title={copy.title} onClose={onClose} closeOnBackdrop={!busy} closeLabel={locale === 'zh-TW' ? '關閉對話框' : 'Close dialog'} className="group-manager-dialog">
+    <>
       <form className="group-create" onSubmit={async (event) => {
         event.preventDefault()
         if (!newName.trim() || createError || busy) return
@@ -107,6 +109,31 @@ export default function GroupManagerDialog({ open, locale = 'en', groups = [], o
         </section>
       ) : null}
       {error ? <p className="form-error" role="alert">{error}</p> : null}
+    </>
+  )
+}
+
+export default function GroupManagerDialog({ open, locale = 'en', groups = [], onClose, onCreate, onRename, onReorder, onDelete, onRefresh }) {
+  const copy = COPY[locale] || COPY.en
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    if (!open) setBusy(false)
+  }, [open])
+
+  return (
+    <Dialog open={open} title={copy.title} onClose={busy ? undefined : onClose} closeOnBackdrop={!busy} closeLabel={locale === 'zh-TW' ? '關閉對話框' : 'Close dialog'} className="group-manager-dialog">
+      <GroupManagerPanel
+        active={open}
+        locale={locale}
+        groups={groups}
+        onCreate={onCreate}
+        onRename={onRename}
+        onReorder={onReorder}
+        onDelete={onDelete}
+        onRefresh={onRefresh}
+        onBusyChange={setBusy}
+      />
     </Dialog>
   )
 }

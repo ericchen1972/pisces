@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from urllib import error, request
 from urllib.parse import urlencode, urlparse
 
-from flask import Flask, Response, jsonify, request as flask_request, session
+from flask import Flask, Response, g, jsonify, request as flask_request, session
 from werkzeug.exceptions import RequestEntityTooLarge
 from google.auth.transport import requests as google_requests
 from google.cloud import firestore
@@ -38,6 +38,9 @@ MAX_PUBLIC_MEDIA_URL_LENGTH = 2048
 TRUSTED_PUBLIC_MEDIA_HOST_SUFFIX = ".blob.vercel-storage.com"
 MAX_CHAT_TEXT_CHARS = 20_000
 MAX_TTS_TEXT_CHARS = 4_096
+MAX_AI_ROOM_RESOLVER_HISTORY_MESSAGES = 30
+MAX_AI_ROOM_RESOLVER_TEXT_CHARS = 1200
+MAX_AI_ROOM_RESOLVER_JSON_CHARS = 30000
 app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 
@@ -180,6 +183,30 @@ def is_tester_login_enabled():
     if raw:
         return raw in {"1", "true", "yes", "on"}
     return not bool(os.getenv("K_SERVICE"))
+
+
+JUDY_TESTER_EMAIL = "judy@gods.tw"
+JUDY_LOGIN_ALLOWED_IP = "220.135.118.126"
+
+
+def is_judy_tester_email(email):
+    return (email or "").strip().lower() == JUDY_TESTER_EMAIL
+
+
+def request_client_ips():
+    forwarded_for = flask_request.headers.get("X-Forwarded-For", "")
+    ips = [
+        item.strip()
+        for item in forwarded_for.split(",")
+        if item.strip()
+    ]
+    if flask_request.remote_addr:
+        ips.append(flask_request.remote_addr)
+    return ips
+
+
+def is_judy_login_allowed():
+    return JUDY_LOGIN_ALLOWED_IP in request_client_ips()
 
 
 def resolve_session_secret():
@@ -491,6 +518,225 @@ def find_friend_by_exact_name(user_id, name):
             if token and token == key:
                 return friend
     return None
+
+
+def _bounded_resolver_text(value, limit=MAX_AI_ROOM_RESOLVER_TEXT_CHARS):
+    if not isinstance(value, str):
+        return ""
+    return value.strip()[:limit]
+
+
+def _friend_identity_candidates(friend):
+    candidates = [
+        friend.get("alias") or "",
+        friend.get("display_name") or "",
+        friend.get("email") or "",
+    ]
+    email = (friend.get("email") or "").strip()
+    if email and "@" in email:
+        candidates.append(email.split("@", 1)[0])
+    return [candidate.strip() for candidate in candidates if candidate and candidate.strip()]
+
+
+def _match_friend_by_id_or_name(friends, *, target_user_id="", target_name=""):
+    target_user_id = (target_user_id or "").strip()
+    if target_user_id:
+        for friend in friends:
+            if (friend.get("id") or "").strip() == target_user_id:
+                return friend
+    target_key = (target_name or "").strip().lower()
+    if not target_key:
+        return None
+    matches = []
+    for friend in friends:
+        for candidate in _friend_identity_candidates(friend):
+            if candidate.lower() == target_key:
+                matches.append(friend)
+                break
+    return matches[0] if len(matches) == 1 else None
+
+
+def ai_room_resolver_history_items(history_messages):
+    items = []
+    for message in (history_messages or [])[-MAX_AI_ROOM_RESOLVER_HISTORY_MESSAGES:]:
+        if not isinstance(message, dict):
+            continue
+        text = _bounded_resolver_text(message.get("text"))
+        role = _bounded_resolver_text(message.get("role"), 32)
+        if not text or role not in {"user", "ai", "ai_proxy", "peer", "assist_user", "assist_ai"}:
+            continue
+        item = {
+            "role": role,
+            "text": text,
+        }
+        for key in (
+            "sender_mode",
+            "visibility",
+            "forwarded_by_user_id",
+            "forwarded_by_name",
+            "forwarded_to_user_id",
+            "forwarded_to_name",
+            "forwarded_message_text",
+            "forwarded_message_id",
+            "forwarded_sender_mode",
+        ):
+            value = _bounded_resolver_text(message.get(key), 256)
+            if value:
+                item[key] = value
+        items.append(item)
+    while items and len(
+        json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+    ) > MAX_AI_ROOM_RESOLVER_JSON_CHARS:
+        items.pop(0)
+    return items
+
+
+def ai_room_resolver_friend_items(friends):
+    items = []
+    for friend in friends or []:
+        friend_id = _bounded_resolver_text(friend.get("id"), 256)
+        if not friend_id:
+            continue
+        items.append(
+            {
+                "id": friend_id,
+                "alias": _bounded_resolver_text(friend.get("alias"), 256),
+                "display_name": _bounded_resolver_text(friend.get("display_name"), 256),
+                "email": _bounded_resolver_text(friend.get("email"), 256),
+            }
+        )
+    return items
+
+
+def resolve_ai_room_forward_target(user_id, user_message, history_messages, friends):
+    history_items = ai_room_resolver_history_items(history_messages)
+    friend_items = ai_room_resolver_friend_items(friends)
+    raw = get_openai_service().generate_text(
+        user_id=user_id,
+        instructions=(
+            "You resolve whether a user's message to Convia is asking Convia to contact another person. "
+            "Return only one compact JSON object. Do not include prose or markdown. "
+            "Schema: should_send boolean, target_user_id string, target_name string, "
+            "target_source one of history, contacts, none, needs_clarification boolean, "
+            "clarifying_question string. Priority rule: first infer the target from recent Convia-room "
+            "conversation history, especially forwarded_by_user_id and forwarded_by_name metadata. "
+            "Only if history is insufficient may you use the contact list. If no single authorized target "
+            "is clear, set needs_clarification true and ask who the user means. Never invent a target."
+        ),
+        input_items=[
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "current_message": user_message,
+                        "history": history_items,
+                        "contacts": friend_items,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            }
+        ],
+    )
+    obj = extract_json_obj(raw)
+    if not obj:
+        return {"should_send": False}
+
+    needs_clarification = bool(obj.get("needs_clarification"))
+    target_source = str(obj.get("target_source") or "none").strip().lower()
+    target_user_id = str(obj.get("target_user_id") or "").strip()
+    target_name = str(obj.get("target_name") or "").strip()
+    should_send = bool(obj.get("should_send"))
+    if needs_clarification:
+        question = str(obj.get("clarifying_question") or "").strip()
+        return {
+            "should_send": False,
+            "needs_clarification": True,
+            "clarifying_question": question or "Who would you like me to ask?",
+        }
+    if not should_send:
+        return {"should_send": False}
+
+    friend = _match_friend_by_id_or_name(
+        friends,
+        target_user_id=target_user_id,
+        target_name=target_name,
+    )
+    if not friend:
+        return {
+            "should_send": False,
+            "needs_clarification": True,
+            "clarifying_question": "Who would you like me to ask?",
+        }
+    return {
+        "should_send": True,
+        "friend": friend,
+        "target_source": target_source if target_source in {"history", "contacts"} else "none",
+    }
+
+
+def ai_room_forward_resolution(user_id, user_message, history_range):
+    cached = getattr(g, "ai_room_forward_resolution", None)
+    if isinstance(cached, dict) and cached.get("message") == user_message:
+        return cached.get("resolution") or {"should_send": False}
+    try:
+        history_messages = get_chat_messages(
+            user_id,
+            "pisces-core",
+            history_range=history_range,
+        )
+    except Exception:
+        history_messages = []
+    try:
+        friends = list_user_friends(user_id)
+    except Exception:
+        friends = []
+    resolution = resolve_ai_room_forward_target(
+        user_id,
+        user_message,
+        history_messages,
+        friends,
+    )
+    g.ai_room_forward_resolution = {
+        "message": user_message,
+        "resolution": resolution,
+    }
+    return resolution
+
+
+def replay_existing_ai_room_forward_if_any(user_id, request_id, user_message):
+    if not request_id:
+        return None
+    for receipt in (
+        get_delivery_terminal(user_id, "chat_forward", request_id),
+        get_delivery_receipt(user_id, "chat_forward", request_id),
+    ):
+        if not receipt:
+            continue
+        recipient_user_id = (receipt.get("recipient_user_id") or receipt.get("contact_id") or "").strip()
+        if not recipient_user_id:
+            continue
+        payload_hash = delivery_payload_hash(recipient_user_id, user_message)
+        return replay_friend_delivery_receipt(
+            receipt,
+            user_id,
+            "chat_forward",
+            request_id,
+            payload_hash,
+            recipient_user_id,
+        )
+    return None
+
+
+def ai_room_forward_request_in_progress(user_id, request_id):
+    if not request_id:
+        return False
+    receipt = get_delivery_receipt(user_id, "chat_forward", request_id) or {}
+    state = (receipt.get("state") or "").strip()
+    return state in {"processing", "started"} and _stream_lease_is_active(
+        receipt,
+        datetime.now(timezone.utc),
+    )
 
 
 def decide_about_friend(user_message, user_id=""):
@@ -1338,17 +1584,35 @@ def get_chat_messages(user_id, contact_id, history_range=None):
                 "role": role,
                 "text": text,
                 "created_at": created_at_iso,
+                "_created_at_order": int(data.get("created_at_order") or 0),
                 "assist_group_id": (data.get("assist_group_id") or "").strip(),
                 "visibility": (data.get("visibility") or "").strip() or "shared",
                 "sender_mode": (data.get("sender_mode") or "").strip() or ("ai_proxy" if role == "ai_proxy" else "user"),
                 "client_request_id": (data.get("client_request_id") or "").strip(),
                 "avatar_url": (data.get("avatar_url") or "").strip(),
+                "forwarded_by_user_id": (data.get("forwarded_by_user_id") or "").strip(),
+                "forwarded_by_name": (data.get("forwarded_by_name") or "").strip(),
+                "forwarded_by_avatar_url": (data.get("forwarded_by_avatar_url") or "").strip(),
+                "forwarded_to_user_id": (data.get("forwarded_to_user_id") or "").strip(),
+                "forwarded_to_name": (data.get("forwarded_to_name") or "").strip(),
+                "forwarded_message_text": (data.get("forwarded_message_text") or "").strip(),
+                "forwarded_message_id": (data.get("forwarded_message_id") or "").strip(),
+                "forwarded_sender_mode": (data.get("forwarded_sender_mode") or "").strip(),
                 "audio_url": audio_url,
                 "audio_duration_seconds": float(data.get("audio_duration_seconds") or 0),
                 "image_url": image_url,
                 "music_url": music_url,
             }
         )
+    messages.sort(
+        key=lambda item: (
+            item.get("created_at") or "",
+            int(item.get("_created_at_order") or 0),
+            item.get("id") or "",
+        )
+    )
+    for item in messages:
+        item.pop("_created_at_order", None)
     return messages
 
 
@@ -1535,6 +1799,8 @@ def persist_delivery_once(
             "text": (write.get("text") or "").strip(),
             "created_at": firestore.SERVER_TIMESTAMP,
         }
+        if "created_at_order" in write:
+            payload["created_at_order"] = int(write.get("created_at_order") or 0)
         payload.update(write.get("extras") or {})
         return payload
 
@@ -2745,7 +3011,10 @@ def persist_friend_delivery(
 def confirm_friend_delivery_before_publish(
     client, sender_user_id, recipient_user_id, message_id,
     receipt_route_name="", receipt_request_id="", rollback_meta=None,
+    sender_contact_id="", recipient_contact_id="",
 ):
+    sender_contact_id = sender_contact_id or recipient_user_id
+    recipient_contact_id = recipient_contact_id or sender_user_id
     friendship_ref, _pair_key, user_a_id, user_b_id = _friendship_reference(
         client, sender_user_id, recipient_user_id
     )
@@ -2753,7 +3022,7 @@ def confirm_friend_delivery_before_publish(
         client.collection("users")
         .document(sender_user_id)
         .collection("chats")
-        .document(recipient_user_id)
+        .document(sender_contact_id)
         .collection("messages")
         .document(message_id)
     )
@@ -2761,7 +3030,7 @@ def confirm_friend_delivery_before_publish(
         client.collection("users")
         .document(recipient_user_id)
         .collection("chats")
-        .document(sender_user_id)
+        .document(recipient_contact_id)
         .collection("messages")
         .document(message_id)
     )
@@ -2798,11 +3067,11 @@ def confirm_friend_delivery_before_publish(
         friendship_values = friendship_snapshot.to_dict() if friendship_snapshot.exists else {}
         sender_meta_ref = (
             client.collection("users").document(sender_user_id)
-            .collection("chat_meta").document(recipient_user_id)
+            .collection("chat_meta").document(sender_contact_id)
         )
         recipient_meta_ref = (
             client.collection("users").document(recipient_user_id)
-            .collection("chat_meta").document(sender_user_id)
+            .collection("chat_meta").document(recipient_contact_id)
         )
         sender_meta_snapshot = next(iter(tx.get(sender_meta_ref)))
         recipient_meta_snapshot = next(iter(tx.get(recipient_meta_ref)))
@@ -2841,8 +3110,8 @@ def confirm_friend_delivery_before_publish(
         effective_rollback_meta = receipt.get("rollback_meta") or rollback_meta or {}
         rollback_meta_expected = receipt.get("rollback_meta_expected") or {}
         for user_id, contact_id, ref, snapshot in (
-            (sender_user_id, recipient_user_id, sender_meta_ref, sender_meta_snapshot),
-            (recipient_user_id, sender_user_id, recipient_meta_ref, recipient_meta_snapshot),
+            (sender_user_id, sender_contact_id, sender_meta_ref, sender_meta_snapshot),
+            (recipient_user_id, recipient_contact_id, recipient_meta_ref, recipient_meta_snapshot),
         ):
             current = snapshot.to_dict() if snapshot.exists else {}
             if current.get("direct_delivery_guard") != message_id:
@@ -3655,7 +3924,47 @@ def chat():
         return jsonify({"ok": False, "error": "message is required"}), 400
     if len(user_message) > MAX_CHAT_TEXT_CHARS:
         return jsonify({"ok": False, "error": "message is too long"}), 413
-    if contact_id == "pisces-core" and has_forward_intent_in_ai_room(user_message):
+    if contact_id == "pisces-core" and body.get("request_id") is not None:
+        try:
+            existing_forward_request_id = validate_request_id(body.get("request_id"))
+            existing_forward_response = replay_existing_ai_room_forward_if_any(
+                user_id,
+                existing_forward_request_id,
+                user_message,
+            )
+        except ValueError:
+            return jsonify({"error": "request_id was already used for a different delivery"}), 409
+        except Exception:
+            existing_forward_response = None
+        if existing_forward_response is not None:
+            return jsonify(existing_forward_response)
+        if ai_room_forward_request_in_progress(user_id, existing_forward_request_id):
+            return jsonify({"error": "request is already in progress"}), 409
+    quota_error = enforce_openai_quota(user_id, "text")
+    if quota_error:
+        return quota_error
+    forward_resolution = {"should_send": False}
+    if contact_id == "pisces-core":
+        try:
+            forward_resolution = ai_room_forward_resolution(
+                user_id,
+                user_message,
+                get_user_history_range(user_id),
+            )
+        except Exception:
+            forward_resolution = {"should_send": False}
+    if contact_id == "pisces-core" and forward_resolution.get("needs_clarification"):
+        reply = (
+            forward_resolution.get("clarifying_question")
+            or "Who would you like me to ask?"
+        )
+        try:
+            save_chat_message(user_id, contact_id, "user", user_message)
+            save_chat_message(user_id, contact_id, "ai", reply)
+        except Exception:
+            pass
+        return jsonify({"reply": reply, "audio_base64": "", "audio_mime_type": "", "tts": {"should_read_aloud": False}})
+    if contact_id == "pisces-core" and forward_resolution.get("should_send"):
         if not user_id:
             return jsonify({"error": "Please sign in first."}), 401
         try:
@@ -3663,7 +3972,7 @@ def chat():
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         safe_drain_pending_delivery_cleanup_jobs(user_id, limit=1)
-        friend = find_friend_from_message(user_id, user_message)
+        friend = forward_resolution.get("friend")
         if not friend:
             reply = "Sorry, I couldn't find the contact name you mentioned. Please include an exact friend name."
             try:
@@ -3727,16 +4036,16 @@ def chat():
             return jsonify({"error": "request is already in progress"}), 409
         delivery_owner = reserved_receipt["owner_token"]
 
-        quota_error = enforce_openai_quota(user_id, "text")
-        if quota_error:
-            safe_release_delivery_request(
-                user_id, "chat_forward", request_id, delivery_owner
-            )
-            return quota_error
-
         try:
             user_doc = get_firestore_client().collection("users").document(user_id).get()
             user_data = user_doc.to_dict() if user_doc.exists else {}
+            recipient_sender_ctx = get_friend_context(target_id, user_id) or {}
+            relay_sender_name = (
+                recipient_sender_ctx.get("friend_name")
+                or user_data.get("display_name")
+                or user_data.get("email")
+                or "your friend"
+            ).strip()
             ai_settings = get_user_ai_settings(user_id)
             history_range = get_user_history_range(user_id)
             friend_history = get_chat_messages(user_id, target_id, history_range=history_range)
@@ -3747,6 +4056,7 @@ def chat():
         except Exception:
             safe_release_delivery_request(user_id, "chat_forward", request_id, delivery_owner)
             return jsonify({"error": "AI reply is currently unavailable."}), 502
+        decision["send_to_friend"] = True
         if has_explicit_voice_request(user_message):
             decision["voice"] = True
         if not decision.get("send_to_friend"):
@@ -3797,7 +4107,7 @@ def chat():
             composed = compose_message_for_friend(
                 user_message=user_message,
                 history_messages=friend_history,
-                user_name=(user_data.get("display_name") or user_data.get("email") or "User"),
+                user_name=relay_sender_name,
                 friend_name=friend_ctx["friend_name"],
                 ai_name=(user_data.get("ai_name") or "Convia"),
                 style_prompt=style_prompt,
@@ -3819,8 +4129,7 @@ def chat():
             if composed_as_user:
                 outbound_text = "I made a song for you. Hope you like it."
             else:
-                sender_name = (user_data.get("display_name") or user_data.get("email") or "your friend").strip()
-                outbound_text = f'{sender_name} made a song for you. Hope you like it.'
+                outbound_text = f'{relay_sender_name} made a song for you. Hope you like it.'
         outbound_image_url = ""
         outbound_music_url = ""
         outbound_blob_urls = []
@@ -3862,6 +4171,10 @@ def chat():
             if sender_mode == "user"
             else (user_data.get("ai_avatar_url") or "").strip() or "/images/fish.png"
         )
+        forwarded_by_name = (
+            user_data.get("display_name") or user_data.get("email") or "your friend"
+        ).strip()
+        forwarded_by_avatar_url = (user_data.get("avatar_url") or "").strip()
         outbound_audio_url = ""
         if decision.get("voice"):
             zh_len = count_zh_chars(outbound_text)
@@ -3896,6 +4209,9 @@ def chat():
             "visibility": "shared",
             "sender_mode": sender_mode,
             "avatar_url": sender_avatar_url,
+            "forwarded_by_user_id": user_id,
+            "forwarded_by_name": forwarded_by_name,
+            "forwarded_by_avatar_url": forwarded_by_avatar_url,
             **({"audio_url": outbound_audio_url} if outbound_audio_url else {}),
             **({"image_url": outbound_image_url} if outbound_image_url else {}),
             **({"music_url": outbound_music_url} if outbound_music_url else {}),
@@ -3904,21 +4220,44 @@ def chat():
             "message_id": canonical_message_id,
             "sender_user_id": user_id,
             "recipient_user_id": target_id,
+            "contact_id": "pisces-core",
             "text": outbound_text,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "sender_display_name": (user_data.get("display_name") or ""),
             "sender_avatar_url": sender_avatar_url,
             "sender_mode": sender_mode,
+            "forwarded_by_user_id": user_id,
+            "forwarded_by_name": forwarded_by_name,
+            "forwarded_by_avatar_url": forwarded_by_avatar_url,
             "audio_url": outbound_audio_url,
             "image_url": outbound_image_url,
             "music_url": outbound_music_url,
         }
+        confirmation_extras = {
+            "visibility": "private_to_user",
+            "sender_mode": "ai",
+            "forwarded_to_user_id": target_id,
+            "forwarded_to_name": friend_ctx["friend_name"],
+            "forwarded_message_text": outbound_text,
+            "forwarded_message_id": canonical_message_id,
+            "forwarded_sender_mode": sender_mode,
+        }
+        confirmation_request = (
+            "The delivery has succeeded. Write a concise private completion reply "
+            "from Convia to the requester. You are reporting that the requested "
+            "message was passed along; you are not writing to the recipient now. "
+            "Use your own warm wording, and do not copy or restate the recipient-facing message."
+        )
         confirmation_instructions, confirmation_input = _openai_text_request(
-            user_message,
+            confirmation_request,
             ai_settings.get("global_prompt") or AI_DEFAULT_GLOBAL_PROMPT,
-            friend_history,
+            [],
             extra_context_text=(
-                "Draft the concise private confirmation that will be shown only if delivery succeeds. "
+                "Draft the concise private confirmation from Convia to the user that will be shown only if delivery succeeds. "
+                "Convia is a mediator and messenger. Speak from Convia's point of view to the requester. "
+                "Say that you have helped ask or pass the message along, and optionally add a gentle wish or reassurance. "
+                "Do not repeat the recipient-facing message verbatim. Do not address the recipient directly. "
+                "Do not start with the recipient's name as if you are speaking to them. "
                 "Base it only "
                 f"on these facts: recipient={friend_ctx['friend_name']}; sent_text={outbound_text}; "
                 f"image_attached={bool(outbound_image_url)}; music_attached={bool(outbound_music_url)}; "
@@ -3964,14 +4303,13 @@ def chat():
                 request_id=request_id,
                 payload_hash=payload_hash,
                 message_writes=[
-                    {"user_id": user_id, "contact_id": target_id, "role": "user" if sender_mode == "user" else "ai_proxy", "text": outbound_text, "extras": outbound_extras, "message_id": canonical_message_id},
-                    {"user_id": target_id, "contact_id": user_id, "role": "peer", "text": outbound_text, "extras": outbound_extras, "message_id": canonical_message_id},
-                    {"user_id": user_id, "contact_id": contact_id, "role": "user", "text": user_message, "extras": {}, "message_id": deterministic_message_id(user_id, "chat_forward", contact_id, request_id, "request")},
-                    {"user_id": user_id, "contact_id": contact_id, "role": "ai", "text": reply, "extras": {}, "message_id": deterministic_message_id(user_id, "chat_forward", contact_id, request_id, "confirmation")},
+                    {"user_id": target_id, "contact_id": "pisces-core", "role": "ai_proxy", "text": outbound_text, "extras": outbound_extras, "message_id": canonical_message_id, "created_at_order": 20},
+                    {"user_id": user_id, "contact_id": contact_id, "role": "user", "text": user_message, "extras": {}, "message_id": deterministic_message_id(user_id, "chat_forward", contact_id, request_id, "request"), "created_at_order": 10},
+                    {"user_id": user_id, "contact_id": contact_id, "role": "ai", "text": reply, "extras": confirmation_extras, "message_id": deterministic_message_id(user_id, "chat_forward", contact_id, request_id, "confirmation"), "created_at_order": 20},
                 ],
                 meta_writes=[
-                    {"user_id": user_id, "contact_id": target_id, "unread_increment": 0, "preview_text": outbound_text},
-                    {"user_id": target_id, "contact_id": user_id, "unread_increment": 1, "preview_text": outbound_text},
+                    {"user_id": user_id, "contact_id": contact_id, "unread_increment": 0, "preview_text": reply},
+                    {"user_id": target_id, "contact_id": "pisces-core", "unread_increment": 1, "preview_text": outbound_text},
                 ],
                 receipt_data={
                     "contact_id": target_id,
@@ -4020,6 +4358,8 @@ def chat():
                 canonical_message_id,
                 "chat_forward",
                 request_id,
+                sender_contact_id=contact_id,
+                recipient_contact_id="pisces-core",
             )
         except Exception:
             return jsonify({"error": "Message delivery is currently unavailable."}), 500
@@ -4039,9 +4379,6 @@ def chat():
             )
         )
 
-    quota_error = enforce_openai_quota(user_id, "text")
-    if quota_error:
-        return quota_error
     ai_settings = get_user_ai_settings(user_id)
     history_range = get_user_history_range(user_id)
     history_messages = get_chat_messages(user_id, contact_id, history_range=history_range)
@@ -4136,6 +4473,139 @@ def _completed_stream_response(receipt, request_id, user_id):
     return response
 
 
+def _response_json_and_status(response_like):
+    status = 200
+    response = response_like
+    if isinstance(response_like, tuple):
+        response = response_like[0]
+        if len(response_like) > 1 and isinstance(response_like[1], int):
+            status = response_like[1]
+    if hasattr(response, "status_code"):
+        status = response.status_code
+    data = response.get_json(silent=True) if hasattr(response, "get_json") else None
+    return data, status
+
+
+def _chat_forward_stream_response(response_like, request_id, user_id, contact_id):
+    payload, status = _response_json_and_status(response_like)
+    if status >= 400 or not isinstance(payload, dict):
+        return response_like
+
+    reply = (payload.get("reply") or payload.get("error") or "").strip()
+    receipt = get_delivery_receipt(user_id, "chat_forward", request_id) or {}
+    message_suffix = "confirmation" if receipt.get("ably_payload") else "advice"
+    done_payload = {
+        "type": "done",
+        "message_id": deterministic_message_id(
+            user_id, "chat_forward", contact_id, request_id, message_suffix
+        ),
+        "reply": reply,
+        "image_url": payload.get("image_url") or "",
+        "music_url": payload.get("music_url") or "",
+    }
+
+    events = []
+    if reply:
+        events.append({"type": "delta", "text": reply})
+    if payload.get("audio_base64"):
+        events.append(
+            {
+                "type": "audio",
+                "audio_base64": payload.get("audio_base64") or "",
+                "audio_mime_type": payload.get("audio_mime_type") or "audio/wav",
+            }
+        )
+    events.append(done_payload)
+    response = Response(
+        iter(_ndjson_line(event) for event in events),
+        mimetype="application/x-ndjson",
+    )
+    response.headers["X-Request-Id"] = request_id
+    return response
+
+
+def _static_chat_stream_reply(*, user_id, contact_id, request_id, payload_hash, user_message, reply):
+    user_message_id = deterministic_message_id(
+        user_id, "chat_stream", contact_id, request_id, "user"
+    )
+    ai_message_id = deterministic_message_id(
+        user_id, "chat_stream", contact_id, request_id, "ai"
+    )
+    existing_receipt = get_delivery_receipt(user_id, "chat_stream", request_id)
+    if existing_receipt and existing_receipt.get("payload_hash") != payload_hash:
+        return jsonify({"error": "request_id was already used for a different delivery"}), 409
+    if existing_receipt and existing_receipt.get("state") == "completed":
+        return _completed_stream_response(existing_receipt, request_id, user_id)
+    try:
+        reserved_receipt, acquired = reserve_stream_request(
+            user_id=user_id,
+            request_id=request_id,
+            payload_hash=payload_hash,
+            user_write={
+                "user_id": user_id,
+                "contact_id": contact_id,
+                "role": "user",
+                "text": user_message,
+                "extras": {},
+                "message_id": user_message_id,
+            },
+            receipt_data={
+                "route": "chat_stream",
+                "user_id": user_id,
+                "contact_id": contact_id,
+                "state": "started",
+                "user_message_id": user_message_id,
+                "ai_message_id": ai_message_id,
+            },
+        )
+    except ValueError:
+        return jsonify({"error": "request_id was already used for a different delivery"}), 409
+    if reserved_receipt.get("state") == "completed":
+        return _completed_stream_response(reserved_receipt, request_id, user_id)
+    if not acquired:
+        return jsonify({"error": "request is already in progress"}), 409
+    owner_token = reserved_receipt["owner_token"]
+    done_payload = {
+        "type": "done",
+        "message_id": ai_message_id,
+        "reply": reply,
+        "image_url": "",
+        "music_url": "",
+    }
+    try:
+        canonical_done_payload = complete_stream_request(
+            user_id,
+            request_id,
+            payload_hash,
+            owner_token,
+            {
+                "user_id": user_id,
+                "contact_id": contact_id,
+                "role": "ai",
+                "text": reply,
+                "extras": {},
+                "message_id": ai_message_id,
+            },
+            done_payload,
+            {"should_read_aloud": False},
+        )
+    except Exception:
+        safe_release_stream_request(user_id, request_id, owner_token)
+        return jsonify({"error": "AI reply is currently unavailable."}), 502
+
+    response = Response(
+        iter(
+            [
+                _ndjson_line({"type": "delta", "text": reply}),
+                _ndjson_line(canonical_done_payload),
+            ]
+        ),
+        mimetype="application/x-ndjson",
+    )
+    response.headers["X-Request-Id"] = request_id
+    return response
+
+
 @app.route("/api/chat/stream", methods=["POST", "OPTIONS"])
 def chat_stream():
     if flask_request.method == "OPTIONS":
@@ -4181,6 +4651,27 @@ def chat_stream():
         return jsonify({"error": "request_id was already used for a different delivery"}), 409
     if existing_receipt and existing_receipt.get("state") == "completed":
         return _completed_stream_response(existing_receipt, request_id, user_id)
+    forward_resolution = {"should_send": False}
+    if contact_id == "pisces-core":
+        try:
+            forward_resolution = ai_room_forward_resolution(
+                user_id,
+                user_message,
+                get_user_history_range(user_id),
+            )
+        except Exception:
+            forward_resolution = {"should_send": False}
+    if contact_id == "pisces-core" and forward_resolution.get("needs_clarification"):
+        return _static_chat_stream_reply(
+            user_id=user_id,
+            contact_id=contact_id,
+            request_id=request_id,
+            payload_hash=payload_hash,
+            user_message=user_message,
+            reply=forward_resolution.get("clarifying_question") or "Who would you like me to ask?",
+        )
+    if contact_id == "pisces-core" and forward_resolution.get("should_send"):
+        return _chat_forward_stream_response(chat(), request_id, user_id, contact_id)
     try:
         ai_settings = get_user_ai_settings(user_id)
         history_range = get_user_history_range(user_id)
@@ -4636,12 +5127,14 @@ def auth_google():
 def auth_tester():
     if flask_request.method == "OPTIONS":
         return ("", 204)
-    if not is_tester_login_enabled():
-        return jsonify({"ok": False, "error": "not found"}), 404
-
     body = flask_request.get_json(silent=True) or {}
     email = (body.get("email") or "").strip().lower()
     avatar_url = (body.get("avatar_url") or "").strip()
+
+    if not is_tester_login_enabled() and not (
+        is_judy_tester_email(email) and is_judy_login_allowed()
+    ):
+        return jsonify({"ok": False, "error": "not found"}), 404
 
     if not email:
         return jsonify({"ok": False, "error": "email is required"}), 400
@@ -4715,6 +5208,7 @@ def session_me():
             "authenticated": False,
             "user": None,
             "tester_login_enabled": is_tester_login_enabled(),
+            "judy_login_enabled": is_judy_login_allowed(),
         })
     try:
         client = get_firestore_client()
@@ -4726,6 +5220,7 @@ def session_me():
                 "authenticated": False,
                 "user": None,
                 "tester_login_enabled": is_tester_login_enabled(),
+                "judy_login_enabled": is_judy_login_allowed(),
             })
         data = doc.to_dict() or {}
         user = {
@@ -4750,6 +5245,7 @@ def session_me():
             "authenticated": True,
             "user": user,
             "tester_login_enabled": is_tester_login_enabled(),
+            "judy_login_enabled": is_judy_login_allowed(),
         })
     except Exception as exc:
         return jsonify({"ok": False, "error": f"failed to load session user: {exc}"}), 500
@@ -5001,8 +5497,11 @@ def add_friend():
     friend = result["friend"]
     friend_user_id = friend["id"]
     friend_alias = (body.get("friend_alias") or "").strip()
+    selected_group_id = (body.get("group_id") or "").strip()
     if len(friend_alias) < 2:
         return jsonify({"ok": False, "error": "friend_alias must be at least 2 characters"}), 400
+    if not selected_group_id:
+        return jsonify({"ok": False, "error": "group_id is required"}), 400
 
     user_a_id, user_b_id = sorted([requester_user_id, friend_user_id])
     pair_key = f"{user_a_id}_{user_b_id}"
@@ -5012,6 +5511,18 @@ def add_friend():
         client = get_firestore_client()
         requester_doc = client.collection("users").document(requester_user_id).get()
         requester_data = requester_doc.to_dict() if requester_doc.exists else {}
+        selected_group_doc = (
+            client.collection("users")
+            .document(requester_user_id)
+            .collection("contact_groups")
+            .document(selected_group_id)
+            .get()
+        )
+        if not selected_group_doc.exists:
+            return jsonify({"ok": False, "error": "group not found"}), 404
+        selected_group_data = selected_group_doc.to_dict() or {}
+        if selected_group_data.get("deletion_state") == "deleting":
+            return jsonify({"ok": False, "error": "group deletion is in progress"}), 400
         friend_doc = client.collection("users").document(friend_user_id).get()
         friend_data = friend_doc.to_dict() if friend_doc.exists else {}
 
@@ -5055,12 +5566,13 @@ def add_friend():
             "created_at": firestore.SERVER_TIMESTAMP,
         }
         client.collection("friendships").document(pair_key).set(payload, merge=True)
-        friend_metadata = ensure_default_chat_group(
-            client,
-            requester_user_id,
-            friend_user_id,
-            requester_data.get("default_contact_group_id"),
-        )
+        try:
+            friend_metadata = get_contact_group_service().assign(
+                requester_user_id, friend_user_id, selected_group_id
+            )
+        except ContactGroupError as exc:
+            error, status = contact_group_error_response(exc)
+            return jsonify(error), status
     except Exception as exc:
         return jsonify({"ok": False, "error": f"failed to add friend: {exc}"}), 500
 
@@ -5148,7 +5660,18 @@ def list_friends():
                 }
             )
 
-        return jsonify({"ok": True, "friends": friends})
+        convia_metadata = metadata_map.get("pisces-core", {})
+        return jsonify(
+            {
+                "ok": True,
+                "friends": friends,
+                "convia": {
+                    "last_message_at": convia_metadata.get("last_message_at"),
+                    "last_message_preview": convia_metadata.get("last_message_preview") or "",
+                    "unread_count": chat_meta_unread_count(convia_metadata),
+                },
+            }
+        )
     except Exception as exc:
         return jsonify({"ok": False, "error": f"failed to list friends: {exc}"}), 500
 

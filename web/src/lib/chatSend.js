@@ -49,6 +49,8 @@ export function canonicalIncomingMessage(payload) {
     imageUrl: payload.image_url || '',
     musicUrl: payload.music_url || '',
     avatarUrl: payload.sender_avatar_url || '',
+    forwardedByName: payload.forwarded_by_name || '',
+    forwardedByAvatarUrl: payload.forwarded_by_avatar_url || '',
   }
 }
 
@@ -65,6 +67,8 @@ export function canonicalOutboundMessage(payload) {
     imageUrl: payload.image_url || '',
     musicUrl: payload.music_url || '',
     avatarUrl: payload.avatar_url || payload.sender_avatar_url || '',
+    forwardedByName: payload.forwarded_by_name || '',
+    forwardedByAvatarUrl: payload.forwarded_by_avatar_url || '',
   }
 }
 

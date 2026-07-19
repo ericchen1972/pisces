@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { readFileSync } from 'node:fs'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import AiSettingsDialog from './AiSettingsDialog.jsx'
 
@@ -46,5 +47,12 @@ describe('AiSettingsDialog', () => {
     expect(screen.getByLabelText('Global prompt')).toBeDisabled()
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(onClose).toHaveBeenCalledOnce()
+  })
+
+  it('keeps the AI avatar and name centered on mobile settings dialogs', () => {
+    const source = readFileSync(`${process.cwd()}/src/styles/forms.css`, 'utf8')
+    const mobileBlock = source.match(/@media\s*\(max-width:\s*520px\)\s*\{(?<body>[\s\S]*)\}\s*$/)?.groups?.body || ''
+    expect(mobileBlock).toMatch(/\.profile-editor--ai\s*\{[^}]*justify-items:\s*center/)
+    expect(mobileBlock).toMatch(/\.profile-editor--ai\s*\{[^}]*text-align:\s*center/)
   })
 })

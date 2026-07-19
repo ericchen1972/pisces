@@ -33,4 +33,9 @@
 .utility-card .primary-button { border-color: #ececec; background: #ececec; color: #171717; }
 .utility-output { min-height: 110px; padding: 12px; overflow: auto; border: 1px solid #414141; border-radius: 8px; background: #212121; color: var(--text); white-space: pre-wrap; }
 .utility-card summary { cursor: pointer; color: var(--muted); }
-@media (max-width: 520px) { .login-card { padding: 34px 20px; }.profile-editor { grid-template-columns: 1fr; justify-items: start; }.voice-preview-row { align-items: stretch; flex-direction: column; } }
+@media (max-width: 520px) {
+  .login-card { padding: 34px 20px; }
+  .profile-editor { grid-template-columns: 1fr; justify-items: start; }
+  .profile-editor--ai { justify-items: center; text-align: center; }
+  .voice-preview-row { align-items: stretch; flex-direction: column; }
+}

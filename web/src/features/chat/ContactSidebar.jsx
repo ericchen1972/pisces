@@ -4,8 +4,8 @@ import { groupContacts } from '../../lib/chatState.js'
 import ContactGroup, { ContactAvatar, UnreadBadge } from './ContactGroup.jsx'
 
 const COPY = {
-  en: { contacts: 'Contacts', add: 'Add friend', ai: 'Chat with Convia', settings: 'Settings' },
-  'zh-TW': { contacts: '聯絡人', add: '新增好友', ai: '與 Convia 聊天', settings: '設定' },
+  en: { contacts: 'Contacts', add: 'Add contact', ai: 'Chat with Convia', settings: 'Settings' },
+  'zh-TW': { contacts: '聯絡人', add: '新增聯絡人', ai: '與 Convia 聊天', settings: '設定' },
 }
 
 function AiAvatar({ contact }) {
@@ -29,7 +29,6 @@ export default function ContactSidebar({
   onEditContact,
   onDeleteContact,
   onOpenSettings,
-  onManageGroups,
   onMoveContact,
 }) {
   const copy = COPY[locale] || COPY.en
@@ -84,7 +83,6 @@ export default function ContactSidebar({
           <span>{currentUser?.display_name || currentUser?.email || copy.settings}</span>
           <SettingsIcon size={18} />
         </button>
-        <button type="button" className="text-button" data-close-drawer onClick={onManageGroups}>{locale === 'zh-TW' ? '管理群組' : 'Manage groups'}</button>
       </footer>
     </nav>
   )

@@ -322,8 +322,13 @@ def test_router_methods_use_strict_responses_schemas_and_validate_results():
         {
             "model": "gpt-5.6-luna",
             "instructions": (
-                "Compose an outbound message from Bo or Convia to Amy. "
+                "Compose an outbound message from Convia to Amy, relaying Bo's intent. "
                 "Relationship: friends. Style: casual. "
+                "Convia is a third-party messenger, not Bo. "
+                "By default, set as_user=false and write message_to_friend in third person: say that Bo says, asks, feels, wants, or is wondering. "
+                "When as_user=false, do not write as if Convia or the speaker is Bo; avoid first-person phrasing such as 我, 我們, 我的, I, we, my, or our for Bo's plans, feelings, promises, or offers. "
+                "Only set as_user=true if the requester explicitly asks to send in Bo's own voice. "
+                "You may soften conflict or make wording warmer, but do not change the core meaning. "
                 "This is the outbound structured artifact, separate from the visible AI reply."
             ),
             "input": [
@@ -361,6 +366,11 @@ def test_router_methods_use_strict_responses_schemas_and_validate_results():
     assert "do not generate a visible reply" in client.responses.create_calls[0][
         "instructions"
     ].lower()
+    friend_instructions = client.responses.create_calls[3]["instructions"]
+    assert "third-party messenger" in friend_instructions
+    assert "write message_to_friend in third person" in friend_instructions
+    assert "avoid first-person phrasing" in friend_instructions
+    assert "Only set as_user=true if the requester explicitly asks" in friend_instructions
 
 
 @pytest.mark.parametrize(

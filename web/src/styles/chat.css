@@ -1,6 +1,5 @@
 .conversation { height: 100%; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; background: var(--bg); color: var(--text); }
-.conversation-header { position: sticky; top: 0; z-index: 5; min-height: 58px; display: grid; grid-template-columns: auto 38px minmax(0, 1fr) auto auto auto; gap: 10px; align-items: center; padding: max(8px, env(safe-area-inset-top)) 18px 8px; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--bg) 92%, transparent); backdrop-filter: blur(12px); }
-.conversation-header__back { border: 0; color: inherit; background: transparent; display: grid; place-items: center; cursor: pointer; }
+.conversation-header { position: sticky; top: 0; z-index: 5; min-height: 58px; display: grid; grid-template-columns: 38px minmax(0, 1fr) auto auto; gap: 10px; align-items: center; padding: max(8px, env(safe-area-inset-top)) 18px 8px; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--bg) 92%, transparent); backdrop-filter: blur(12px); }
 .conversation-header .contact-avatar { width: 36px; height: 36px; border-radius: 50%; object-fit: cover; background: #333; }
 .conversation-header div { min-width: 0; display: grid; gap: 2px; }
 .conversation-header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .95rem; }
@@ -13,6 +12,9 @@
 .message-row--user .message-row__bubble, .message-row--assist_user .message-row__bubble { background: #f4f4f4; color: #111; }
 .message-row__plain { width: 100%; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; }
 .message-row__private-label, .message-row__ai-label { margin-bottom: 6px; color: var(--muted); font-size: .75rem; font-weight: 600; }
+.message-row__forwarded-by { width: fit-content; max-width: min(100%, 520px); display: inline-flex; align-items: center; gap: 6px; margin: 0 0 8px; padding: 5px 8px; border: 1px solid #3f3f3f; border-radius: 999px; background: #262626; color: #d8d8d8; font-size: .8rem; white-space: normal; }
+.message-row__forwarded-by img { width: 20px; height: 20px; border-radius: 50%; object-fit: cover; background: #444; }
+.message-row__forwarded-by strong { color: #f2f2f2; font-weight: 650; }
 .message-row__incomplete { display: flex; gap: 10px; align-items: center; margin-top: 8px; color: #c7c7c7; font-size: .78rem; }
 .message-row__incomplete button { border: 1px solid #575757; border-radius: 999px; padding: 4px 10px; background: transparent; color: inherit; cursor: pointer; }
 .message-row__typing { display: inline-flex; gap: 4px; padding: 5px 0; }

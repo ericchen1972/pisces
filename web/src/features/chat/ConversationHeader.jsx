@@ -1,8 +1,8 @@
 import { useId } from 'react'
-import { BackIcon, EditIcon, PhoneIcon } from '../../components/icons.jsx'
+import { EditIcon, PhoneIcon } from '../../components/icons.jsx'
 import { ContactAvatar } from './ContactGroup.jsx'
 
-export default function ConversationHeader({ contact, locale = 'en', onBack, onCall, onEdit }) {
+export default function ConversationHeader({ contact, locale = 'en', onCall, onEdit }) {
   const callDescriptionId = useId()
   if (!contact) return null
   const zh = locale === 'zh-TW'
@@ -11,9 +11,6 @@ export default function ConversationHeader({ contact, locale = 'en', onBack, onC
   const personCallDisabled = !contact.isAi
   return (
     <header className="conversation-header">
-      <button type="button" className="conversation-header__back" onClick={onBack} aria-label={zh ? '返回' : 'Back'}>
-        <BackIcon size={22} />
-      </button>
       <ContactAvatar contact={contact} />
       <div><strong>{contact.name}</strong>{contact.isAi ? <span>Convia</span> : null}</div>
       <button type="button" className="icon-button conversation-header__edit" onClick={() => onEdit?.(contact)} aria-label={zh ? `編輯 ${contact.name}` : `Edit ${contact.name}`}>

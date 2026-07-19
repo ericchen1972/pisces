@@ -34,8 +34,17 @@ describe('remaining visible interface policy', () => {
     const source = readFileSync(`${process.cwd()}/src/App.jsx`, 'utf8')
     expect(source).toContain('const reconnectGate = createReconnectGate()')
     expect(source).toContain('if (!reconnectGate.shouldReconcile()) return')
-    expect(source).toContain('selectedContactIdRef.current === senderId')
+    expect(source).toContain('document.hasFocus()')
+    expect(source).toContain('shouldAutoMarkIncomingRead({ selectedContactId: selectedContactIdRef.current, conversationId, windowFocused })')
     expect(source).not.toContain('apiBaseUrl, selectedContact?.id]')
+  })
+
+  it('allows the selected Convia conversation to clear its durable unread count', () => {
+    const source = readFileSync(`${process.cwd()}/src/App.jsx`, 'utf8')
+    const markRead = source.slice(source.indexOf('const markContactAsRead = async'), source.indexOf('const loginTesterAccount'))
+
+    expect(markRead).not.toContain("contactId === 'pisces-core'")
+    expect(markRead).toContain('/api/chat/mark-read')
   })
 
   it('wires durable client request identity through history, voice pending, and shared Convia success', () => {
@@ -44,7 +53,8 @@ describe('remaining visible interface policy', () => {
     expect(source).toContain("const personVoiceRequestId = shouldUseAiVoiceFlow ? '' : createClientRequestId('person-voice')")
     expect(source).toContain('requestId: personVoiceRequestId')
     expect(source).toContain('reconcileCanonicalMessage(current, audioMessageId, canonicalVoiceMessage)')
-    expect(source).toContain('reconcileCanonicalMessage(current, \'\', message)')
+    expect(source).toContain("const pendingMessageId = `pending-${identity.requestId}`")
+    expect(source).toContain('reconcileCanonicalMessage(current, pendingMessageId, message)')
     expect(source).toContain('reconcileCanonicalMessage(withMessage, \'\', conviaMessage)')
   })
 
@@ -53,6 +63,20 @@ describe('remaining visible interface policy', () => {
     const restore = source.slice(source.indexOf('const restore = async () =>'), source.indexOf('const rawUi = localStorage'))
     const settingsSave = source.slice(source.indexOf('const saveUserSettings = async'), source.indexOf('const openAddFriendModal'))
     expect(restore).toContain('setTesterLoginEnabled(data?.tester_login_enabled === true)')
+    expect(restore).toContain('setJudyLoginEnabled(data?.judy_login_enabled === true)')
     expect(settingsSave).not.toContain('setTesterLoginEnabled')
+  })
+
+  it('keeps Judy login pointed at the existing tester account with Eric relation', () => {
+    const source = readFileSync(`${process.cwd()}/src/App.jsx`, 'utf8')
+    expect(source).toContain("email: 'judy@gods.tw'")
+    expect(source).not.toContain("email: 'judy@example.com'")
+  })
+
+  it('uses same-origin API calls on the production host', () => {
+    const source = readFileSync(`${process.cwd()}/src/App.jsx`, 'utf8')
+    const getApiBaseUrl = source.slice(source.indexOf('function getApiBaseUrl()'), source.indexOf('function navigateTo'))
+    expect(getApiBaseUrl).toContain("if (!isLocalHost) return ''")
+    expect(getApiBaseUrl).not.toContain('FALLBACK_API_BASE_URL')
   })
 })

@@ -6,6 +6,8 @@ import {
   applyDeletedContactGroup,
   applyLocalThenRefresh,
   contactGroupStateFromResponse,
+  shouldAutoMarkIncomingRead,
+  unreadStateFromFriendsResponse,
 } from './lib/chatState.js'
 import {
   consumeGuardedRequest,
@@ -34,7 +36,6 @@ import ContactSidebar from './features/chat/ContactSidebar.jsx'
 import Composer from './features/chat/Composer.jsx'
 import Conversation from './features/chat/Conversation.jsx'
 import ConversationEmptyState from './features/chat/ConversationEmptyState.jsx'
-import GroupManagerDialog from './features/groups/GroupManagerDialog.jsx'
 import AiCallOverlay from './features/calls/AiCallOverlay.jsx'
 import LoginScreen from './features/auth/LoginScreen.jsx'
 import TesterLoginDialog from './features/auth/TesterLoginDialog.jsx'
@@ -85,12 +86,28 @@ function tr(isZh, enText, zhText) {
   return isZh ? zhText : enText
 }
 
+function isLocalHostName(host) {
+  return host === 'localhost' || host === '127.0.0.1' || host === '[::1]'
+}
+
+function isLoopbackApiBase(value) {
+  try {
+    return isLocalHostName(new URL(value).hostname)
+  } catch {
+    return false
+  }
+}
+
 function getApiBaseUrl() {
   const envBase = (import.meta.env.VITE_API_BASE_URL || '').trim()
-  if (envBase) return envBase.replace(/\/$/, '')
   const host = window.location.hostname
-  const isLocalHost = host === 'localhost' || host === '127.0.0.1'
-  return (isLocalHost ? LOCAL_API_BASE_URL : FALLBACK_API_BASE_URL).replace(/\/$/, '')
+  const isLocalHost = isLocalHostName(host)
+  if (!isLocalHost) return ''
+  if (envBase) {
+    const normalizedEnvBase = envBase.replace(/\/$/, '')
+    if (isLoopbackApiBase(normalizedEnvBase)) return normalizedEnvBase
+  }
+  return LOCAL_API_BASE_URL.replace(/\/$/, '')
 }
 
 function navigateTo(pathname) {
@@ -323,6 +340,7 @@ function LoginHome() {
   const [isLoggingIn, setIsLoggingIn] = useState(false)
   const [isSignedIn, setIsSignedIn] = useState(false)
   const [testerLoginEnabled, setTesterLoginEnabled] = useState(false)
+  const [judyLoginEnabled, setJudyLoginEnabled] = useState(false)
   const [currentUser, setCurrentUser] = useState(null)
   const [selectedContact, setSelectedContact] = useState(null)
   const [chatInput, setChatInput] = useState('')
@@ -330,7 +348,6 @@ function LoginHome() {
   const [unreadByContact, setUnreadByContact] = useState({})
   const [contactGroups, setContactGroups] = useState([])
   const [defaultContactGroupId, setDefaultContactGroupId] = useState('')
-  const [groupManagerOpen, setGroupManagerOpen] = useState(false)
   const [isHistoryLoading, setIsHistoryLoading] = useState(false)
   const [micAllowed, setMicAllowed] = useState(() => Boolean(navigator.mediaDevices?.getUserMedia))
   const [isRecording, setIsRecording] = useState(false)
@@ -352,6 +369,7 @@ function LoginHome() {
   const [editModalOpen, setEditModalOpen] = useState(false)
   const [editForm, setEditForm] = useState(null)
   const [editContactSaving, setEditContactSaving] = useState(false)
+  const [editContactRemoving, setEditContactRemoving] = useState(false)
   const [isUploadingAvatar, setIsUploadingAvatar] = useState(false)
   const [isPreparingAvatar, setIsPreparingAvatar] = useState(false)
   const [avatarUploadError, setAvatarUploadError] = useState('')
@@ -368,6 +386,7 @@ function LoginHome() {
   const [addFriendModalOpen, setAddFriendModalOpen] = useState(false)
   const [friendEmailInput, setFriendEmailInput] = useState('')
   const [friendAliasInput, setFriendAliasInput] = useState('')
+  const [friendGroupInput, setFriendGroupInput] = useState('')
   const [friendCodeInput, setFriendCodeInput] = useState('')
   const [addFriendError, setAddFriendError] = useState('')
   const [addFriendSuccess, setAddFriendSuccess] = useState('')
@@ -470,6 +489,8 @@ function LoginHome() {
         musicUrl: message.music_url || '',
         senderMode: message.sender_mode || '',
         avatarUrl: message.avatar_url || '',
+        forwardedByName: message.forwarded_by_name || '',
+        forwardedByAvatarUrl: message.forwarded_by_avatar_url || '',
       })
     })
     return view
@@ -529,7 +550,6 @@ function LoginHome() {
     setIsUploadingAvatar(false)
     setIsPreparingAvatar(false)
     setEditContactSaving(false)
-    setGroupManagerOpen(false)
     setEditModalOpen(false)
     setSettingsModalOpen(false)
     setAddFriendModalOpen(false)
@@ -696,10 +716,7 @@ function LoginHome() {
         isAi: false,
       }))
       authRequestGuard.runIfCurrent(authContext, () => setContacts((prev) => [prev[0], ...friendContacts]))
-      const unreadMap = {}
-      friendContacts.forEach((c) => {
-        unreadMap[c.id] = Number.isFinite(c.unreadCount) ? Math.max(0, c.unreadCount) : 0
-      })
+      const unreadMap = unreadStateFromFriendsResponse(friendContacts, data)
       authRequestGuard.runIfCurrent(authContext, () => setUnreadByContact(unreadMap))
       return friendContacts
     } catch (error) {
@@ -740,7 +757,7 @@ function LoginHome() {
   }
 
   const markContactAsRead = async (contactId) => {
-    if (!isSignedIn || !contactId || contactId === 'pisces-core') return
+    if (!isSignedIn || !contactId) return
     setUnreadByContact((prev) => ({ ...prev, [contactId]: 0 }))
     try {
       await fetch(`${apiBaseUrl}/api/chat/mark-read`, {
@@ -754,18 +771,23 @@ function LoginHome() {
     }
   }
 
-  const submitTesterLogin = async (e) => {
-    e.preventDefault()
-    const email = testerEmail.trim().toLowerCase()
-    const avatarUrl = testerAvatarUrl.trim()
+  const loginTesterAccount = async ({ email: rawEmail, avatarUrl: rawAvatarUrl = '', modal = true }) => {
+    const email = rawEmail.trim().toLowerCase()
+    const avatarUrl = rawAvatarUrl.trim()
     if (!email) {
-      setTesterError(t('Email is required.', '請輸入 Email。'))
+      if (modal) setTesterError(t('Email is required.', '請輸入 Email。'))
+      else setGoogleError(t('Email is required.', '請輸入 Email。'))
       return
     }
     const authTransition = authTransitionCoordinator.begin()
     try {
-      setTesterSubmitting(true)
-      setTesterError('')
+      if (modal) {
+        setTesterSubmitting(true)
+        setTesterError('')
+      } else {
+        setIsLoggingIn(true)
+        setGoogleError('')
+      }
       const res = await fetch(`${apiBaseUrl}/api/auth/tester`, {
         method: 'POST',
         credentials: 'include',
@@ -785,11 +807,23 @@ function LoginHome() {
       setTesterAvatarUrl('')
     } catch (err) {
       if (err?.name === 'AbortError') return
-      setTesterError(visibleErrorMessage(err, isZh ? 'zh-TW' : 'en', 'Tester login failed.', '測試帳號登入失敗。'))
+      const message = visibleErrorMessage(err, isZh ? 'zh-TW' : 'en', 'Tester login failed.', '測試帳號登入失敗。')
+      if (modal) setTesterError(message)
+      else setGoogleError(message)
     } finally {
-      if (!authTransition.signal.aborted) setTesterSubmitting(false)
+      if (!authTransition.signal.aborted) {
+        if (modal) setTesterSubmitting(false)
+        else setIsLoggingIn(false)
+      }
     }
   }
+
+  const submitTesterLogin = async (e) => {
+    e.preventDefault()
+    await loginTesterAccount({ email: testerEmail, avatarUrl: testerAvatarUrl, modal: true })
+  }
+
+  const loginAsJudy = () => loginTesterAccount({ email: 'judy@gods.tw', modal: false })
 
   const openSettingsModal = () => {
     if (!isSignedIn || !currentUser?.id) return
@@ -856,6 +890,7 @@ function LoginHome() {
     setAddFriendSuccess('')
     setFriendEmailInput('')
     setFriendAliasInput('')
+    setFriendGroupInput('')
     setFriendCodeInput('')
     setAddFriendModalOpen(true)
   }
@@ -866,6 +901,7 @@ function LoginHome() {
 
     const email = friendEmailInput.trim().toLowerCase()
     const alias = friendAliasInput.trim()
+    const groupId = friendGroupInput.trim()
     const code = friendCodeInput.trim()
     const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
     if (!emailPattern.test(email)) {
@@ -881,6 +917,10 @@ function LoginHome() {
       setAddFriendError(t('This name is already used by another contact.', '這個名稱已被其他聯絡人使用。'))
       return
     }
+    if (!groupId) {
+      setAddFriendError(t('Please select a group.', '請選擇群組。'))
+      return
+    }
 
     const authContext = authRequestGuard.snapshot()
     try {
@@ -894,12 +934,13 @@ function LoginHome() {
         body: JSON.stringify({
           friend_email: email,
           friend_alias: alias,
+          group_id: groupId,
           identify_code: code,
         }),
       })
       const data = await res.json()
       if (!res.ok || !data.ok) {
-        throw new Error(data.error || t(`Add friend failed (HTTP ${res.status})`, `新增好友失敗（HTTP ${res.status}）`))
+        throw new Error(data.error || t(`Add contact failed (HTTP ${res.status})`, `新增聯絡人失敗（HTTP ${res.status}）`))
       }
       if (!authRequestGuard.isCurrent(authContext) || authContext.userId !== currentUser.id) return
       const newFriend = data?.friend || {}
@@ -917,12 +958,13 @@ function LoginHome() {
       setAddFriendError('')
       setFriendEmailInput('')
       setFriendAliasInput('')
+      setFriendGroupInput('')
       setFriendCodeInput('')
       setAddFriendModalOpen(false)
       selectedContactIdRef.current = ''
       setSelectedContact(null)
     } catch (err) {
-      setAddFriendError(visibleErrorMessage(err, isZh ? 'zh-TW' : 'en', 'Add friend failed.', '新增好友失敗。'))
+      setAddFriendError(visibleErrorMessage(err, isZh ? 'zh-TW' : 'en', 'Add contact failed.', '新增聯絡人失敗。'))
     } finally {
       setAddFriendSubmitting(false)
     }
@@ -931,6 +973,7 @@ function LoginHome() {
   const onEditContact = (contact) => {
     avatarPreviewOwnerRef.current.invalidate()
     setEditContactSaving(false)
+    setEditContactRemoving(false)
     setIsPreparingAvatar(false)
     setAvatarUploadError('')
     setPendingAvatarBlob(null)
@@ -984,6 +1027,20 @@ function LoginHome() {
       },
     })
     return send.started ? send.completion : false
+  }
+
+  const onRemoveEditingContact = async () => {
+    if (!editForm || editForm.isAi || editContactRemoving) return
+    setEditContactRemoving(true)
+    try {
+      const removed = await onDeleteContact(editForm)
+      if (removed !== false) {
+        setEditModalOpen(false)
+        setEditForm(null)
+      }
+    } finally {
+      setEditContactRemoving(false)
+    }
   }
 
   const loadContactHistory = async (contactId, { limit = null, merge = false, silent = false } = {}) => {
@@ -1220,6 +1277,7 @@ function LoginHome() {
         })
         const data = await res.json()
         setTesterLoginEnabled(data?.tester_login_enabled === true)
+        setJudyLoginEnabled(data?.judy_login_enabled === true)
         if (res.ok && data?.ok && data?.authenticated && data?.user?.id) {
           const authContext = applySignedInUser(data.user, authTransition)
           if (authContext) {
@@ -1229,19 +1287,6 @@ function LoginHome() {
         }
       } catch (err) {
         if (err?.name === 'AbortError') return
-        // ignore restore errors and continue with defaults
-      }
-      try {
-        const rawUi = localStorage.getItem(UI_STORAGE_KEY)
-        if (rawUi) {
-          const uiState = JSON.parse(rawUi)
-          if (uiState?.selectedContactId) {
-            authRequestGuard.runIfCurrent(activeRestoreContext, () => {
-              restoredSelectedContactIdRef.current = uiState.selectedContactId
-            })
-          }
-        }
-      } catch {
         // ignore restore errors and continue with defaults
       }
     }
@@ -1331,16 +1376,14 @@ function LoginHome() {
   }, [isSignedIn, selectedContact])
 
   useEffect(() => {
-    if (!isSignedIn || selectedContact || !restoredSelectedContactIdRef.current) return
-    const target = contacts.find((contact) => contact.id === restoredSelectedContactIdRef.current)
-    if (target) {
-      selectedContactIdRef.current = target.id
-      setSelectedContact(target)
-      markContactAsRead(target.id)
-      loadContactHistory(target.id)
-    }
-    restoredSelectedContactIdRef.current = null
-  }, [isSignedIn, selectedContact, contacts])
+    if (!isSignedIn || !currentUser?.id || selectedContact) return
+    const target = contacts.find((contact) => contact.id === 'pisces-core' || contact.isAi)
+    if (!target) return
+    selectedContactIdRef.current = target.id
+    setSelectedContact(target)
+    markContactAsRead(target.id)
+    loadContactHistory(target.id)
+  }, [isSignedIn, currentUser?.id, selectedContact, contacts])
 
   useEffect(() => {
     if (!isSignedIn || !currentUser?.id) return
@@ -1443,45 +1486,56 @@ function LoginHome() {
           if (isCancelled || !authRequestGuard.isCurrent(subscriptionContext) || subscriptionContext.userId !== currentUser.id) return
           const payload = message?.data || {}
           const senderId = payload.sender_user_id || ''
+          const conversationId = payload.contact_id === 'pisces-core' ? 'pisces-core' : senderId
           const incomingMessage = canonicalIncomingMessage(payload)
           const text = payload.text || ''
           const audioUrl = payload.audio_url || ''
           const imageUrl = payload.image_url || ''
           const musicUrl = payload.music_url || ''
-          if (!senderId || (!text && !audioUrl && !imageUrl && !musicUrl)) return
+          if (!conversationId || (!text && !audioUrl && !imageUrl && !musicUrl)) return
           if (!incomingMessage) return
 
           let authorization = null
-          try {
-            authorization = await authorizeIncomingFriend({
-              senderId,
-              contacts: contactsRef.current,
-              refreshFriends: () => loadFriendsList(currentUser, subscriptionContext),
-              inFlightRefreshes: realtimeFriendRefreshesRef.current,
-            })
-          } catch {
-            return
+          if (conversationId === 'pisces-core') {
+            authorization = {
+              contact: contactsRef.current.find((contact) => contact.id === 'pisces-core') || { id: 'pisces-core', name: 'Convia', isAi: true },
+              refreshed: false,
+            }
+          } else {
+            try {
+              authorization = await authorizeIncomingFriend({
+                senderId,
+                contacts: contactsRef.current,
+                refreshFriends: () => loadFriendsList(currentUser, subscriptionContext),
+                inFlightRefreshes: realtimeFriendRefreshesRef.current,
+              })
+            } catch {
+              return
+            }
           }
           if (!authorization?.contact || isCancelled || !authRequestGuard.isCurrent(subscriptionContext)) return
 
-          setContacts((previous) => previous.map((contact) => contact.id === senderId ? {
+          setContacts((previous) => previous.map((contact) => contact.id === conversationId ? {
             ...contact,
             last_message_at: payload.created_at || new Date().toISOString(),
             last_message_preview: text,
           } : contact))
 
           setMessagesByContact((prev) => {
-            const current = prev[senderId] || []
+            const current = prev[conversationId] || []
             return {
               ...prev,
-              [senderId]: reconcileCanonicalMessage(current, '', incomingMessage),
+              [conversationId]: reconcileCanonicalMessage(current, '', incomingMessage),
             }
           })
 
-          if (selectedContactIdRef.current === senderId) {
-            markContactAsRead(senderId)
+          const windowFocused = typeof document.hasFocus === 'function'
+            ? document.hasFocus()
+            : document.visibilityState === 'visible'
+          if (shouldAutoMarkIncomingRead({ selectedContactId: selectedContactIdRef.current, conversationId, windowFocused })) {
+            markContactAsRead(conversationId)
           } else if (!authorization.refreshed) {
-            setUnreadByContact((prev) => ({ ...prev, [senderId]: (prev[senderId] || 0) + 1 }))
+            setUnreadByContact((prev) => ({ ...prev, [conversationId]: (prev[conversationId] || 0) + 1 }))
           }
         })
 
@@ -1910,6 +1964,7 @@ function LoginHome() {
       { contactId, text: input },
     )
     personSendIdentityRef.current = identity
+    const pendingMessageId = `pending-${identity.requestId}`
     const send = startExclusiveSend({
       scope: accountOperationScope,
       ownerRef: personSendOperationRef,
@@ -1924,7 +1979,7 @@ function LoginHome() {
         if (personSendIdentityRef.current?.requestId === identity.requestId) personSendIdentityRef.current = null
         setMessagesByContact((previous) => {
           const current = previous[contactId] || []
-          const withMessage = reconcileCanonicalMessage(current, '', message)
+          const withMessage = reconcileCanonicalMessage(current, pendingMessageId, message)
           return {
             ...previous,
             [contactId]: conviaMessage
@@ -1963,6 +2018,14 @@ function LoginHome() {
       onSettled: () => setIsAwaitingReply(false),
     })
     if (!send.started) return false
+    setMessagesByContact((previous) => ({
+      ...previous,
+      [contactId]: [
+        ...(previous[contactId] || []),
+        { id: pendingMessageId, role: 'user', requestId: identity.requestId, text: input, status: 'sending' },
+      ],
+    }))
+    setChatInput((current) => current.trim() === input ? '' : current)
     setIsAwaitingReply(true)
     return true
   }
@@ -1983,10 +2046,6 @@ function LoginHome() {
       messages={conversationMessages}
       locale={isZh ? 'zh-TW' : 'en'}
       loading={isHistoryLoading}
-      onBack={() => {
-        selectedContactIdRef.current = ''
-        setSelectedContact(null)
-      }}
       onCall={openAiCall}
       onEdit={onEditContact}
       onImageClick={setImageViewerUrl}
@@ -2033,7 +2092,6 @@ function LoginHome() {
       onEditContact={onEditContact}
       onDeleteContact={onDeleteContact}
       onOpenSettings={openSettingsModal}
-      onManageGroups={() => setGroupManagerOpen(true)}
       onMoveContact={async (contact, groupId) => {
         const authContext = authRequestGuard.snapshot()
         try {
@@ -2064,6 +2122,7 @@ function LoginHome() {
     setAddFriendModalOpen(false)
     setAddFriendError('')
     setAddFriendSuccess('')
+    setFriendGroupInput('')
   }
   const closeTesterLogin = () => {
     if (testerSubmitting) return
@@ -2072,6 +2131,7 @@ function LoginHome() {
   }
   const closeContactEditor = () => {
     if (editContactSaving) return
+    if (editContactRemoving) return
     avatarPreviewOwnerRef.current.invalidate()
     setIsPreparingAvatar(false)
     setEditModalOpen(false)
@@ -2089,10 +2149,12 @@ function LoginHome() {
           isLoggingIn={isLoggingIn}
           error={googleError}
           testerLoginEnabled={testerLoginEnabled}
+          judyLoginEnabled={judyLoginEnabled}
           onOpenTesterLogin={() => {
             setTesterError('')
             setTesterModalOpen(true)
           }}
+          onJudyLogin={loginAsJudy}
         />
         <TesterLoginDialog
           open={testerModalOpen}
@@ -2117,20 +2179,6 @@ function LoginHome() {
           {selectedContact ? conversationPanel : <ConversationEmptyState locale={isZh ? 'zh-TW' : 'en'} />}
         </div>
       </ChatShell>
-      <GroupManagerDialog
-        open={groupManagerOpen}
-        locale={isZh ? 'zh-TW' : 'en'}
-        groups={contactGroups}
-        onClose={() => setGroupManagerOpen(false)}
-        onCreate={(name) => mutateGroups('create', { name })}
-        onRename={(groupId, name) => mutateGroups('update', { group_id: groupId, name })}
-        onReorder={(orderedGroupIds) => mutateGroups('reorder', { ordered_group_ids: orderedGroupIds })}
-        onDelete={deleteGroup}
-        onRefresh={(groups) => {
-          setContactGroups(groups)
-          setDefaultContactGroupId((current) => (groups.some((group) => group.id === current) ? current : ''))
-        }}
-      />
       <SettingsDialog
         open={settingsModalOpen}
         locale={isZh ? 'zh-TW' : 'en'}
@@ -2138,23 +2186,35 @@ function LoginHome() {
         historyRange={historyRangeInput}
         error={settingsError}
         saving={settingsSaving}
+        groups={contactGroups}
         onIdentifyCodeChange={setIdentifyCodeInput}
         onHistoryRangeChange={setHistoryRangeInput}
         onSubmit={saveUserSettings}
         onClose={closeSettings}
         onLogout={clearSessionAndLogout}
+        onCreateGroup={(name) => mutateGroups('create', { name })}
+        onRenameGroup={(groupId, name) => mutateGroups('update', { group_id: groupId, name })}
+        onReorderGroups={(orderedGroupIds) => mutateGroups('reorder', { ordered_group_ids: orderedGroupIds })}
+        onDeleteGroup={deleteGroup}
+        onRefreshGroups={(groups) => {
+          setContactGroups(groups)
+          setDefaultContactGroupId((current) => (groups.some((group) => group.id === current) ? current : ''))
+        }}
       />
       <AddFriendDialog
         open={addFriendModalOpen}
         locale={isZh ? 'zh-TW' : 'en'}
         email={friendEmailInput}
         alias={friendAliasInput}
+        groupId={friendGroupInput}
+        groups={contactGroups}
         verificationCode={friendCodeInput}
         error={addFriendError}
         success={addFriendSuccess}
         submitting={addFriendSubmitting}
         onEmailChange={setFriendEmailInput}
         onAliasChange={setFriendAliasInput}
+        onGroupChange={setFriendGroupInput}
         onVerificationCodeChange={setFriendCodeInput}
         onSubmit={submitAddFriendValidation}
         onClose={closeAddFriend}
@@ -2181,8 +2241,10 @@ function LoginHome() {
         form={editForm}
         error={avatarUploadError}
         busy={editContactSaving}
+        removing={editContactRemoving}
         onFormChange={setEditForm}
         onSave={onSaveContactEdit}
+        onRemove={onRemoveEditingContact}
         onClose={closeContactEditor}
       />
       <ImageViewerDialog open={Boolean(imageViewerUrl)} src={imageViewerUrl} locale={isZh ? 'zh-TW' : 'en'} onClose={() => setImageViewerUrl('')} />

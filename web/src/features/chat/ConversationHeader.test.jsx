@@ -11,6 +11,11 @@ describe('ConversationHeader', () => {
     expect(screen.getByLabelText('Amy Adams avatar')).toHaveTextContent('AA')
   })
 
+  it('does not render a top back or panel-collapse button', () => {
+    render(<ConversationHeader contact={{ id: 'pisces-core', name: 'Convia', isAi: true }} />)
+    expect(screen.queryByRole('button', { name: 'Back' })).not.toBeInTheDocument()
+  })
+
   it.each([
     ['en', 'Person-to-person calls are coming later'],
     ['zh-TW', '真人通話將於稍後開放'],

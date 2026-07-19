@@ -30,6 +30,23 @@ function RichContent({ message, locale, onImageClick, renderAudio }) {
   )
 }
 
+function ForwardedByNotice({ message, locale }) {
+  const name = (message.forwardedByName || '').trim()
+  if (!name) return null
+  const label = locale === 'zh-TW' ? `我幫 ${name} 來問你` : `I am asking for ${name}`
+  return (
+    <div className="message-row__forwarded-by">
+      <span>{locale === 'zh-TW' ? '我幫' : 'For'}</span>
+      {message.forwardedByAvatarUrl ? (
+        <img src={message.forwardedByAvatarUrl} alt={name} />
+      ) : null}
+      <strong>{name}</strong>
+      <span>{locale === 'zh-TW' ? '來問你' : 'I am asking you'}</span>
+      <span className="sr-only">{label}</span>
+    </div>
+  )
+}
+
 export default function MessageRow({ message, locale = 'en', onImageClick, onRetry, renderAudio }) {
   if (!message) return null
   const isHuman = HUMAN_ROLES.has(message.role)
@@ -52,7 +69,10 @@ export default function MessageRow({ message, locale = 'en', onImageClick, onRet
         {(message.role === 'ai-typing' || message.status === 'streaming') && !(message.text || '').trim() ? (
           <span className="message-row__typing" aria-label={locale === 'zh-TW' ? '正在回覆' : 'Responding'}><i /><i /><i /></span>
         ) : (
-          <RichContent message={message} locale={locale} onImageClick={onImageClick} renderAudio={renderAudio} />
+          <>
+            <ForwardedByNotice message={message} locale={locale} />
+            <RichContent message={message} locale={locale} onImageClick={onImageClick} renderAudio={renderAudio} />
+          </>
         )}
       </div>
       {message.status === 'incomplete' ? (

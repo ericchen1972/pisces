@@ -17,6 +17,18 @@ REAL_PERSIST_DELIVERY_ONCE = main.persist_delivery_once
 REAL_CONFIRM_FRIEND_DELIVERY = main.confirm_friend_delivery_before_publish
 
 
+def force_semantic_forward(monkeypatch, friend_id="user-b"):
+    monkeypatch.setattr(
+        main,
+        "resolve_ai_room_forward_target",
+        lambda *_args, **_kwargs: {
+            "should_send": True,
+            "friend": {"id": friend_id},
+            "target_source": "contacts",
+        },
+    )
+
+
 class RealtimeServiceStub:
     def __init__(self, result=None):
         self.models = SimpleNamespace(realtime="gpt-realtime-test")
@@ -1718,6 +1730,7 @@ def forwarding_stubs(route_stubs, monkeypatch):
     published = []
     monkeypatch.setattr(main, "has_forward_intent_in_ai_room", lambda _text: True)
     monkeypatch.setattr(main, "find_friend_from_message", lambda *_args: {"id": "user-b"})
+    force_semantic_forward(monkeypatch)
     monkeypatch.setattr(
         main,
         "get_friend_context",
@@ -1852,7 +1865,7 @@ def test_send_voice_route_uses_openai_transcription_and_preserves_shared_deliver
 
     monkeypatch.setattr(main, "persist_friend_delivery", persist_delivery)
     monkeypatch.setattr(
-        main, "confirm_friend_delivery_before_publish", lambda *_args: True
+        main, "confirm_friend_delivery_before_publish", lambda *_args, **_kwargs: True
     )
     monkeypatch.setattr(
         main,
@@ -1928,7 +1941,7 @@ def test_send_voice_route_convia_transcript_stays_human_voice_message(
     )
     monkeypatch.setattr(main, "persist_friend_delivery", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        main, "confirm_friend_delivery_before_publish", lambda *_args: True
+        main, "confirm_friend_delivery_before_publish", lambda *_args, **_kwargs: True
     )
     monkeypatch.setattr(
         main, "upload_audio_to_vercel_blob", lambda *_args: "https://blob/voice.webm"
@@ -1988,7 +2001,7 @@ def test_send_voice_failures_are_stable_and_redacted(
         monkeypatch.setattr(main, "accepted_friendship_exists", lambda *_args: True)
         monkeypatch.setattr(main, "persist_friend_delivery", lambda *_args: None)
         monkeypatch.setattr(
-            main, "confirm_friend_delivery_before_publish", lambda *_args: True
+            main, "confirm_friend_delivery_before_publish", lambda *_args, **_kwargs: True
         )
     if failure_stage == "blob":
         monkeypatch.setattr(
@@ -2298,7 +2311,8 @@ def test_ai_forward_confirmation_upload_failure_is_text_only_and_replay_identica
     assert "audio_base64" not in json.dumps(receipt, default=str)
     assert len(uploads) == 1
     assert len([1 for name, _kwargs in service.calls if name == "synthesize"]) == 2
-    assert [item[2] for item in saved].count("peer") == 1
+    assert [item[2] for item in saved].count("ai_proxy") == 1
+    assert saved[0][0:2] == ("user-b", "pisces-core")
     assert len(published) == 1
 
 
@@ -2582,34 +2596,328 @@ def test_legacy_chat_rejects_anonymous_sessions_without_openai_calls(client, rou
     assert service.calls == []
 
 
-def test_ai_room_forwarding_decision_false_returns_private_openai_advice_without_send(
-    signed_in_client, forwarding_stubs
+def test_ai_room_resolver_false_returns_private_openai_reply_without_send(
+    signed_in_client, forwarding_stubs, monkeypatch
 ):
     service, saved, published = forwarding_stubs
-    service.assist_decision = {
-        "send_to_friend": False,
-        "voice": False,
-        "reason": "user asked for advice",
-    }
+    monkeypatch.setattr(
+        main,
+        "resolve_ai_room_forward_target",
+        lambda *_args, **_kwargs: {"should_send": False},
+    )
     service.text = "You may want to ask Amy gently first."
 
     payload = {"message": "Help me tell Amy something", "request_id": "advice-1"}
     response = signed_in_client.post("/api/chat", json=payload)
-    calls_after_first = len(service.calls)
-    saved_after_first = len(saved)
-    retry = signed_in_client.post("/api/chat", json=payload)
 
     assert response.status_code == 200
     assert response.get_json()["reply"] == "You may want to ask Amy gently first."
     assert not any(name == "compose_message_for_friend" for name, _ in service.calls)
     assert published == []
-    assert retry.get_json() == response.get_json()
-    assert len(service.calls) == calls_after_first
-    assert len(saved) == saved_after_first
     assert [item[2:4] for item in saved] == [
         ("user", "Help me tell Amy something"),
         ("ai", "You may want to ask Amy gently first."),
     ]
+
+
+def test_ai_room_semantic_resolver_uses_forwarded_history_before_phrase_rules(
+    signed_in_client, forwarding_stubs, monkeypatch
+):
+    service, saved, published = forwarding_stubs
+    monkeypatch.setattr(
+        main,
+        "has_forward_intent_in_ai_room",
+        lambda _text: pytest.fail("AI-room forwarding must not depend on phrase rules"),
+    )
+    monkeypatch.setattr(
+        main,
+        "find_friend_from_message",
+        lambda *_args: pytest.fail("history semantic resolution should run before name scanning"),
+    )
+    monkeypatch.setattr(
+        main,
+        "list_user_friends",
+        lambda _user_id: [
+            {
+                "id": "user-b",
+                "alias": "",
+                "display_name": "Eric Chen",
+                "email": "eric@example.test",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "get_chat_messages",
+        lambda _user_id, contact_id, **_kwargs: [
+            {
+                "role": "ai_proxy",
+                "text": "Judy, Eric Chen wants to ask if you are free for dinner.",
+                "visibility": "shared",
+                "sender_mode": "ai_proxy",
+                "forwarded_by_user_id": "user-b",
+                "forwarded_by_name": "Eric Chen",
+            }
+        ]
+        if contact_id == "pisces-core"
+        else [],
+    )
+    def resolve_semantically(user_id, user_message, history_messages, friends):
+        resolver_context = json.dumps(
+            {
+                "user_id": user_id,
+                "user_message": user_message,
+                "history": main.ai_room_resolver_history_items(history_messages),
+                "friends": main.ai_room_resolver_friend_items(friends),
+            },
+            ensure_ascii=False,
+        )
+        assert "forwarded_by_name" in resolver_context
+        assert "forwarded_by_user_id" in resolver_context
+        assert "Eric Chen" in resolver_context
+        return {
+            "should_send": True,
+            "friend": {"id": "user-b"},
+            "target_source": "history",
+        }
+
+    monkeypatch.setattr(main, "resolve_ai_room_forward_target", resolve_semantically)
+    service.assist_decision = {"send_to_friend": True, "voice": False, "reason": "send"}
+    service.composed = {
+        "as_user": False,
+        "message_to_friend": "Judy wants to know which bar you would like to go to.",
+    }
+    service.text = "OpenAI confirms the message was delivered."
+
+    response = signed_in_client.post(
+        "/api/chat",
+        json={"message": "Ask him which bar he wants to go to.", "request_id": "semantic-history-1"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["reply"] == "OpenAI confirms the message was delivered."
+    assert published[0][0] == "user-b"
+    assert saved[0][0:4] == (
+        "user-b",
+        "pisces-core",
+        "ai_proxy",
+        "Judy wants to know which bar you would like to go to.",
+    )
+
+
+def test_ai_room_history_forward_intent_executes_even_when_assist_gate_would_advise(
+    signed_in_client, forwarding_stubs, monkeypatch
+):
+    service, saved, published = forwarding_stubs
+    monkeypatch.setattr(
+        main,
+        "list_user_friends",
+        lambda _user_id: [
+            {
+                "id": "user-b",
+                "alias": "",
+                "display_name": "Eric Chen",
+                "email": "eric@example.test",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "get_chat_messages",
+        lambda _user_id, contact_id, **_kwargs: [
+            {
+                "role": "ai_proxy",
+                "text": "Judy，Eric Chen 想問問妳下週二有沒有空來酒吧坐坐？",
+                "visibility": "shared",
+                "sender_mode": "ai_proxy",
+                "forwarded_by_user_id": "user-b",
+                "forwarded_by_name": "Eric Chen",
+            }
+        ]
+        if contact_id == "pisces-core"
+        else [],
+    )
+    monkeypatch.setattr(
+        main,
+        "resolve_ai_room_forward_target",
+        lambda *_args, **_kwargs: {
+            "should_send": True,
+            "friend": {"id": "user-b"},
+            "target_source": "history",
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "get_friend_context",
+        lambda *_args: {
+            "friend_name": "Eric Chen",
+            "special_prompt": "warm",
+            "relationship": "friends",
+        },
+    )
+    service.assist_decision = {
+        "send_to_friend": False,
+        "voice": False,
+        "reason": "would have advised before the resolver became authoritative",
+    }
+    service.composed = {
+        "as_user": False,
+        "message_to_friend": "Judy 想問你想約在哪一間酒吧。",
+    }
+    service.text = "我已經幫你把問題傳給 Eric Chen 了。"
+
+    response = signed_in_client.post(
+        "/api/chat",
+        json={"message": "問問他想約在哪一間酒吧", "request_id": "history-forward-executes-1"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["reply"] == "我已經幫你把問題傳給 Eric Chen 了。"
+    assert published[0][0] == "user-b"
+    assert published[0][1]["text"] == "Judy 想問你想約在哪一間酒吧。"
+    assert saved[0][0:4] == (
+        "user-b",
+        "pisces-core",
+        "ai_proxy",
+        "Judy 想問你想約在哪一間酒吧。",
+    )
+    assert any(name == "compose_message_for_friend" for name, _ in service.calls)
+
+
+def test_ai_room_stream_history_forward_intent_executes_even_when_assist_gate_would_advise(
+    signed_in_client, forwarding_stubs, monkeypatch
+):
+    service, saved, published = forwarding_stubs
+    monkeypatch.setattr(
+        main,
+        "resolve_ai_room_forward_target",
+        lambda *_args, **_kwargs: {
+            "should_send": True,
+            "friend": {"id": "user-b"},
+            "target_source": "history",
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "get_friend_context",
+        lambda *_args: {
+            "friend_name": "Eric Chen",
+            "special_prompt": "warm",
+            "relationship": "friends",
+        },
+    )
+    service.assist_decision = {
+        "send_to_friend": False,
+        "voice": False,
+        "reason": "the resolved forwarding task must remain authoritative",
+    }
+    service.composed = {
+        "as_user": False,
+        "message_to_friend": "Judy 想問你想約哪一家酒吧。",
+    }
+    service.text = "我已經幫你把問題傳給 Eric Chen 了。"
+
+    response = signed_in_client.post(
+        "/api/chat/stream",
+        json={
+            "message": "問問他想約哪一家酒吧",
+            "contact_id": "pisces-core",
+            "request_id": "stream-history-forward-executes-1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert published[0][0] == "user-b"
+    assert published[0][1]["text"] == "Judy 想問你想約哪一家酒吧。"
+    assert any(item[0:4] == (
+        "user-b",
+        "pisces-core",
+        "ai_proxy",
+        "Judy 想問你想約哪一家酒吧。",
+    ) for item in saved)
+    assert not any(name == "stream_text" for name, _ in service.calls)
+
+
+def test_ai_room_semantic_resolver_clarifies_when_history_and_contacts_are_ambiguous(
+    signed_in_client, forwarding_stubs, monkeypatch
+):
+    service, saved, published = forwarding_stubs
+    monkeypatch.setattr(main, "has_forward_intent_in_ai_room", lambda _text: False)
+    monkeypatch.setattr(main, "list_user_friends", lambda _user_id: [])
+    monkeypatch.setattr(main, "get_chat_messages", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        main,
+        "resolve_ai_room_forward_target",
+        lambda *_args, **_kwargs: {
+            "should_send": False,
+            "target_source": "none",
+            "needs_clarification": True,
+            "clarifying_question": "Who would you like me to ask?",
+        },
+    )
+    service.assist_decision = {"send_to_friend": True, "voice": False, "reason": "send"}
+    service.composed = {"as_user": False, "message_to_friend": "This should not send"}
+
+    response = signed_in_client.post(
+        "/api/chat",
+        json={"message": "Ask them about dinner.", "request_id": "semantic-clarify-1"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["reply"] == "Who would you like me to ask?"
+    assert published == []
+    assert [item[2:4] for item in saved] == [
+        ("user", "Ask them about dinner."),
+        ("ai", "Who would you like me to ask?"),
+    ]
+    assert not any(name == "compose_message_for_friend" for name, _ in service.calls)
+
+
+def test_ai_room_forward_resolver_passes_history_metadata_and_accepts_history_target(
+    route_stubs
+):
+    service, _saved = route_stubs
+    service.generate_text = lambda **kwargs: service.calls.append(("generate_text", kwargs)) or json.dumps(
+        {
+            "should_send": True,
+            "target_user_id": "user-b",
+            "target_name": "Eric Chen",
+            "target_source": "history",
+            "needs_clarification": False,
+        }
+    )
+
+    result = main.resolve_ai_room_forward_target(
+        "user-a",
+        "Ask him which bar he wants to go to.",
+        [
+            {
+                "role": "ai_proxy",
+                "text": "Eric Chen asked Judy about dinner.",
+                "forwarded_by_user_id": "user-b",
+                "forwarded_by_name": "Eric Chen",
+                "sender_mode": "ai_proxy",
+            }
+        ],
+        [
+            {
+                "id": "user-b",
+                "alias": "",
+                "display_name": "Eric Chen",
+                "email": "eric@example.test",
+            }
+        ],
+    )
+
+    assert result["should_send"] is True
+    assert result["friend"]["id"] == "user-b"
+    assert result["target_source"] == "history"
+    resolver_call = [kwargs for name, kwargs in service.calls if name == "generate_text"][0]
+    context = json.dumps(resolver_call["input_items"], ensure_ascii=False)
+    assert "forwarded_by_user_id" in context
+    assert "forwarded_by_name" in context
+    assert "Eric Chen" in context
+    assert "Only if history is insufficient may you use the contact list" in resolver_call["instructions"]
 
 
 @pytest.mark.parametrize(
@@ -2641,11 +2949,144 @@ def test_ai_room_forwarding_sender_identity_requires_model_and_explicit_intent(
     assert response.status_code == 200
     assert response.get_json()["reply"] == "OpenAI confirms the message was delivered."
     assert published[0][1]["sender_mode"] == expected_sender_mode
-    assert saved[0][5] == saved[1][5] == published[0][1]["message_id"]
+    assert saved[0][0:4] == ("user-b", "pisces-core", "ai_proxy", "Hello Amy")
+    assert saved[0][5] == published[0][1]["message_id"]
+    assert saved[0][4]["forwarded_by_name"] == "Bo"
+    assert saved[0][4]["forwarded_by_avatar_url"] == "https://user-avatar"
+    sender_replies = [
+        item for item in saved
+        if item[0:3] == ("user-a", "pisces-core", "ai")
+    ]
+    assert len(sender_replies) == 1
+    sender_confirmation = sender_replies[0]
+    assert sender_confirmation[3] == "OpenAI confirms the message was delivered."
+    assert sender_confirmation[4]["forwarded_to_user_id"] == "user-b"
+    assert sender_confirmation[4]["forwarded_to_name"] == "Amy"
+    assert sender_confirmation[4]["forwarded_message_text"] == "Hello Amy"
+    assert not any(item[0:2] == ("user-a", "user-b") for item in saved)
+    assert not any(item[0:2] == ("user-b", "user-a") for item in saved)
     assert saved[-1][2:4] == ("ai", "OpenAI confirms the message was delivered.")
     confirmation = [kwargs for name, kwargs in service.calls if name == "generate_text"][-1]
     assert "Amy" in json.dumps(confirmation, ensure_ascii=False)
     assert "Hello Amy" in json.dumps(confirmation, ensure_ascii=False)
+    assert confirmation["input_items"][-1]["content"].startswith("The delivery has succeeded.")
+    assert "Tell Amy hello" not in confirmation["input_items"][-1]["content"]
+    assert "Do not repeat the recipient-facing message verbatim" in json.dumps(
+        confirmation, ensure_ascii=False
+    )
+
+
+def test_ai_room_forwarding_uses_recipient_alias_in_text_and_public_name_in_tag(
+    signed_in_client, forwarding_stubs, monkeypatch
+):
+    service, _saved, published = forwarding_stubs
+    service.assist_decision = {
+        "send_to_friend": True,
+        "voice": False,
+        "reason": "send",
+    }
+    service.composed = {
+        "as_user": False,
+        "message_to_friend": "Judy，Eric 想問妳下週二有沒有空一起去酒吧坐坐？",
+    }
+    service.text = "已經幫你把訊息傳給 Judy 了。"
+
+    firestore = FakeFirestoreClient()
+    firestore.seed(
+        "users/user-a",
+        display_name="Eric Chen",
+        avatar_url="https://eric-avatar",
+        ai_avatar_url="https://ai-avatar",
+    )
+    firestore.seed(
+        "friendships/user-a_user-b",
+        user_a_id="user-a",
+        user_b_id="user-b",
+        user_a_display_name="Eric Chen",
+        user_b_display_name="Judy",
+        alias_for_a="Judy",
+        alias_for_b="Eric",
+        status="accepted",
+    )
+    monkeypatch.setattr(main, "get_firestore_client", lambda: firestore)
+    monkeypatch.setattr(
+        main,
+        "get_friend_context",
+        lambda requester_id, contact_id: (
+            {
+                "friend_name": "Judy",
+                "special_prompt": "warm",
+                "relationship": "friends",
+            }
+            if (requester_id, contact_id) == ("user-a", "user-b")
+            else {
+                "friend_name": "Eric",
+                "special_prompt": "",
+                "relationship": "friends",
+            }
+        ),
+    )
+
+    response = signed_in_client.post(
+        "/api/chat",
+        json={"message": "幫我問 Judy 下週二有沒有空去酒吧坐坐", "request_id": "recipient-alias-1"},
+    )
+
+    assert response.status_code == 200
+    compose_call = next(
+        kwargs for name, kwargs in service.calls
+        if name == "compose_message_for_friend"
+    )
+    assert compose_call["user_name"] == "Eric"
+    assert compose_call["friend_name"] == "Judy"
+    assert published[0][1]["forwarded_by_name"] == "Eric Chen"
+    assert published[0][1]["text"].startswith("Judy，Eric 想問")
+
+
+def test_chat_stream_forward_intent_reuses_friend_delivery_route(
+    signed_in_client, forwarding_stubs
+):
+    service, saved, published = forwarding_stubs
+    service.assist_decision = {
+        "send_to_friend": True,
+        "voice": False,
+        "reason": "send",
+    }
+    service.composed = {"as_user": False, "message_to_friend": "Hello Amy"}
+    service.text = "OpenAI confirms the message was delivered."
+    request_id = "stream-forward-1"
+
+    response = signed_in_client.post(
+        "/api/chat/stream",
+        json={
+            "message": "Tell Amy hello",
+            "contact_id": "pisces-core",
+            "request_id": request_id,
+        },
+    )
+    lines = [json.loads(line) for line in response.get_data(as_text=True).splitlines()]
+
+    assert response.status_code == 200
+    assert response.mimetype == "application/x-ndjson"
+    assert lines == [
+        {"type": "delta", "text": "OpenAI confirms the message was delivered."},
+        {
+            "type": "done",
+            "message_id": main.deterministic_message_id(
+                "user-a", "chat_forward", "pisces-core", request_id, "confirmation"
+            ),
+            "reply": "OpenAI confirms the message was delivered.",
+            "image_url": "",
+            "music_url": "",
+        },
+    ]
+    assert published[0][0] == "user-b"
+    assert published[0][1]["contact_id"] == "pisces-core"
+    assert published[0][1]["text"] == "Hello Amy"
+    assert saved[0][0:4] == ("user-b", "pisces-core", "ai_proxy", "Hello Amy")
+    assert saved[0][5] == published[0][1]["message_id"]
+    assert saved[-1][2:4] == ("ai", "OpenAI confirms the message was delivered.")
+    assert not any(name == "stream_text" for name, _ in service.calls)
 
 
 def test_ai_room_forwarding_same_request_id_is_idempotent(
@@ -2850,6 +3291,7 @@ def test_ai_outbound_revoked_after_persistence_rolls_back_before_publish_and_cle
     if route_kind == "forward":
         monkeypatch.setattr(main, "has_forward_intent_in_ai_room", lambda _text: True)
         monkeypatch.setattr(main, "find_friend_from_message", lambda *_args: {"id": "user-b"})
+        force_semantic_forward(monkeypatch)
         path = "/api/chat"
         payload = {"contact_id": "pisces-core", "message": "Tell Amy hello", "request_id": "revoke-forward"}
     else:
@@ -2935,6 +3377,7 @@ def test_ai_outbound_unpublished_replay_does_not_cross_friendship_generation(
     if route_kind == "forward":
         monkeypatch.setattr(main, "has_forward_intent_in_ai_room", lambda _text: True)
         monkeypatch.setattr(main, "find_friend_from_message", lambda *_args: {"id": "user-b"})
+        force_semantic_forward(monkeypatch)
         path = "/api/chat"
         payload = {"contact_id": "pisces-core", "message": message, "request_id": request_id}
     else:
@@ -2998,6 +3441,7 @@ def test_ai_outbound_concurrent_winner_receipt_uses_generation_guard_and_cleans_
     if route_kind == "forward":
         monkeypatch.setattr(main, "has_forward_intent_in_ai_room", lambda _text: True)
         monkeypatch.setattr(main, "find_friend_from_message", lambda *_args: {"id": "user-b"})
+        force_semantic_forward(monkeypatch)
         path = "/api/chat"
         payload = {"contact_id": "pisces-core", "message": message, "request_id": request_id}
     else:
@@ -3065,7 +3509,7 @@ def test_forward_private_confirmation_artifact_is_cleaned_when_delivery_is_not_d
         }
         monkeypatch.setattr(main, "persist_delivery_once", lambda **_kwargs: (winner, False))
     else:
-        monkeypatch.setattr(main, "confirm_friend_delivery_before_publish", lambda *_args: False)
+        monkeypatch.setattr(main, "confirm_friend_delivery_before_publish", lambda *_args, **_kwargs: False)
 
     response = signed_in_client.post(
         "/api/chat",
@@ -3104,6 +3548,7 @@ def test_ai_outbound_transient_confirm_failure_keeps_durable_media_for_retry(
     if route_kind == "forward":
         monkeypatch.setattr(main, "has_forward_intent_in_ai_room", lambda _text: True)
         monkeypatch.setattr(main, "find_friend_from_message", lambda *_args: {"id": "user-b"})
+        force_semantic_forward(monkeypatch)
         path = "/api/chat"
         payload = {"contact_id": "pisces-core", "message": "Tell Amy hello", "request_id": "confirm-transient-forward"}
     else:
@@ -3705,6 +4150,11 @@ def test_chat_stream_active_reservation_rejects_second_producer_before_stream(
     signed_in_client, route_stubs, monkeypatch
 ):
     service, saved = route_stubs
+    monkeypatch.setattr(
+        main,
+        "resolve_ai_room_forward_target",
+        lambda *_args, **_kwargs: {"should_send": False},
+    )
     monkeypatch.setattr(main, "get_delivery_receipt", lambda *_args: None)
     monkeypatch.setattr(
         main,

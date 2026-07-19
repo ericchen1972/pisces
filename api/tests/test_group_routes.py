@@ -593,6 +593,12 @@ def test_friend_list_bootstraps_and_returns_authoritative_metadata(
         unread_count=1,
     )
     firestore.seed(
+        "users/user-a/chat_meta/pisces-core",
+        last_message_at="2026-07-16T11:00:00Z",
+        last_message_preview="Eric asked whether you are free next Tuesday.",
+        unread_count=3,
+    )
+    firestore.seed(
         "friendships/user-a_user-b",
         pair_key="user-a_user-b",
         user_a_id="user-a",
@@ -645,6 +651,11 @@ def test_friend_list_bootstraps_and_returns_authoritative_metadata(
         "unread_count": 2,
     }
     assert friends["user-c"]["group_id"] == "family"
+    assert response.get_json()["convia"] == {
+        "last_message_at": "2026-07-16T11:00:00Z",
+        "last_message_preview": "Eric asked whether you are free next Tuesday.",
+        "unread_count": 3,
+    }
     assert firestore.read("users/user-a/chat_meta/user-b")["group_id"] == "others"
     assert firestore.read("users/user-a/chat_meta/user-c")["group_id"] == "family"
 
@@ -758,7 +769,36 @@ def test_chat_history_rejects_non_integer_poll_limit(signed_in_client, monkeypat
     assert calls == []
 
 
-def test_add_friend_applies_requesters_default_group_when_metadata_is_unassigned(
+def test_add_friend_requires_group_id(
+    signed_in_client, monkeypatch
+):
+    monkeypatch.setattr(
+        main,
+        "_validate_friend_payload",
+        lambda body: (
+            {
+                "ok": True,
+                "requester_user_id": "user-a",
+                "friend": {
+                    "id": "user-b",
+                    "email": "b@example.com",
+                    "display_name": "B",
+                    "avatar_url": "",
+                },
+            },
+            200,
+        ),
+    )
+
+    response = signed_in_client.post(
+        "/api/friend/add", json={"friend_alias": "Bee"}
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {"ok": False, "error": "group_id is required"}
+
+
+def test_add_friend_applies_selected_group(
     signed_in_client, monkeypatch
 ):
     firestore = FakeFirestoreClient()
@@ -769,6 +809,7 @@ def test_add_friend_applies_requesters_default_group_when_metadata_is_unassigned
         default_contact_group_id="others",
     )
     firestore.seed("users/user-a/contact_groups/others", name="Others")
+    firestore.seed("users/user-a/contact_groups/family", name="Family")
     firestore.seed(
         "users/user-b", email="b@example.com", display_name="B"
     )
@@ -793,7 +834,7 @@ def test_add_friend_applies_requesters_default_group_when_metadata_is_unassigned
     )
 
     response = signed_in_client.post(
-        "/api/friend/add", json={"friend_alias": "Bee"}
+        "/api/friend/add", json={"friend_alias": "Bee", "group_id": "family"}
     )
 
     assert response.status_code == 200
@@ -806,12 +847,12 @@ def test_add_friend_applies_requesters_default_group_when_metadata_is_unassigned
             "unread_count",
         )
     } == {
-        "group_id": "others",
+        "group_id": "family",
         "last_message_at": None,
         "last_message_preview": "",
         "unread_count": 0,
     }
-    assert firestore.read("users/user-a/chat_meta/user-b")["group_id"] == "others"
+    assert firestore.read("users/user-a/chat_meta/user-b")["group_id"] == "family"
 
 
 def test_delete_friend_requires_authentication(client):

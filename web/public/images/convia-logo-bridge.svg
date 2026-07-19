@@ -1,0 +1,13 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Convia bridge logo</title>
+  <desc id="desc">A rounded Convia C mark shaped by two conversation bubbles and a gentle bridge between people and AI.</desc>
+  <rect width="512" height="512" rx="116" fill="#F4F1EA"/>
+  <path d="M350 156C326 132 293 118 256 118C180 118 120 178 120 256C120 334 180 394 256 394C294 394 328 379 352 354" stroke="#171717" stroke-width="42" stroke-linecap="round"/>
+  <path d="M343 205C323 186 293 174 260 174C211 174 174 210 174 256C174 302 211 338 260 338C294 338 324 325 344 304" stroke="#171717" stroke-width="20" stroke-linecap="round" opacity=".16"/>
+  <circle cx="194" cy="254" r="13" fill="#171717"/>
+  <circle cx="256" cy="254" r="13" fill="#171717"/>
+  <circle cx="318" cy="254" r="13" fill="#171717"/>
+  <path d="M210 315C228 332 244 340 259 340C276 340 292 332 310 315" stroke="#171717" stroke-width="16" stroke-linecap="round"/>
+  <path d="M338 334L374 370C379 375 388 371 387 364L382 321" fill="#171717"/>
+  <path d="M176 178L140 142C135 137 126 141 127 148L132 191" fill="#171717"/>
+</svg>

@@ -1,0 +1,20 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Convia messenger logo</title>
+  <desc id="desc">A Convia messenger mark with two people connected by a warm AI mediator node.</desc>
+  <rect width="512" height="512" rx="116" fill="#171717"/>
+  <circle cx="160" cy="256" r="44" fill="#F4F1EA"/>
+  <circle cx="352" cy="256" r="44" fill="#F4F1EA"/>
+  <circle cx="256" cy="256" r="62" fill="#F4F1EA"/>
+  <path d="M203 256H213" stroke="#F4F1EA" stroke-width="26" stroke-linecap="round"/>
+  <path d="M299 256H309" stroke="#F4F1EA" stroke-width="26" stroke-linecap="round"/>
+  <path d="M234 239C248 226 265 226 278 239" stroke="#171717" stroke-width="14" stroke-linecap="round"/>
+  <path d="M230 274C248 293 266 293 284 274" stroke="#171717" stroke-width="14" stroke-linecap="round"/>
+  <circle cx="237" cy="258" r="7" fill="#171717"/>
+  <circle cx="275" cy="258" r="7" fill="#171717"/>
+  <path d="M256 148V107" stroke="#F4F1EA" stroke-width="20" stroke-linecap="round"/>
+  <path d="M256 405V364" stroke="#F4F1EA" stroke-width="20" stroke-linecap="round"/>
+  <path d="M209 108H303" stroke="#F4F1EA" stroke-width="20" stroke-linecap="round"/>
+  <path d="M212 405H300" stroke="#F4F1EA" stroke-width="20" stroke-linecap="round"/>
+  <path d="M332 173C374 190 402 222 402 256C402 293 371 327 324 342" stroke="#F4F1EA" stroke-width="16" stroke-linecap="round" opacity=".42"/>
+  <path d="M180 339C137 322 110 290 110 256C110 219 141 185 188 170" stroke="#F4F1EA" stroke-width="16" stroke-linecap="round" opacity=".42"/>
+</svg>

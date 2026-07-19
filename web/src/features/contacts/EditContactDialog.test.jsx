@@ -25,4 +25,14 @@ describe('EditContactDialog', () => {
     render(<EditContactDialog open locale="zh-TW" form={{ alias: 'Amy', avatar: 'https://lh3.googleusercontent.com/a/photo' }} onFormChange={() => {}} onSave={() => {}} onClose={() => {}} />)
     expect(screen.getByRole('img', { name: 'Amy 的 Google 個人資料頭像' })).toBeInTheDocument()
   })
+
+  it('confirms before removing a contact relationship', () => {
+    const onRemove = vi.fn()
+    render(<EditContactDialog open locale="zh-TW" form={{ alias: 'Amy', avatar: 'https://lh3.googleusercontent.com/a/photo' }} onFormChange={() => {}} onSave={() => {}} onClose={() => {}} onRemove={onRemove} />)
+    fireEvent.click(screen.getByRole('button', { name: /移除/ }))
+    expect(onRemove).not.toHaveBeenCalled()
+    expect(screen.getByText('確定要移除 Amy？')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '確認移除 Amy' }))
+    expect(onRemove).toHaveBeenCalledOnce()
+  })
 })

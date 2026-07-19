@@ -11,6 +11,9 @@
 .dialog-body .primary-button { border-color: #fff; background: #fff; color: #171717; }
 .dialog-body .danger-button { border-color: #d94e4e; background: #b83232; color: #fff; }
 .form-error { margin: 6px 0 0; color: #ff9b9b; font-size: 13px; }
+.settings-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; margin-bottom: 18px; padding: 4px; border: 1px solid #3d3d3d; border-radius: 10px; background: #191919; }
+.dialog-body .settings-tabs button { min-width: 0; border: 0; background: transparent; color: #bdbdbd; }
+.dialog-body .settings-tabs button[aria-selected="true"] { background: #303030; color: #fff; box-shadow: inset 0 0 0 1px #565656; }
 .group-create { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 10px; }
 .group-create > label { min-width: 0; }
 .group-create .form-error { grid-column: 1 / -1; grid-row: 2; }
@@ -23,6 +26,9 @@
 .delete-group-panel { margin-top: 18px; padding: 14px; border: 1px solid #5a3c3c; border-radius: 10px; background: #292020; }
 .delete-group-panel p { margin: 0 0 12px; color: #d4d4d4; font-size: 14px; line-height: 1.45; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+.dialog-actions--split { align-items: center; justify-content: space-between; }
+.dialog-actions--split .danger-button { display: inline-flex; align-items: center; gap: 7px; }
+.dialog-actions__right { display: inline-flex; gap: 8px; }
 
 @media (max-width: 520px) {
   .dialog-backdrop { align-items: end; padding: 0; }

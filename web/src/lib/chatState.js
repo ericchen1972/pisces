@@ -41,6 +41,23 @@ export function unreadTotal(contacts = [], unreadByContact = {}) {
   }, 0)
 }
 
+export function shouldAutoMarkIncomingRead({ selectedContactId = '', conversationId = '', windowFocused = false } = {}) {
+  return Boolean(conversationId && selectedContactId === conversationId && windowFocused)
+}
+
+export function unreadStateFromFriendsResponse(friendContacts = [], data = {}) {
+  const unread = {
+    'pisces-core': Math.max(0, Number(data?.convia?.unread_count) || 0),
+  }
+  for (const contact of friendContacts) {
+    if (!contact?.id) continue
+    unread[contact.id] = Number.isFinite(contact.unreadCount)
+      ? Math.max(0, contact.unreadCount)
+      : 0
+  }
+  return unread
+}
+
 export function contactGroupStateFromResponse(data = {}) {
   const groups = Array.isArray(data.groups) ? data.groups : []
   const candidate = typeof data.default_contact_group_id === 'string'

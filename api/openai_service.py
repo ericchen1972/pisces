@@ -161,8 +161,13 @@ class OpenAIService:
             user_id=user_id,
             name="friend_message",
             instructions=(
-                f"Compose an outbound message from {user_name} or {ai_name} to {friend_name}. "
+                f"Compose an outbound message from {ai_name} to {friend_name}, relaying {user_name}'s intent. "
                 f"Relationship: {relationship_context}. Style: {style_prompt}. "
+                f"{ai_name} is a third-party messenger, not {user_name}. "
+                f"By default, set as_user=false and write message_to_friend in third person: say that {user_name} says, asks, feels, wants, or is wondering. "
+                f"When as_user=false, do not write as if {ai_name} or the speaker is {user_name}; avoid first-person phrasing such as 我, 我們, 我的, I, we, my, or our for {user_name}'s plans, feelings, promises, or offers. "
+                f"Only set as_user=true if the requester explicitly asks to send in {user_name}'s own voice. "
+                "You may soften conflict or make wording warmer, but do not change the core meaning. "
                 "This is the outbound structured artifact, separate from the visible AI reply."
             ),
             input_items=self._router_input(history_messages, user_message),
